@@ -1,9 +1,9 @@
 import subprocess
 import sys
 
-import numpy as np
-
 from config import GRAVITY
+
+import numpy as np
 
 try:
     import casadi as cs
@@ -14,6 +14,13 @@ except ImportError:
 
 
 class MPCController:
+    """
+    Minimal alpha-RACER style MPC tracker.
+
+    The MPC prediction model is kinematic [x, y, psi, v], matching the
+    controller in car_ros2/mpc_controller.py. The simulation model remains DBM.
+    """
+
     def __init__(
         self,
         dt,
@@ -24,24 +31,21 @@ class MPCController:
         max_steer_rate,
         db_params,
         track_width,
-        max_state_vel_rate,
-        max_state_speed,
-        max_lateral_speed,
-        max_yaw_rate,
+        max_state_speed=5.0,
     ):
         self.dt = dt
         self.horizon = horizon
-        self.Q = Q
+        self.Q = Q[:2, :2] if Q.shape[0] > 2 else Q
         self.R = R
         self.max_vel_rate = max_vel_rate
         self.max_steer_rate = max_steer_rate
-        self.track_half_width = track_width / 2.0
-        self.max_state_vel_rate = max_state_vel_rate
-        self.max_state_speed = max_state_speed
-        self.max_lateral_speed = max_lateral_speed
-        self.max_yaw_rate = max_yaw_rate
         self.p = db_params
-        self.n_states = 6
+        self.track_half_width = track_width / 2.0
+        self.max_speed = max_state_speed
+        self.last_loss = np.nan
+        self.last_track_loss = np.nan
+        self.last_action_loss = np.nan
+        self.n_states = 4
         self.n_controls = 2
 
         self.X = cs.SX.sym("X", self.n_states, self.horizon + 1)
@@ -52,74 +56,42 @@ class MPCController:
 
         self._build_problem()
 
-    def _dbm_dxdt_casadi(self, state, u):
-        x, y, vx, vy, psi, omega = state[0], state[1], state[2], state[3], state[4], state[5]
-        target_vel = u[0]
-        target_steer = u[1]
-        steer = target_steer * self.p.Sa + self.p.Sb
-        prev_vel = cs.sqrt(vx**2 + vy**2 + 1e-6)
-        throttle = target_vel * self.p.Ta - target_vel * self.p.Tb * prev_vel
-        dx = vx * cs.cos(psi) - vy * cs.sin(psi)
-        dy = vx * cs.sin(psi) + vy * cs.cos(psi)
-        dpsi = omega
-        safe_vx = cs.fmax(vx, 0.5)
-        alpha_f = steer - cs.atan((self.p.LF * omega + vy) / safe_vx)
-        alpha_r = cs.atan((self.p.LR * omega - vy) / safe_vx)
-        sign_vx = cs.if_else(vx > 0, 1, cs.if_else(vx < 0, -1, 0))
-        F_rx = throttle - self.p.fr * self.p.MASS * GRAVITY * sign_vx
-        F_fz = (
-            0.5 * self.p.MASS * GRAVITY * self.p.LR / (self.p.LF + self.p.LR)
-            - 0.5 * self.p.hcom / (self.p.LF + self.p.LR) * F_rx
+    def _vehicle_dynamics(self, xk, uk):
+        x, y, psi, v = xk[0], xk[1], xk[2], xk[3]
+        target_vel = uk[0]
+        target_steer = uk[1]
+        wheelbase = self.p.LF + self.p.LR
+        actual_steer = target_steer * self.p.Sa + self.p.Sb
+        throttle_force = target_vel * self.p.Ta - target_vel * self.p.Tb * v
+        acceleration = throttle_force / self.p.MASS - self.p.fr * GRAVITY
+
+        return cs.vertcat(
+            x + v * cs.cos(psi) * self.dt,
+            y + v * cs.sin(psi) * self.dt,
+            psi + (v / wheelbase) * cs.tan(actual_steer) * self.dt,
+            v + acceleration * self.dt,
         )
-        F_rz = (
-            0.5 * self.p.MASS * GRAVITY * self.p.LF / (self.p.LF + self.p.LR)
-            + 0.5 * self.p.hcom / (self.p.LF + self.p.LR) * F_rx
-        )
-        F_fy = 2 * self.p.mu * F_fz * cs.sin(self.p.Cf * cs.arctan(self.p.Bf * alpha_f))
-        F_ry = 2 * self.p.mu * F_rz * cs.sin(self.p.Cr * cs.arctan(self.p.Br * alpha_r))
-        dvx = (F_rx - F_fy * cs.sin(steer) + vy * omega * self.p.MASS) / self.p.MASS
-        dvy = (F_ry + F_fy * cs.cos(steer) - vx * omega * self.p.MASS) / self.p.MASS
-        domega = (F_fy * self.p.LF * cs.cos(steer) - F_ry * self.p.LR) / self.p.Iz
-        return cs.vertcat(dx, dy, dvx, dvy, dpsi, domega)
 
     def _build_problem(self):
-        cost = 0
+        track_cost = 0
+        action_cost = 0
         g_eq = [self.X[:, 0] - self.x0]
+
         for k in range(self.horizon):
-            dxdt = self._dbm_dxdt_casadi(self.X[:, k], self.U[:, k])
-            x_next = self.X[:, k] + self.dt * dxdt
+            x_next = self._vehicle_dynamics(self.X[:, k], self.U[:, k])
             g_eq.append(self.X[:, k + 1] - x_next)
 
-        for k in range(self.horizon + 1):
-            psi_err = cs.atan2(cs.sin(self.X[4, k] - self.ref[3, k]), cs.cos(self.X[4, k] - self.ref[3, k]))
-            err = cs.vertcat(
-                self.X[0, k] - self.ref[0, k],
-                self.X[1, k] - self.ref[1, k],
-                self.X[2, k] - self.ref[2, k],
-                psi_err,
-            )
-            cost += err.T @ self.Q @ err
-
         g_ineq = []
-        for k in range(self.horizon):
-            if k == 0:
-                du = self.U[:, k] - self.u_prev
-            else:
-                du = self.U[:, k] - self.U[:, k - 1]
-            cost += du.T @ self.R @ du
-            vel_rate = du[0] / self.dt
-            steer_rate = du[1] / self.dt
-            g_ineq.append(vel_rate - self.max_vel_rate)
-            g_ineq.append(-vel_rate - self.max_vel_rate)
-            g_ineq.append(steer_rate - self.max_steer_rate)
-            g_ineq.append(-steer_rate - self.max_steer_rate)
-
         for k in range(1, self.horizon + 1):
-            state_vel_rate = (self.X[2, k] - self.X[2, k - 1]) / self.dt
-            g_ineq.append(state_vel_rate - self.max_state_vel_rate)
-            g_ineq.append(-state_vel_rate - self.max_state_vel_rate)
+            dx = self.X[0, k] - self.ref[4, k]
+            dy = self.X[1, k] - self.ref[5, k]
+            tangent_x = self.ref[7, k]
+            tangent_y = -self.ref[6, k]
+            car_px = self.ref[0, k] + dx * tangent_x + dy * tangent_y
+            car_py = dx * self.ref[6, k] + dy * self.ref[7, k]
+            pos_err = cs.vertcat(car_px - self.ref[0, k], car_py - self.ref[1, k])
+            track_cost += pos_err.T @ self.Q @ pos_err
 
-        for k in range(1, self.horizon + 1):
             lateral_e = (
                 (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
                 + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
@@ -127,6 +99,21 @@ class MPCController:
             g_ineq.append(lateral_e - self.track_half_width)
             g_ineq.append(-lateral_e - self.track_half_width)
 
+        for k in range(self.horizon):
+            if k == 0:
+                du = self.U[:, k] - self.u_prev
+            else:
+                du = self.U[:, k] - self.U[:, k - 1]
+            action_cost += du.T @ self.R @ du
+
+            vel_rate = du[0] / self.dt
+            steer_rate = du[1] / self.dt
+            g_ineq.append(vel_rate - self.max_vel_rate)
+            g_ineq.append(-vel_rate - self.max_vel_rate)
+            g_ineq.append(steer_rate - self.max_steer_rate)
+            g_ineq.append(-steer_rate - self.max_steer_rate)
+
+        cost = track_cost + action_cost
         self.g = cs.vertcat(*g_eq, *g_ineq)
         self.x_opt = cs.vertcat(cs.reshape(self.X, -1, 1), cs.reshape(self.U, -1, 1))
         self.p_opt = cs.vertcat(
@@ -136,38 +123,47 @@ class MPCController:
         )
 
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
-        opts = {"ipopt.print_level": 0, "print_time": False, "ipopt.max_iter": 100}
+        opts = {"ipopt.print_level": 0, "print_time": False, "ipopt.max_iter": 500}
         self.solver = cs.nlpsol("mpc_solver", "ipopt", nlp, opts)
+        self.loss_fn = cs.Function(
+            "mpc_loss_parts",
+            [self.x_opt, self.p_opt],
+            [cost, track_cost, action_cost],
+        )
 
         self.n_x = self.n_states * (self.horizon + 1)
         self.n_u = self.n_controls * self.horizon
-        self.n_eq = len(g_eq) * 6
+        self.n_eq = len(g_eq) * self.n_states
         self.n_total = self.g.size1()
 
     def solve(self, x0, ref_traj, u_prev):
-        X_guess = np.tile(x0.reshape(-1, 1), (1, self.horizon + 1))
+        x0_mpc = np.array([x0[0], x0[1], x0[2], max(x0[3], 0.0)])
+        X_guess = np.tile(x0_mpc.reshape(-1, 1), (1, self.horizon + 1))
         U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
         x_init = np.concatenate([X_guess.T.reshape(-1), U_guess.T.reshape(-1)])
-        p_val = np.concatenate([x0.reshape(-1, 1), ref_traj.T.reshape(-1, 1), u_prev.reshape(-1, 1)])
+        p_val = np.concatenate([x0_mpc.reshape(-1, 1), ref_traj.T.reshape(-1, 1), u_prev.reshape(-1, 1)])
+
         lbx = np.full(self.n_x + self.n_u, -np.inf)
         ubx = np.full(self.n_x + self.n_u, np.inf)
-        vel_start = self.n_x
-        for k in range(self.horizon):
-            lbx[vel_start + k * 2] = 0.0
-            ubx[vel_start + k * 2] = 1.0
-            lbx[vel_start + k * 2 + 1] = -1.0
-            ubx[vel_start + k * 2 + 1] = 1.0
         for k in range(self.horizon + 1):
-            lbx[k * self.n_states + 2] = 0.0
-            ubx[k * self.n_states + 2] = self.max_state_speed
-            lbx[k * self.n_states + 3] = -self.max_lateral_speed
-            ubx[k * self.n_states + 3] = self.max_lateral_speed
-            lbx[k * self.n_states + 5] = -self.max_yaw_rate
-            ubx[k * self.n_states + 5] = self.max_yaw_rate
+            lbx[k * self.n_states + 3] = 0.0
+            ubx[k * self.n_states + 3] = self.max_speed
+
+        u_start = self.n_x
+        for k in range(self.horizon):
+            lbx[u_start + k * 2] = 0.0
+            ubx[u_start + k * 2] = 1.0
+            lbx[u_start + k * 2 + 1] = -1.0
+            ubx[u_start + k * 2 + 1] = 1.0
+
         lbg = np.zeros(self.n_total)
         ubg = np.zeros(self.n_total)
         lbg[self.n_eq:] = -np.inf
         sol = self.solver(x0=x_init, lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p_val)
         x_opt = sol["x"].full().flatten()
+        loss, track_loss, action_loss = self.loss_fn(x_opt, p_val)
+        self.last_loss = float(loss)
+        self.last_track_loss = float(track_loss)
+        self.last_action_loss = float(action_loss)
         u_opt = x_opt[self.n_x:].reshape(self.n_controls, self.horizon)
         return u_opt, u_opt[:, 0]

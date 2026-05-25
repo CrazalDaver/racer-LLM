@@ -11,11 +11,11 @@ class CarState:
         self.omega = omega
 
     def to_array(self):
-        return np.array([self.x, self.y, self.vx, self.vy, self.psi, self.omega])
+        return np.array([self.x, self.y, self.psi, self.vx, self.vy, self.omega])
 
     @classmethod
     def from_array(cls, arr):
-        return cls(x=arr[0], y=arr[1], vx=arr[2], vy=arr[3], psi=arr[4], omega=arr[5])
+        return cls(x=arr[0], y=arr[1], psi=arr[2], vx=arr[3], vy=arr[4], omega=arr[5])
 
 
 class CarAction:

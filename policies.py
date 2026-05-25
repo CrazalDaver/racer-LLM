@@ -17,7 +17,11 @@ class BasePolicy(abc.ABC):
         self.track = track
         self.mpc = mpc
         self.step_distance = step_distance
-        self.last_u = np.array([0.5, 0.0])
+        self.last_u = np.array([0.5, self._neutral_steer_command()])
+        self.last_ref_traj = None
+
+    def _neutral_steer_command(self) -> float:
+        return np.clip(-self.mpc.p.Sb / self.mpc.p.Sa, -1.0, 1.0)
 
     @abc.abstractmethod
     def get_reference_trajectory(self, state: CarState, current_s: float) -> np.ndarray:
@@ -25,11 +29,15 @@ class BasePolicy(abc.ABC):
 
     def get_action(self, state: CarState, current_s: float) -> CarAction:
         ref_traj = self.get_reference_trajectory(state, current_s)
+        self.last_ref_traj = ref_traj
         state_arr = state.to_array()
         try:
             _, u_first = self.mpc.solve(state_arr, ref_traj, self.last_u)
         except Exception as e:
             print(f"MPC solve failed: {e}, using last control")
+            self.mpc.last_loss = np.nan
+            self.mpc.last_track_loss = np.nan
+            self.mpc.last_action_loss = np.nan
             u_first = self.last_u
 
         target_vel = np.clip(u_first[0], 0.0, 1.0)
@@ -45,8 +53,8 @@ class CenterLinePolicy(BasePolicy):
         for k in range(horizon + 1):
             s = current_s + k * self.step_distance
             x, y, psi = self.track.interpolate(s)
-            ref[0, k] = x
-            ref[1, k] = y
+            ref[0, k] = s % self.track.total_length
+            ref[1, k] = 0.0
             ref[2, k] = state.vx
             ref[3, k] = psi
             ref[4, k] = x
@@ -62,78 +70,106 @@ class AlphaRacerPolicy(BasePolicy):
     The current example offsets the reference path from the centerline.
     """
 
-    def __init__(self, track, mpc, step_distance=1.2, params=None, raceline: RaceLine = None, max_speed=5.0):
+    def __init__(
+        self,
+        track,
+        mpc,
+        step_distance=1.2,
+        params=None,
+        raceline: RaceLine = None,
+        max_speed=5.0,
+    ):
         super().__init__(track, mpc, step_distance)
         self.params = params if params is not None else np.array([1.0, 0.0, 0.5, 0.2, 0.1])
         self.raceline = raceline
         self.max_speed = max_speed
         self.last_raceline_s = None
 
-    def get_action(self, state: CarState, current_s: float) -> CarAction:
-        action = super().get_action(state, current_s)
-        _, center_error = self.track.project(state.x, state.y, s_hint=current_s, search_radius=4.0)
+    def _raceline_frenet_state(self, raceline_s: float, center_hint: float = None) -> dict:
+        point = self.raceline.interpolate(raceline_s)
+        center_s, lateral_e = self.track.project(
+            point["x_m"],
+            point["y_m"],
+            s_hint=center_hint,
+            search_radius=8.0,
+            psi_hint=point["psi_rad"],
+            max_heading_error=math.pi / 2.0,
+        )
+        xc, yc, psi_center = self.track.interpolate(center_s)
+        return {
+            "track_s": center_s,
+            "lateral_e": lateral_e,
+            "speed": min(point["vx_mps"], self.max_speed),
+            "center_x": xc,
+            "center_y": yc,
+            "psi_center": psi_center,
+            "normal_x": -math.sin(psi_center),
+            "normal_y": math.cos(psi_center),
+        }
 
-        if abs(center_error) < 0.65:
-            return action
-
-        lookahead_s = current_s + max(0.8, 0.6 * max(state.vx, 0.5))
-        target_x, target_y, _ = self.track.interpolate(lookahead_s)
-        dx = target_x - state.x
-        dy = target_y - state.y
-        local_x = dx * math.cos(state.psi) + dy * math.sin(state.psi)
-        local_y = dy * math.cos(state.psi) - dx * math.sin(state.psi)
-        dist2 = max(local_x * local_x + local_y * local_y, 1e-4)
-
-        wheelbase = self.mpc.p.LF + self.mpc.p.LR
-        desired_actual_steer = np.clip(2.0 * wheelbase * local_y / dist2, -self.mpc.p.Sa, self.mpc.p.Sa)
-        target_steer = (desired_actual_steer - self.mpc.p.Sb) / self.mpc.p.Sa
-
-        action.steer = np.clip(target_steer, -1.0, 1.0)
-        action.throttle = min(action.throttle, 0.35)
-        self.last_u = np.array([action.throttle, action.steer])
-        return action
+    def _raceline_frenet_velocity(self, raceline_s: float, center_s: float, lateral_e: float) -> tuple:
+        ds = 0.2
+        next_state = self._raceline_frenet_state(raceline_s + ds, center_hint=center_s + ds)
+        speed = next_state["speed"]
+        track_delta = math.atan2(
+            math.sin((next_state["track_s"] - center_s) * 2.0 * math.pi / self.track.total_length),
+            math.cos((next_state["track_s"] - center_s) * 2.0 * math.pi / self.track.total_length),
+        ) * self.track.total_length / (2.0 * math.pi)
+        lateral_delta = next_state["lateral_e"] - lateral_e
+        return speed * track_delta / ds, speed * lateral_delta / ds
 
     def get_reference_trajectory(self, state: CarState, current_s: float) -> np.ndarray:
         horizon = self.mpc.horizon
         q, zeta, s1, s2, s3 = self.params
         ref = np.zeros((8, horizon + 1))
         raceline_s = None
-        base_point = None
         if self.raceline is not None:
             raceline_s, _ = self.raceline.project(
                 state.x,
                 state.y,
                 s_hint=self.last_raceline_s,
                 search_radius=4.0,
+                psi_hint=state.psi,
+                max_heading_error=math.pi / 2.0,
             )
             self.last_raceline_s = raceline_s
-            base_point = self.raceline.interpolate(raceline_s)
+            target_raceline_s = raceline_s
+            frenet = self._raceline_frenet_state(raceline_s, center_hint=current_s)
+            p_pert_x = frenet["track_s"]
+            p_pert_y = frenet["lateral_e"]
         for k in range(horizon + 1):
             if self.raceline is not None:
-                s = raceline_s + k * self.mpc.dt * max(base_point["vx_mps"], 0.5)
-                point = self.raceline.interpolate(s)
-                xc, yc, psi_center = self.track.interpolate(s)
-                ref[0, k] = point["x_m"]
-                ref[1, k] = point["y_m"]
-                ref[2, k] = min(point["vx_mps"], self.max_speed)
-                ref[3, k] = point["psi_rad"]
+                frenet = self._raceline_frenet_state(target_raceline_s, center_hint=p_pert_x)
+                p_ref_x = p_pert_x % self.track.total_length
+                p_ref_y = float(np.clip(p_pert_y, -self.mpc.track_half_width, self.mpc.track_half_width))
+                xc, yc, psi_center = self.track.interpolate(p_ref_x)
+                ref[0, k] = p_ref_x
+                ref[1, k] = p_ref_y
+                ref[2, k] = frenet["speed"]
+                ref[3, k] = psi_center
                 ref[4, k] = xc
                 ref[5, k] = yc
                 ref[6, k] = -math.sin(psi_center)
                 ref[7, k] = math.cos(psi_center)
+
+                vx_rl, vy_rl = self._raceline_frenet_velocity(
+                    target_raceline_s,
+                    frenet["track_s"],
+                    frenet["lateral_e"],
+                )
+                p_pert_x += zeta * vx_rl * self.mpc.dt
+                p_pert_y += zeta * vy_rl * self.mpc.dt
+                target_raceline_s += self.mpc.dt * max(frenet["speed"], 0.5)
             else:
                 s = current_s + k * self.step_distance
                 xc, yc, psi = self.track.interpolate(s)
-                nx = -math.sin(psi)
-                ny = math.cos(psi)
-                offset = s1 * math.sin(s3 * s) * math.exp(-s2 * s)
-                offset *= q
-                ref[0, k] = xc + offset * nx
-                ref[1, k] = yc + offset * ny
+                offset = np.clip(s1 * math.sin(s3 * s) * math.exp(-s2 * s), -self.mpc.track_half_width, self.mpc.track_half_width)
+                ref[0, k] = s % self.track.total_length
+                ref[1, k] = offset
                 ref[2, k] = state.vx
                 ref[3, k] = psi
                 ref[4, k] = xc
                 ref[5, k] = yc
-                ref[6, k] = nx
-                ref[7, k] = ny
+                ref[6, k] = -math.sin(psi)
+                ref[7, k] = math.cos(psi)
         return ref

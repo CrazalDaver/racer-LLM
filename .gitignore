@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+Figure_*.png
+simulation_trace.npz

@@ -5,31 +5,74 @@ from typing import Tuple
 import numpy as np
 
 
-class Track:
-    def __init__(self, waypoints: np.ndarray, closed: bool = True):
-        self.waypoints = np.asarray(waypoints, dtype=float)
-        if closed and np.linalg.norm(self.waypoints[0] - self.waypoints[-1]) > 1e-6:
-            self.waypoints = np.vstack([self.waypoints, self.waypoints[0]])
-        self._precompute()
+class ProjectablePath:
+    def _precompute_projection(self, projection_waypoints: np.ndarray, set_total_length: bool = False):
+        self._projection_waypoints = np.asarray(projection_waypoints, dtype=float)
+        self._seg_vectors = np.diff(self._projection_waypoints, axis=0)
+        self._seg_lengths = np.linalg.norm(self._seg_vectors, axis=1)
+        self._cum_len = np.cumsum(np.insert(self._seg_lengths, 0, 0))
+        self._tangents = self._seg_vectors / (self._seg_lengths[:, None] + 1e-8)
+        self._normals = np.array([[-t[1], t[0]] for t in self._tangents])
+        self._normals = self._normals / (np.linalg.norm(self._normals, axis=1, keepdims=True) + 1e-8)
 
-    def _precompute(self):
-        self.seg_vectors = np.diff(self.waypoints, axis=0)
-        self.seg_lengths = np.linalg.norm(self.seg_vectors, axis=1)
-        self.cum_len = np.cumsum(np.insert(self.seg_lengths, 0, 0))
-        self.total_length = self.cum_len[-1]
-        self.tangents = self.seg_vectors / (self.seg_lengths[:, None] + 1e-8)
-        self.normals = np.array([[-t[1], t[0]] for t in self.tangents])
-        self.normals = self.normals / (np.linalg.norm(self.normals, axis=1, keepdims=True) + 1e-8)
+        if set_total_length:
+            self.total_length = self._cum_len[-1]
 
-    def project(self, x: float, y: float, s_hint: float = None, search_radius: float = None) -> Tuple[float, float]:
+        self.seg_vectors = self._seg_vectors
+        self.seg_lengths = self._seg_lengths
+        self.cum_len = self._cum_len
+        self.tangents = self._tangents
+        self.normals = self._normals
+
+    def project(
+        self,
+        x: float,
+        y: float,
+        s_hint: float = None,
+        search_radius: float = None,
+        psi_hint: float = None,
+        max_heading_error: float = None,
+    ) -> Tuple[float, float]:
+        result = self._project_impl(
+            x,
+            y,
+            s_hint=s_hint,
+            search_radius=search_radius,
+            psi_hint=psi_hint,
+            max_heading_error=max_heading_error,
+        )
+        if result is not None:
+            return result
+        if s_hint is not None and search_radius is not None:
+            result = self._project_impl(
+                x,
+                y,
+                s_hint=s_hint,
+                search_radius=search_radius * 2.0,
+            )
+            if result is not None:
+                return result
+        return self._project_impl(x, y)
+
+    def _project_impl(
+        self,
+        x: float,
+        y: float,
+        s_hint: float = None,
+        search_radius: float = None,
+        psi_hint: float = None,
+        max_heading_error: float = None,
+    ) -> Tuple[float, float]:
         pos = np.array([x, y])
         best_dist = np.inf
         best_idx = -1
         best_t = 0.0
         best_closest = None
 
-        for i, (p0, p1) in enumerate(zip(self.waypoints[:-1], self.waypoints[1:])):
-            if not self._segment_is_near_hint(self.cum_len[i], s_hint, search_radius):
+        for i, (p0, p1) in enumerate(zip(self._projection_waypoints[:-1], self._projection_waypoints[1:])):
+            if not _is_near_progress(self.cum_len[i], s_hint, search_radius, self.total_length):
+                continue
+            if not _is_heading_compatible(self.tangents[i], psi_hint, max_heading_error):
                 continue
             seg_vec = p1 - p0
             seg_len = self.seg_lengths[i]
@@ -46,17 +89,20 @@ class Track:
                 best_closest = closest
 
         if best_idx == -1:
-            return self.project(x, y)
+            return None
 
         normal = self.normals[best_idx]
         signed_e = np.dot(pos - best_closest, normal)
         s = self.cum_len[best_idx] + best_t * self.seg_lengths[best_idx]
-        return s % self.total_length, signed_e
+        return _unwrap_progress(s % self.total_length, s_hint, self.total_length), signed_e
 
-    def _segment_is_near_hint(self, seg_s: float, s_hint: float, search_radius: float) -> bool:
-        if s_hint is None or search_radius is None:
-            return True
-        return _circular_distance(seg_s, s_hint, self.total_length) <= search_radius
+
+class Track(ProjectablePath):
+    def __init__(self, waypoints: np.ndarray, closed: bool = True):
+        self.waypoints = np.asarray(waypoints, dtype=float)
+        if closed and np.linalg.norm(self.waypoints[0] - self.waypoints[-1]) > 1e-6:
+            self.waypoints = np.vstack([self.waypoints, self.waypoints[0]])
+        self._precompute_projection(self.waypoints, set_total_length=True)
 
     def interpolate(self, s: float) -> Tuple[float, float, float]:
         if self.total_length > 0:
@@ -76,6 +122,10 @@ class Track:
         psi = self._get_psi_at_seg(idx)
         return x, y, psi
 
+    def frenet_to_world(self, s: float, e: float) -> Tuple[float, float]:
+        x, y, psi = self.interpolate(s)
+        return x - e * math.sin(psi), y + e * math.cos(psi)
+
     def _get_psi_at_seg(self, idx: int) -> float:
         if idx >= len(self.tangents):
             idx = len(self.tangents) - 1
@@ -90,7 +140,7 @@ def create_test_track(num_points=300, radius=14.0):
     return np.column_stack([x, y])
 
 
-class RaceLine:
+class RaceLine(ProjectablePath):
     """
     alpha-RACER style raceline.
 
@@ -135,56 +185,13 @@ class RaceLine:
             "dev_m": np.interp(s_wrapped, s_ext, dev_ext),
         }
 
-    def project(self, x: float, y: float, s_hint: float = None, search_radius: float = None) -> Tuple[float, float]:
-        pos = np.array([x, y])
-        best_dist = np.inf
-        best_idx = -1
-        best_t = 0.0
-        best_closest = None
-
-        for i, (p0, p1) in enumerate(zip(self._closed_waypoints[:-1], self._closed_waypoints[1:])):
-            if not self._segment_is_near_hint(self._cum_len[i], s_hint, search_radius):
-                continue
-            seg_vec = p1 - p0
-            seg_len = self._seg_lengths[i]
-            if seg_len < 1e-6:
-                continue
-            t = np.dot(pos - p0, seg_vec) / (seg_len * seg_len)
-            t = np.clip(t, 0.0, 1.0)
-            closest = p0 + t * seg_vec
-            dist = np.linalg.norm(pos - closest)
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = i
-                best_t = t
-                best_closest = closest
-
-        if best_idx == -1:
-            return self.project(x, y)
-
-        normal = self._normals[best_idx]
-        signed_e = np.dot(pos - best_closest, normal)
-        s = self._cum_len[best_idx] + best_t * self._seg_lengths[best_idx]
-        return s % self.total_length, signed_e
-
-    def _segment_is_near_hint(self, seg_s: float, s_hint: float, search_radius: float) -> bool:
-        if s_hint is None or search_radius is None:
-            return True
-        return _circular_distance(seg_s, s_hint, self.total_length) <= search_radius
-
     def _compute_heading(self):
         dx = np.gradient(self.x)
         dy = np.gradient(self.y)
         return np.arctan2(dy, dx)
 
     def _precompute_segments(self):
-        self._closed_waypoints = np.vstack([self.waypoints, self.waypoints[0]])
-        seg_vectors = np.diff(self._closed_waypoints, axis=0)
-        self._seg_lengths = np.linalg.norm(seg_vectors, axis=1)
-        self._cum_len = np.cumsum(np.insert(self._seg_lengths, 0, 0))
-        tangents = seg_vectors / (self._seg_lengths[:, None] + 1e-8)
-        self._normals = np.array([[-t[1], t[0]] for t in tangents])
-        self._normals = self._normals / (np.linalg.norm(self._normals, axis=1, keepdims=True) + 1e-8)
+        self._precompute_projection(np.vstack([self.waypoints, self.waypoints[0]]))
 
 
 def load_centerline_csv(path) -> np.ndarray:
@@ -195,6 +202,25 @@ def load_raceline_csv(path) -> RaceLine:
     return RaceLine(np.genfromtxt(Path(path), delimiter=",", comments="#"))
 
 
-def _circular_distance(a: float, b: float, length: float) -> float:
-    delta = abs((a - b) % length)
-    return min(delta, length - delta)
+def _is_near_progress(seg_s: float, s_hint: float, search_radius: float, total_length: float) -> bool:
+    if s_hint is None or search_radius is None:
+        return True
+    delta = abs((seg_s - s_hint) % total_length)
+    return min(delta, total_length - delta) <= search_radius
+
+
+def _is_heading_compatible(tangent: np.ndarray, psi_hint: float, max_heading_error: float) -> bool:
+    if psi_hint is None or max_heading_error is None:
+        return True
+    seg_psi = math.atan2(tangent[1], tangent[0])
+    err = math.atan2(math.sin(seg_psi - psi_hint), math.cos(seg_psi - psi_hint))
+    return abs(err) <= max_heading_error
+
+
+def _unwrap_progress(s: float, s_hint: float, total_length: float) -> float:
+    if s_hint is None:
+        return s
+    return s_hint + math.atan2(
+        math.sin((s - s_hint) * 2.0 * math.pi / total_length),
+        math.cos((s - s_hint) * 2.0 * math.pi / total_length),
+    ) * total_length / (2.0 * math.pi)

@@ -9,7 +9,7 @@ class DynamicBicycleModel:
         self.p = db_params
 
     def _dbm_dxdt(self, state, target_vel, target_steer):
-        x, y, vx, vy, psi, omega = state
+        x, y, psi, vx, vy, omega = state
         steer = target_steer * self.p.Sa + self.p.Sb
         prev_vel = max(np.sqrt(vx**2 + vy**2), 0.1)
         throttle = target_vel * self.p.Ta - target_vel * self.p.Tb * prev_vel
@@ -33,7 +33,7 @@ class DynamicBicycleModel:
         dvx = (F_rx - F_fy * np.sin(steer) + vy * omega * self.p.MASS) / self.p.MASS
         dvy = (F_ry + F_fy * np.cos(steer) - vx * omega * self.p.MASS) / self.p.MASS
         domega = (F_fy * self.p.LF * np.cos(steer) - F_ry * self.p.LR) / self.p.Iz
-        return np.array([dx, dy, dvx, dvy, dpsi, domega])
+        return np.array([dx, dy, dpsi, dvx, dvy, domega])
 
     def step(self, state, target_vel, target_steer):
         def f(s, tv, ts):

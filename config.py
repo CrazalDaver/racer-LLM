@@ -31,19 +31,17 @@ class SimParams:
     TRACK_WIDTH = 2.0
     OFFROAD_TOLERANCE = 0.55
     OFFROAD_STRENGTH = 3.0
-    MPC_HORIZON = 6
-    Q = np.diag([5.0, 5.0, 0.5, 1.0])
-    R = np.diag([0.05, 0.005])
+    MPC_DT = 0.1
+    MPC_HORIZON = 10
+    Q = np.diag([1.0, 1.0])
+    R = np.diag([1.0, 1.0])
     MAX_VEL_RATE = 8.0
-    MAX_STATE_VEL_RATE = 4.0
-    MAX_STATE_SPEED = 6.0
-    MAX_LATERAL_SPEED = 3.0
-    MAX_YAW_RATE = 8.0
+    MAX_STATE_SPEED = 5.0
     MAX_STEER_RATE = 4.0
-    MAX_RACELINE_SPEED = 3.0
+    MAX_RACELINE_SPEED = 5.0
     PROJECTION_SEARCH_RADIUS = 4.0
-    RECOVERY_ERROR_THRESHOLD = 0.65
-    RECOVERY_THROTTLE = 0.35
+    PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
+    TRACE_OUTPUT = "simulation_trace.npz"
 
 
 params = SimParams()
