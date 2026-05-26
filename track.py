@@ -185,6 +185,26 @@ class RaceLine(ProjectablePath):
             "dev_m": np.interp(s_wrapped, s_ext, dev_ext),
         }
 
+    def nearest_index(
+        self,
+        x: float,
+        y: float,
+        last_idx: int = None,
+        back_steps: int = 20,
+        forward_steps: int = 200,
+    ) -> int:
+        if last_idx is None:
+            dx = self.x - x
+            dy = self.y - y
+            return int(np.argmin(dx * dx + dy * dy))
+
+        n_points = len(self.x)
+        offsets = np.arange(-back_steps, forward_steps + 1)
+        indices = (int(last_idx) + offsets) % n_points
+        dx = self.x[indices] - x
+        dy = self.y[indices] - y
+        return int(indices[np.argmin(dx * dx + dy * dy)])
+
     def _compute_heading(self):
         dx = np.gradient(self.x)
         dy = np.gradient(self.y)

@@ -53,6 +53,7 @@ class MPCController:
         self.x0 = cs.SX.sym("x0", self.n_states, 1)
         self.ref = cs.SX.sym("ref", 8, self.horizon + 1)
         self.u_prev = cs.SX.sym("u_prev", self.n_controls, 1)
+        self.q_weight = cs.SX.sym("q_weight", 1)
 
         self._build_problem()
 
@@ -82,7 +83,7 @@ class MPCController:
             g_eq.append(self.X[:, k + 1] - x_next)
 
         g_ineq = []
-        for k in range(1, self.horizon + 1):
+        for k in range(self.horizon + 1):
             dx = self.X[0, k] - self.ref[4, k]
             dy = self.X[1, k] - self.ref[5, k]
             tangent_x = self.ref[7, k]
@@ -90,14 +91,15 @@ class MPCController:
             car_px = self.ref[0, k] + dx * tangent_x + dy * tangent_y
             car_py = dx * self.ref[6, k] + dy * self.ref[7, k]
             pos_err = cs.vertcat(car_px - self.ref[0, k], car_py - self.ref[1, k])
-            track_cost += pos_err.T @ self.Q @ pos_err
+            track_cost += self.q_weight * (pos_err.T @ self.Q @ pos_err)
 
-            lateral_e = (
-                (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
-                + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
-            )
-            g_ineq.append(lateral_e - self.track_half_width)
-            g_ineq.append(-lateral_e - self.track_half_width)
+            if k > 0:
+                lateral_e = (
+                    (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
+                    + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
+                )
+                g_ineq.append(lateral_e - self.track_half_width)
+                g_ineq.append(-lateral_e - self.track_half_width)
 
         for k in range(self.horizon):
             if k == 0:
@@ -120,6 +122,7 @@ class MPCController:
             cs.reshape(self.x0, -1, 1),
             cs.reshape(self.ref, -1, 1),
             cs.reshape(self.u_prev, -1, 1),
+            self.q_weight,
         )
 
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
@@ -136,12 +139,19 @@ class MPCController:
         self.n_eq = len(g_eq) * self.n_states
         self.n_total = self.g.size1()
 
-    def solve(self, x0, ref_traj, u_prev):
+    def solve(self, x0, ref_traj, u_prev, q_weight=1.0):
         x0_mpc = np.array([x0[0], x0[1], x0[2], max(x0[3], 0.0)])
         X_guess = np.tile(x0_mpc.reshape(-1, 1), (1, self.horizon + 1))
         U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
         x_init = np.concatenate([X_guess.T.reshape(-1), U_guess.T.reshape(-1)])
-        p_val = np.concatenate([x0_mpc.reshape(-1, 1), ref_traj.T.reshape(-1, 1), u_prev.reshape(-1, 1)])
+        p_val = np.concatenate(
+            [
+                x0_mpc.reshape(-1, 1),
+                ref_traj.T.reshape(-1, 1),
+                u_prev.reshape(-1, 1),
+                np.array([[float(q_weight)]]),
+            ]
+        )
 
         lbx = np.full(self.n_x + self.n_u, -np.inf)
         ubx = np.full(self.n_x + self.n_u, np.inf)
@@ -165,5 +175,5 @@ class MPCController:
         self.last_loss = float(loss)
         self.last_track_loss = float(track_loss)
         self.last_action_loss = float(action_loss)
-        u_opt = x_opt[self.n_x:].reshape(self.n_controls, self.horizon)
+        u_opt = x_opt[self.n_x:].reshape(self.horizon, self.n_controls).T
         return u_opt, u_opt[:, 0]
