@@ -17,7 +17,7 @@ def create_policy(policy_type, track, mpc, raceline=None):
             track,
             mpc,
             step_distance=params.DT * params.MAX_RACELINE_SPEED,
-            params=np.array([1.0, 1.0, 0.8, 0.1, 0.5]),  # q, zeta, s1, s2, s3
+            params=np.array([1.2, 1.0, 0.8, 0.1, 0.5]),  # q, zeta, s1, s2, s3
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
             search_back_steps=params.RACELINE_SEARCH_BACK_STEPS,
