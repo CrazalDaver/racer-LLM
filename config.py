@@ -1,19 +1,21 @@
 import numpy as np
+import copy
 
 
 GRAVITY = 9.81
 
 
 class DynamicParams:
-    def __init__(self):
+    def __init__(self, vehicle_model_type="dbm"):
+        model_type = vehicle_model_type.lower()
         self.LF = 0.11
         self.LR = 0.23
         self.MASS = 4.65
         self.Iz = 0.1
         self.Ta = 5.5
         self.Tb = -1.0
-        self.Sa = 0.36
-        self.Sb = 0.03
+        self.Sa = 0.60
+        self.Sb = 0.0
         self.mu = 3.0
         self.Cf = 1.0
         self.Cr = 1.0
@@ -21,30 +23,77 @@ class DynamicParams:
         self.Br = 60.0
         self.hcom = 0.0
         self.fr = 0.1
+        self.ros_kinematic = False
+
+        if model_type in {"kinematic", "kinetic", "kinetics"}:
+            self._use_kinematic_baseline()
+        elif model_type != "dbm":
+            raise ValueError(f"Unknown vehicle model: {vehicle_model_type}")
+
+    def _use_kinematic_baseline(self):
+        # Match the alpha-RACER ROS kinematic baseline while using the larger
+        # steering scale needed by the current raceline curvature.
+        self.LF = 0.11
+        self.LR = 0.23
+        self.Sa = 0.80 # 
+        self.Sb = 0.0
+        self.Ta = 20.0 / 4.65
+        self.Tb = 0.0
+        self.fr = 1.0
+        self.ros_kinematic = True
+
+    def copy(self):
+        return copy.copy(self)
+
+
+def make_vehicle_params(vehicle_model_type):
+    return DynamicParams(vehicle_model_type)
 
 
 class SimParams:
     DT = 0.02
-    TOTAL_TIME = 25.0
+    TOTAL_TIME = 30.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
     TRACK_WIDTH = 2.0
     OFFROAD_TOLERANCE = 0.55
-    OFFROAD_STRENGTH = 3.0
+    OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
     MPC_DT = 0.1
-    MPC_HORIZON = 5
+
+    MPC_HORIZON = 8
+
     Q = np.diag([1.0, 1.0])
-    R = np.diag([1.0, 1.0])
+    R = np.diag([1.0, 1.0]) * 1e-3
+
+    VELOCITY_TRACK_WEIGHT = 2.0 # weight for velocity tracking in MPC cost
+    HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost
+
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0
     MAX_STEER_RATE = 4.0
     MAX_RACELINE_SPEED = 5.0
-    RACELINE_SEARCH_BACK_STEPS = 20
+    RACELINE_SEARCH_BACK_STEPS = 20 # searching for the closest point on the raceline
     RACELINE_SEARCH_FORWARD_STEPS = 200
     PROJECTION_SEARCH_RADIUS = 4.0
     PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
     TRACE_OUTPUT = "simulation_trace.npz"
+    VEHICLE_MODEL = "kinematic"
+    NUM_CARS = 1
+    CAR_START_GAP = 3.0
+    UNSAFE_DISTANCE = 0.4
+    LLM_MODEL = "my-racing-ctrl"
+    LLM_BASE_URL = "http://localhost:11434"
+    LLM_TIMEOUT = 20.0
+    LLM_UPDATE_INTERVAL_STEPS = 5 # how often to update the LLM policy in terms of MPC steps
+    ALPHARACER_PARAMS = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # q, zeta, s1, s2, s3
+    LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
+    IBR_Q = 1.2
+    IBR_ZETA = 1.0
+    IBR_SF1 = 0.1
+    IBR_SF2 = 0.5
+    IBR_BLOCKING = 0.2
+    IBR_PARAMS = np.array([IBR_Q, IBR_ZETA, IBR_SF1, IBR_SF2, IBR_BLOCKING])
 
 
 params = SimParams()
-db_params = DynamicParams()
+db_params = DynamicParams("dbm")

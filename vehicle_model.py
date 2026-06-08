@@ -3,6 +3,10 @@ import numpy as np
 from config import GRAVITY
 
 
+def wrap_angle(angle):
+    return np.arctan2(np.sin(angle), np.cos(angle))
+
+
 class DynamicBicycleModel:
     def __init__(self, dt, db_params):
         self.dt = dt
@@ -43,4 +47,41 @@ class DynamicBicycleModel:
         k2 = f(state + 0.5 * self.dt * k1, target_vel, target_steer)
         k3 = f(state + 0.5 * self.dt * k2, target_vel, target_steer)
         k4 = f(state + self.dt * k3, target_vel, target_steer)
-        return state + self.dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+        next_state = state + self.dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+        next_state[2] = wrap_angle(next_state[2])
+        return next_state
+
+
+class KinematicBicycleModel:
+    """
+    Six-state wrapper around the same kinematic model used by the MPC.
+
+    The simulation state remains [x, y, psi, vx, vy, omega], but vy is kept at
+    zero and omega is derived from the kinematic yaw-rate equation.
+    """
+
+    def __init__(self, dt, db_params, max_speed=None):
+        self.dt = dt
+        self.p = db_params
+        self.max_speed = max_speed
+
+    def step(self, state, target_vel, target_steer):
+        x, y, psi, vx, _, _ = state
+        v = max(vx, 0.0)
+        wheelbase = self.p.LF + self.p.LR
+        actual_steer = target_steer * self.p.Sa + self.p.Sb
+        if getattr(self.p, "ros_kinematic", False):
+            acceleration = target_vel * self.p.Ta - self.p.fr
+        else:
+            throttle_force = target_vel * self.p.Ta - target_vel * self.p.Tb * v
+            acceleration = throttle_force / self.p.MASS - self.p.fr * GRAVITY
+
+        omega = (v / wheelbase) * np.tan(actual_steer)
+        next_x = x + v * np.cos(psi) * self.dt
+        next_y = y + v * np.sin(psi) * self.dt
+        next_psi = wrap_angle(psi + omega * self.dt)
+        next_vx = max(v + acceleration * self.dt, 0.0)
+        if self.max_speed is not None:
+            next_vx = min(next_vx, self.max_speed)
+        next_omega = (next_vx / wheelbase) * np.tan(actual_steer)
+        return np.array([next_x, next_y, next_psi, next_vx, 0.0, next_omega])

@@ -4,5 +4,7 @@ __pycache__/
 .idea/
 Figure_*.png
 myplot.png
+*.png
 *.gif
-simulation_trace.npz
+*.npz
+result/
