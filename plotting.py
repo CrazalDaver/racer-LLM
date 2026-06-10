@@ -15,6 +15,15 @@ def _scalar_string(value):
     return str(array)
 
 
+def _string_list(value):
+    if value is None:
+        return []
+    array = np.asarray(value)
+    if array.shape == ():
+        return [str(array.item())]
+    return [str(item) for item in array.tolist()]
+
+
 def _time_step(time, fallback=0.02):
     if len(time) < 2:
         return fallback
@@ -175,6 +184,9 @@ def plot_simulation_results(
     ref_speed_history=None,
     ref_lateral_errors=None,
     ref_longitudinal_positions=None,
+    policy_params_history=None,
+    policy_names=None,
+    policy_mode_history=None,
     track_length=None,
     trajectory_stride=2,
     velocity_dt_multiplier=2,
@@ -266,11 +278,25 @@ def plot_simulation_results(
     ax.legend()
 
     ax = axes[3]
-    off_flag = [1 if abs(e) > half_width else 0 for e in lateral_errors]
-    ax.plot(lateral_time, off_flag, drawstyle="steps-post", c="orange")
-    ax.set_ylim(-0.1, 1.1)
-    ax.grid(alpha=0.3)
-    ax.set_title("Offroad penalty")
+    policy_names = [name.lower() for name in _string_list(policy_names)]
+    policy_mode_history = _string_list(policy_mode_history)
+    policy_params_history = _as_optional_array(policy_params_history)
+    uses_llm = any("llm" in name for name in policy_names) or any(mode in {"stable", "push", "overtake", "block", "recover", "custom"} for mode in policy_mode_history)
+    if uses_llm and policy_params_history is not None and policy_params_history.ndim == 2 and policy_params_history.shape[1] >= 5:
+        param_time = np.arange(len(policy_params_history)) * dt
+        labels = ["q", "zeta", "s1", "s2", "s3"]
+        for idx, label in enumerate(labels):
+            ax.plot(param_time, policy_params_history[:, idx], label=label)
+        ax.grid(alpha=0.3)
+        ax.set_title("LLM policy parameters")
+        ax.set_xlabel("Time (s)")
+        ax.legend(ncol=2, fontsize=8)
+    else:
+        off_flag = [1 if abs(e) > half_width else 0 for e in lateral_errors]
+        ax.plot(lateral_time, off_flag, drawstyle="steps-post", c="orange")
+        ax.set_ylim(-0.1, 1.1)
+        ax.grid(alpha=0.3)
+        ax.set_title("Offroad penalty")
 
     ax = axes[4]
     loss_time = np.arange(len(mpc_losses)) * dt
@@ -396,6 +422,9 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         ref_speed_history=np.asarray(data["ref_speed"]) if "ref_speed" in data.files else None,
         ref_lateral_errors=np.asarray(data["ref_py"]) if "ref_py" in data.files else None,
         ref_longitudinal_positions=np.asarray(data["ref_px"]) if "ref_px" in data.files else None,
+        policy_params_history=np.asarray(data["policy_params"]) if "policy_params" in data.files else None,
+        policy_names=np.asarray(data["policy_names"]) if "policy_names" in data.files else None,
+        policy_mode_history=np.asarray(data["policy_mode"]) if "policy_mode" in data.files else None,
         track_length=track_length,
         trajectory_stride=1,
         velocity_dt_multiplier=1,
@@ -415,5 +444,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # plot_trace_npz("LLM.npz")
     # plot_trace_npz("F:/desktop/racer-LLM/result/grid_search/019_vw2_q1_h8.npz")
     # plot_trace_npz("F:/desktop/racer-LLM/result/grid_search/013_vw1_q2_h8.npz")

@@ -48,6 +48,8 @@ class MPCController:
         self.last_heading_loss = np.nan
         self.last_solver_success = True
         self.last_solver_status = "not_run"
+        self.last_state_plan = None
+        self.last_control_plan = None
         self.n_states = 4
         self.n_controls = 2
 
@@ -254,5 +256,7 @@ class MPCController:
 
         x_opt = sol["x"].full().flatten()
         self._store_loss_parts(x_opt, p_val)
+        self.last_state_plan = x_opt[:self.n_x].reshape(self.horizon + 1, self.n_states).T
         u_opt = x_opt[self.n_x:].reshape(self.horizon, self.n_controls).T
+        self.last_control_plan = u_opt
         return u_opt, u_opt[:, 0]

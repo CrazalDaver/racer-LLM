@@ -65,7 +65,11 @@ def experiment_name(policy_names, snapshot, custom_name=None):
 
     policy_slug = "-".join(_slug(name) for name in policy_names)
     policy_params = _policy_params_for_name(policy_names, snapshot)
-    return f"policies-{policy_slug}-{_policy_param_slug(policy_params)}"
+    ego_suffix = ""
+    ego_position = int(snapshot.get("EGO_POSITION", 1))
+    if ego_position != 1:
+        ego_suffix = f"-ego{ego_position}"
+    return f"policies-{policy_slug}{ego_suffix}-{_policy_param_slug(policy_params)}"
 
 
 def save_experiment_config(output_dir, policy_names, snapshot):
@@ -83,7 +87,16 @@ def save_experiment_config(output_dir, policy_names, snapshot):
     return config_path
 
 
-def _override_snapshot(snapshot, vehicle_model_type=None, alpharacer_params=None, llm_policy_params=None):
+def _override_snapshot(
+    snapshot,
+    vehicle_model_type=None,
+    alpharacer_params=None,
+    llm_policy_params=None,
+    llm_output_mode=None,
+    llm_model_name=None,
+    llm_update_interval_steps=None,
+    ego_position=None,
+):
     snapshot = dict(snapshot)
     if vehicle_model_type is not None:
         snapshot["VEHICLE_MODEL"] = vehicle_model_type
@@ -91,6 +104,14 @@ def _override_snapshot(snapshot, vehicle_model_type=None, alpharacer_params=None
         snapshot["ALPHARACER_PARAMS"] = [float(value) for value in alpharacer_params]
     if llm_policy_params is not None:
         snapshot["LLM_POLICY_PARAMS"] = [float(value) for value in llm_policy_params]
+    if llm_output_mode is not None:
+        snapshot["LLM_OUTPUT_MODE"] = llm_output_mode
+    if llm_model_name is not None:
+        snapshot["LLM_MODEL"] = llm_model_name
+    if llm_update_interval_steps is not None:
+        snapshot["LLM_UPDATE_INTERVAL_STEPS"] = int(llm_update_interval_steps)
+    if ego_position is not None:
+        snapshot["EGO_POSITION"] = int(ego_position)
     return snapshot
 
 
@@ -105,6 +126,10 @@ def run_experiment(
     vehicle_model_type=None,
     alpharacer_params=None,
     llm_policy_params=None,
+    llm_output_mode=None,
+    llm_model_name=None,
+    llm_update_interval_steps=None,
+    ego_position=1,
 ):
     snapshot = params_snapshot()
     snapshot = _override_snapshot(
@@ -112,6 +137,10 @@ def run_experiment(
         vehicle_model_type=vehicle_model_type,
         alpharacer_params=alpharacer_params,
         llm_policy_params=llm_policy_params,
+        llm_output_mode=llm_output_mode,
+        llm_model_name=llm_model_name,
+        llm_update_interval_steps=llm_update_interval_steps,
+        ego_position=ego_position,
     )
     exp_name = experiment_name(policy_names, snapshot, custom_name=name)
     output_dir = Path("result") / f"experiment_{exp_name}"
@@ -134,6 +163,10 @@ def run_experiment(
             vehicle_model_type=vehicle_model_type,
             alpharacer_params=alpharacer_params,
             llm_policy_params=llm_policy_params,
+            llm_output_mode=llm_output_mode,
+            llm_model_name=llm_model_name,
+            llm_update_interval_steps=llm_update_interval_steps,
+            ego_position=ego_position,
         )
 
         if save_animation:
@@ -183,6 +216,29 @@ def parse_args():
         default=None,
         help="Temporary LLM_POLICY_PARAMS override for this run.",
     )
+    parser.add_argument(
+        "--llm-output-mode",
+        choices=["auto", "mode", "params"],
+        default=None,
+        help="LLM output style: mode chooses presets; params asks for q/zeta/s1/s2/s3 directly.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Temporary LLM_MODEL override. Names containing 'params' use direct parameter output in auto mode.",
+    )
+    parser.add_argument(
+        "--llm-update-interval-steps",
+        type=int,
+        default=None,
+        help="Temporary LLM_UPDATE_INTERVAL_STEPS override for this run.",
+    )
+    parser.add_argument(
+        "--ego-position",
+        type=int,
+        default=1,
+        help="1-based starting position for policy_names[0] ego; opponents fill the remaining slots.",
+    )
     parser.add_argument("--stride", type=int, default=2, help="Animation frame stride.")
     parser.add_argument("--interval", type=int, default=30, help="Animation frame interval in milliseconds.")
     parser.add_argument("--dpi", type=int, default=100, help="Saved animation DPI.")
@@ -202,6 +258,10 @@ def main():
         vehicle_model_type=args.vehicle_model,
         alpharacer_params=args.alpha_params,
         llm_policy_params=args.llm_params,
+        llm_output_mode=args.llm_output_mode,
+        llm_model_name=args.llm_model,
+        llm_update_interval_steps=args.llm_update_interval_steps,
+        ego_position=args.ego_position,
     )
 
 
