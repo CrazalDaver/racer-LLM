@@ -27,6 +27,19 @@ def _string_array(value):
     return [str(item) for item in array.tolist()]
 
 
+def _short_policy_name(name):
+    key = str(name).strip().lower()
+    if "llm" in key:
+        return "LLM"
+    if key in {"alpharacer", "alpha_racer"}:
+        return "Alpha"
+    return str(name)
+
+
+def _car_role(car_idx):
+    return "Car" if car_idx == 0 else f"Opponent{car_idx}"
+
+
 def _policy_labels(data, car_count):
     if "policy_names" in data.files:
         names = _string_array(data["policy_names"])
@@ -34,10 +47,17 @@ def _policy_labels(data, car_count):
         names = [_scalar_string(data["policy_mode"][0], "policy")] if len(data["policy_mode"]) else []
     else:
         names = []
+    model_names = _string_array(data["llm_model_names"]) if "llm_model_names" in data.files else []
     labels = []
     for idx in range(car_count):
         name = names[idx] if idx < len(names) else ""
-        labels.append(f" ({name})" if name else "")
+        model_name = model_names[idx] if idx < len(model_names) else ""
+        if name and "llm" in name.lower() and model_name:
+            labels.append(f" ({_short_policy_name(name)}:{model_name})")
+        elif name:
+            labels.append(f" ({_short_policy_name(name)})")
+        else:
+            labels.append("")
     return labels
 
 
@@ -82,7 +102,7 @@ def _mode_color(mode):
 
 
 def load_trace(path):
-    data = np.load(path, allow_pickle=False)
+    data = np.load(path, allow_pickle=True)
     track_csv = _scalar_string(data["track_csv"], params.TRACK_CSV) if "track_csv" in data.files else params.TRACK_CSV
     raceline_csv = (
         _scalar_string(data["raceline_csv"], params.RACELINE_CSV)
@@ -118,7 +138,7 @@ def _save_animation(animation, save_path, interval, dpi):
     print(f"Saved animation to {output}")
 
 
-def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
+def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, show_ref_debug=False):
     import matplotlib
 
     if save_path:
@@ -152,28 +172,51 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
     throttle = data["throttle"]
     steer = data["steer"]
     offroad = data["offroad"] if "offroad" in data.files else np.abs(py) > (params.TRACK_WIDTH / 2.0)
+    car_offroad = data["car_offroad"] if "car_offroad" in data.files else None
     collision = data["collision"] if "collision" in data.files else np.zeros_like(offroad, dtype=bool)
     car_count = car_x.shape[1] if car_x is not None and car_x.ndim == 2 else 1
     policy_labels = _policy_labels(data, car_count)
     policy_names = _string_array(data["policy_names"]) if "policy_names" in data.files else []
+    llm_model_names = _string_array(data["llm_model_names"]) if "llm_model_names" in data.files else []
     policy_mode = data["policy_mode"].astype(str) if "policy_mode" in data.files else None
-    ego_uses_llm = bool(policy_names and "llm" in policy_names[0].lower())
-    show_policy_mode = ego_uses_llm and policy_mode is not None and np.any(policy_mode != "custom")
+    car_policy_mode = data["car_policy_mode"].astype(str) if "car_policy_mode" in data.files else None
+    if car_policy_mode is None and policy_mode is not None:
+        car_policy_mode = np.full((len(time), car_count), "fixed", dtype="<U32")
+        car_policy_mode[:, 0] = policy_mode
+    llm_mode_indices = [
+        idx
+        for idx, name in enumerate(policy_names[:car_count])
+        if "llm" in name.lower()
+        and car_policy_mode is not None
+        and np.any((car_policy_mode[:, idx] != "custom") & (car_policy_mode[:, idx] != "fixed"))
+    ]
+    if car_offroad is None and car_x is not None and car_y is not None:
+        car_py = data["car_py"] if "car_py" in data.files else None
+        if car_py is not None:
+            car_offroad = np.abs(car_py) > (params.TRACK_WIDTH / 2.0)
+    if car_offroad is None:
+        car_offroad = np.zeros((len(time), car_count), dtype=bool)
+        car_offroad[:, 0] = offroad
 
     frames = np.arange(0, len(time), max(1, stride))
     fig, ax = plt.subplots(figsize=(9, 8))
     track_line, = ax.plot(waypoints[:, 0], waypoints[:, 1], "k--", alpha=0.5, label="Track")
     raceline_line, = ax.plot(raceline.x, raceline.y, "m--", alpha=0.65, label="Raceline")
     full_traj, = ax.plot(x, y, color="0.75", linewidth=0.8, label="Full trajectory")
-    trail, = ax.plot([], [], "b-", linewidth=1.6, 
-                    #  label="Trajectory so far"
-                     )
+    opponent_colors = ["tab:green", "tab:purple", "tab:brown", "tab:pink"]
+    car_colors = ["tab:blue"] + [opponent_colors[(idx - 1) % len(opponent_colors)] for idx in range(1, car_count)]
+    trail, = ax.plot(
+        [],
+        [],
+        "b-",
+        linewidth=1.6,
+        label="Trajectory so far" if show_ref_debug else "_nolegend_",
+    )
     opponent_trails = []
     opponent_points = []
     if car_x is not None and car_y is not None and car_x.ndim == 2 and car_x.shape[1] > 1:
-        colors = ["tab:green", "tab:purple", "tab:brown", "tab:pink"]
         for car_idx in range(1, car_x.shape[1]):
-            color = colors[(car_idx - 1) % len(colors)]
+            color = car_colors[car_idx]
             opponent_trail, = ax.plot([], [], color=color, linewidth=1.2, label="_nolegend_")
             opponent_point, = ax.plot(
                 [],
@@ -181,44 +224,110 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
                 "o",
                 color=color,
                 markersize=5,
-                label=f"Opponent{car_idx}{policy_labels[car_idx]}",
+                label=f"{_car_role(car_idx)}{policy_labels[car_idx]}",
             )
             opponent_trails.append(opponent_trail)
             opponent_points.append(opponent_point)
-    horizon_line, = ax.plot([], [], linestyle="None", color="tab:orange", marker=".", markersize=4, label="ref_traj points")
-    raceline_points, = ax.plot([], [], linestyle="None", color="m", marker=".", markersize=4, alpha=0.8, label="raceline source points")
-    # car_ref_line, = ax.plot([], [], color="tab:cyan", linewidth=1.0, alpha=0.75, label="Car to ref_traj[0]")
-    car_point, = ax.plot([], [], "bo", markersize=6, label=f"Car{policy_labels[0]}")
-    # ref_point, = ax.plot([], [], "o", color="tab:orange", markersize=6, label="ref_traj[0]")
+    horizon_line, = ax.plot(
+        [],
+        [],
+        linestyle="None",
+        color="tab:orange",
+        marker=".",
+        markersize=4,
+        visible=show_ref_debug,
+        label="ref_traj points" if show_ref_debug else "_nolegend_",
+    )
+    raceline_points, = ax.plot(
+        [],
+        [],
+        linestyle="None",
+        color="m",
+        marker=".",
+        markersize=4,
+        alpha=0.8,
+        visible=show_ref_debug,
+        label="raceline source points" if show_ref_debug else "_nolegend_",
+    )
+    car_ref_line, = ax.plot(
+        [],
+        [],
+        color="tab:cyan",
+        linewidth=1.0,
+        alpha=0.75,
+        visible=show_ref_debug,
+        label="Car to ref_traj[0]" if show_ref_debug else "_nolegend_",
+    )
+    ref_point, = ax.plot(
+        [],
+        [],
+        "o",
+        color="tab:orange",
+        markersize=6,
+        visible=show_ref_debug,
+        label="ref_traj[0]" if show_ref_debug else "_nolegend_",
+    )
+    car_point, = ax.plot([], [], "o", color=car_colors[0], markersize=6, label=f"{_car_role(0)}{policy_labels[0]}")
+    offroad_points, = ax.plot(
+        [],
+        [],
+        linestyle="None",
+        marker="x",
+        color="red",
+        markersize=6,
+        markeredgewidth=1.4,
+        label="Off-track points",
+    )
     info = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", ha="left")
-    mode_label = ax.text(
+    mode_title = ax.text(
         0.70,
-        0.50,
-        "",
+        0.60,
+        "LLM modes" if llm_mode_indices else "",
         transform=ax.transAxes,
         va="bottom",
         ha="left",
         color="black",
-        fontsize=14,
+        fontsize=10,
         fontweight="bold",
         bbox={"boxstyle": "round,pad=0.32", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
     )
-    mode_value = ax.text(
-        0.84,
-        0.50,
-        "",
-        transform=ax.transAxes,
-        va="bottom",
-        ha="left",
-        color="black",
-        fontsize=14,
-        fontweight="bold",
-        bbox={"boxstyle": "round,pad=0.32", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
-    )
+    mode_label_texts = []
+    mode_value_texts = []
+    for local_idx, car_idx in enumerate(llm_mode_indices):
+        label_y = 0.565 - 0.075 * local_idx
+        value_y = label_y - 0.032
+        mode_label_texts.append(
+            ax.text(
+                0.70,
+                label_y,
+                "",
+                transform=ax.transAxes,
+                va="bottom",
+                ha="left",
+                color=car_colors[car_idx],
+                fontsize=9,
+                fontweight="bold",
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+            )
+        )
+        mode_value_texts.append(
+            ax.text(
+                0.82,
+                value_y,
+                "",
+                transform=ax.transAxes,
+                va="bottom",
+                ha="left",
+                color="black",
+                fontsize=9,
+                fontweight="bold",
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+            )
+        )
     # record distance to nearest opponent in front and behind, as well as last and best lap times
     race_info = ax.text(
         0.98, # right align
-        0.34, # down align
+        0.22, # down align, below LLM mode blocks and above the legend
         "",
         transform=ax.transAxes,
         va="bottom",
@@ -258,11 +367,13 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
         raceline_line,
         full_traj,
         trail,
+        offroad_points,
         horizon_line,
         raceline_points,
         car_ref_line,
         ref_point,
     ]
+    legend_handles = [handle for handle in legend_handles if not handle.get_label().startswith("_")]
     ax.legend(handles=legend_handles, loc="lower right", fontsize=8, framealpha=0.85)
     ax.grid(alpha=0.2)
 
@@ -278,23 +389,43 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
                 opponent_trails[local_idx].set_data(car_x[: i + 1, car_idx], car_y[: i + 1, car_idx])
                 opponent_points[local_idx].set_data([car_x[i, car_idx]], [car_y[i, car_idx]])
         car_point.set_data([x[i]], [y[i]])
-        ref_point.set_data([ref_x[i]], [ref_y[i]])
-        car_ref_line.set_data([x[i], ref_x[i]], [y[i], ref_y[i]])
-        horizon_line.set_data(ref_horizon_x[i], ref_horizon_y[i])
-        if raceline_horizon_x is not None and raceline_horizon_y is not None:
+        if show_ref_debug:
+            ref_point.set_data([ref_x[i]], [ref_y[i]])
+            car_ref_line.set_data([x[i], ref_x[i]], [y[i], ref_y[i]])
+            horizon_line.set_data(ref_horizon_x[i], ref_horizon_y[i])
+        else:
+            ref_point.set_data([], [])
+            car_ref_line.set_data([], [])
+            horizon_line.set_data([], [])
+        if show_ref_debug and raceline_horizon_x is not None and raceline_horizon_y is not None:
             raceline_points.set_data(raceline_horizon_x[i], raceline_horizon_y[i])
         else:
             raceline_points.set_data([], [])
-        offroad_text.set_text("OFF TRACK" if offroad[i] else "")
+        if car_x is not None and car_y is not None and car_x.ndim == 2 and car_offroad.ndim == 2:
+            clipped_mask = car_offroad[: i + 1, : car_x.shape[1]]
+            offroad_points.set_data(car_x[: i + 1, : car_x.shape[1]][clipped_mask], car_y[: i + 1, : car_x.shape[1]][clipped_mask])
+        else:
+            offroad_points.set_data(x[: i + 1][offroad[: i + 1]], y[: i + 1][offroad[: i + 1]])
+        if car_offroad.ndim == 2:
+            offroad_cars = [
+                _car_role(car_idx)
+                for car_idx in range(min(car_count, car_offroad.shape[1]))
+                if car_offroad[i, car_idx]
+            ]
+        else:
+            offroad_cars = [_car_role(0)] if offroad[i] else []
+        offroad_text.set_text(f"OFF TRACK: {', '.join(offroad_cars)}" if offroad_cars else "")
         collision_text.set_text("NEAR COLLISION" if collision[i] else "")
         ref_speed_text = "" if ref_speed is None else f"\nref_v={ref_speed[i]:.2f} m/s"
-        if show_policy_mode:
-            mode_label.set_text("Mode:")
-            mode_value.set_text(policy_mode[i])
-            mode_value.set_color(_mode_color(policy_mode[i]))
-        else:
-            mode_label.set_text("")
-            mode_value.set_text("")
+        mode_title.set_text("LLM modes" if llm_mode_indices else "")
+        for label_artist, value_artist, car_idx in zip(mode_label_texts, mode_value_texts, llm_mode_indices):
+            mode = car_policy_mode[i, car_idx] if car_policy_mode is not None else ""
+            model_name = llm_model_names[car_idx] if car_idx < len(llm_model_names) else ""
+            model_suffix = f" ({model_name})" if model_name else ""
+            label_artist.set_text(f"{_car_role(car_idx)}{model_suffix}:")
+            label_artist.set_color(car_colors[car_idx])
+            value_artist.set_text(mode)
+            value_artist.set_color(_mode_color(mode))
         completed_laps = int(np.searchsorted(lap_stats["crossing_times"], time[i], side="right"))
         current_lap = completed_laps + 1
         previous_crossing = time[0] if completed_laps == 0 else lap_stats["crossing_times"][completed_laps - 1]
@@ -326,13 +457,15 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
             *opponent_trails,
             *opponent_points,
             car_point,
-            ref_point,
-            car_ref_line,
+            offroad_points,
             horizon_line,
             raceline_points,
+            ref_point,
+            car_ref_line,
             info,
-            mode_label,
-            mode_value,
+            mode_title,
+            *mode_label_texts,
+            *mode_value_texts,
             race_info,
             offroad_text,
             collision_text,
@@ -360,8 +493,20 @@ def main():
         help="Optional output path. Use --save for simulation_trace.gif, or pass trace.gif/trace.mp4.",
     )
     parser.add_argument("--dpi", type=int, default=100, help="Saved animation DPI")
+    parser.add_argument(
+        "--show-ref-debug",
+        action="store_true",
+        help="Show ref_traj[0], ref_traj horizon points, raceline source points, and the car-to-ref line.",
+    )
     args = parser.parse_args()
-    make_animation(args.trace, stride=args.stride, interval=args.interval, save_path=args.save, dpi=args.dpi)
+    make_animation(
+        args.trace,
+        stride=args.stride,
+        interval=args.interval,
+        save_path=args.save,
+        dpi=args.dpi,
+        show_ref_debug=args.show_ref_debug,
+    )
 
 
 if __name__ == "__main__":

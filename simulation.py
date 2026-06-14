@@ -209,7 +209,10 @@ def save_simulation_trace(trace, track, params):
         policy_params=np.asarray(trace["policy_params"]),
         policy_mode=np.asarray(trace["policy_mode"]),
         policy_names=np.asarray(trace.get("policy_names", [])),
-        llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=object),
+        llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
+        car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
+        car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
+        car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -379,13 +382,18 @@ def run_simulation(
         "mpc_solver_status": [],
         "policy_params": [],
         "policy_mode": [],
+        "car_policy_params": [],
+        "car_policy_mode": [],
+        "car_offroad": [],
         "policy_names": resolved_policy_names,
         "llm_model_names": [
             (
                 params.LLM_MODEL
                 if resolved_policy_names[idx] == "llm_alpharacer" and resolved_llm_model_names[idx] is None
-                else resolved_llm_model_names[idx]
+                else str(resolved_llm_model_names[idx])
             )
+            if resolved_policy_names[idx] == "llm_alpharacer"
+            else ""
             for idx in range(num_cars)
         ],
         "ego_index": ego_idx,
@@ -531,6 +539,11 @@ def run_simulation(
         trace["mpc_solver_status"].append(ego_mpc.last_solver_status)
         trace["policy_params"].append(getattr(ego_policy, "params", np.full(5, np.nan)).copy())
         trace["policy_mode"].append(getattr(ego_policy, "current_mode", "fixed"))
+        trace["car_policy_params"].append(
+            [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
+        )
+        trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
+        trace["car_offroad"].append([abs(error) > track_half_width for error in car_e])
 
         if (step + 1) % 100 == 0 and ego_policy.last_ref_traj is not None:
             frenet_ref_lines.append((ego_state.x, ego_state.y, ref_fx, ref_fy))
@@ -727,8 +740,14 @@ if __name__ == "__main__":
     #     ego_position=3,
     # )
 
+    # run_simulation(
+    #     policy_names=["LLM", "LLM", "IBR"],  # ego, oppo1, oppo2
+    #     llm_model_names=["my-racing-ctrl-mode", "llama3.2:1b", None],
+    #     vehicle_model_type="kinematic",
+    # )
+
     run_simulation(
-        policy_names=["LLM", "LLM", "IBR"],  # ego, oppo1, oppo2
-        llm_model_names=["my-racing-ctrl-mode", "llama3.2:1b", None],
+        policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
+        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
         vehicle_model_type="kinematic",
     )
