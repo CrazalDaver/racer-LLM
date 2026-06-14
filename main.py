@@ -69,7 +69,11 @@ def experiment_name(policy_names, snapshot, custom_name=None):
     ego_position = int(snapshot.get("EGO_POSITION", 1))
     if ego_position != 1:
         ego_suffix = f"-ego{ego_position}"
-    return f"policies-{policy_slug}{ego_suffix}-{_policy_param_slug(policy_params)}"
+    model_suffix = ""
+    if snapshot.get("LLM_MODEL_NAMES"):
+        model_slug = "-".join(_slug(model or "default") for model in snapshot["LLM_MODEL_NAMES"])
+        model_suffix = f"-models-{model_slug}"
+    return f"policies-{policy_slug}{ego_suffix}-{_policy_param_slug(policy_params)}{model_suffix}"
 
 
 def save_experiment_config(output_dir, policy_names, snapshot):
@@ -94,6 +98,7 @@ def _override_snapshot(
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
+    llm_model_names=None,
     llm_update_interval_steps=None,
     ego_position=None,
 ):
@@ -108,6 +113,8 @@ def _override_snapshot(
         snapshot["LLM_OUTPUT_MODE"] = llm_output_mode
     if llm_model_name is not None:
         snapshot["LLM_MODEL"] = llm_model_name
+    if llm_model_names is not None:
+        snapshot["LLM_MODEL_NAMES"] = list(llm_model_names)
     if llm_update_interval_steps is not None:
         snapshot["LLM_UPDATE_INTERVAL_STEPS"] = int(llm_update_interval_steps)
     if ego_position is not None:
@@ -128,6 +135,7 @@ def run_experiment(
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
+    llm_model_names=None,
     llm_update_interval_steps=None,
     ego_position=1,
 ):
@@ -139,6 +147,7 @@ def run_experiment(
         llm_policy_params=llm_policy_params,
         llm_output_mode=llm_output_mode,
         llm_model_name=llm_model_name,
+        llm_model_names=llm_model_names,
         llm_update_interval_steps=llm_update_interval_steps,
         ego_position=ego_position,
     )
@@ -165,6 +174,7 @@ def run_experiment(
             llm_policy_params=llm_policy_params,
             llm_output_mode=llm_output_mode,
             llm_model_name=llm_model_name,
+            llm_model_names=llm_model_names,
             llm_update_interval_steps=llm_update_interval_steps,
             ego_position=ego_position,
         )
@@ -183,15 +193,85 @@ def run_experiment(
     return output_dir
 
 
+def _ego_first_policies_from_start_order(start_order, ego_position):
+    ego_index = int(ego_position) - 1
+    if ego_index < 0 or ego_index >= len(start_order):
+        raise ValueError(f"ego_position must be between 1 and {len(start_order)}, got {ego_position}")
+    ego_policy = start_order[ego_index]
+    other_policies = [policy for idx, policy in enumerate(start_order) if idx != ego_index]
+    return [ego_policy, *other_policies]
+
+
+def run_llm_position_sweep(
+    name_prefix=None,
+    save_animation=True,
+    stride=2,
+    interval=30,
+    dpi=100,
+    show_plot=False,
+    vehicle_model_type=None,
+    alpharacer_params=None,
+    llm_policy_params=None,
+    llm_output_mode=None,
+    llm_model_name=None,
+    llm_model_names=None,
+    llm_update_interval_steps=None,
+):
+    # default
+    start_order_cases = [
+        # (["IBR", "IBR", "LLM"], 3),
+        # (["IBR", "LLM", "IBR"], 2),
+        (["LLM", "IBR", "IBR"], 1),
+    ]
+
+    output_dirs = []
+    for start_order, ego_position in start_order_cases:
+        if _slug(start_order[ego_position - 1]) not in {"llm", "llm-alpharacer", "llm_alpharacer"}:
+            raise ValueError(f"Expected LLM at ego_position={ego_position}, got {start_order}")
+
+        policy_names = _ego_first_policies_from_start_order(start_order, ego_position)
+        start_order_slug = "-".join(_slug(policy) for policy in start_order)
+        case_name = f"{name_prefix}-" if name_prefix else ""
+        case_name = f"{case_name}startorder-{start_order_slug}-ego{ego_position}"
+        output_dirs.append(
+            run_experiment(
+                policy_names=policy_names,
+                name=case_name,
+                save_animation=save_animation,
+                stride=stride,
+                interval=interval,
+                dpi=dpi,
+                show_plot=show_plot,
+                vehicle_model_type=vehicle_model_type,
+                alpharacer_params=alpharacer_params,
+                llm_policy_params=llm_policy_params,
+                llm_output_mode=llm_output_mode,
+                llm_model_name=llm_model_name,
+                llm_model_names=llm_model_names,
+                llm_update_interval_steps=llm_update_interval_steps,
+                ego_position=ego_position,
+            )
+        )
+    return output_dirs
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run a racer experiment and save trace/animation under result/.")
     parser.add_argument(
         "--policies",
         nargs="+",
-        default=["alpha", "IBR", "IBR"],
-        help='Per-car policy names, e.g. --policies alpha IBR IBR or --policies llm IBR IBR.',
+        default=None,
+        help=(
+            "Run one explicit per-car policy case, e.g. --policies alpha IBR IBR or --policies llm IBR IBR. "
+            "If omitted, run the three LLM position sweep cases."
+        ),
     )
     parser.add_argument("--name", default=None, help="Optional experiment name suffix. Defaults to policy/config name.")
+    parser.add_argument(
+        "--llm-position-sweep",
+        action="store_true",
+        help="Run three start-order cases: IBR IBR LLM / IBR LLM IBR / LLM IBR IBR.",
+    )
     parser.add_argument("--no-animation", action="store_true", help="Skip GIF generation.")
     parser.add_argument("--show-plot", action="store_true", help="Show the static simulation plot.")
     parser.add_argument(
@@ -228,6 +308,16 @@ def parse_args():
         help="Temporary LLM_MODEL override. Names containing 'params' use direct parameter output in auto mode.",
     )
     parser.add_argument(
+        "--llm-models",
+        nargs="+",
+        default=None,
+        help=(
+            "Per-car LLM model names aligned with --policies order, e.g. "
+            "--llm-models my-racing-ctrl-mode llama3.2:1b none. "
+            "Use none/default/- for non-LLM cars."
+        ),
+    )
+    parser.add_argument(
         "--llm-update-interval-steps",
         type=int,
         default=None,
@@ -247,6 +337,24 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.llm_position_sweep or args.policies is None:
+        run_llm_position_sweep(
+            name_prefix=args.name,
+            save_animation=not args.no_animation,
+            stride=args.stride,
+            interval=args.interval,
+            dpi=args.dpi,
+            show_plot=args.show_plot,
+            vehicle_model_type=args.vehicle_model,
+            alpharacer_params=args.alpha_params,
+            llm_policy_params=args.llm_params,
+            llm_output_mode=args.llm_output_mode,
+            llm_model_name=args.llm_model,
+            llm_model_names=args.llm_models,
+            llm_update_interval_steps=args.llm_update_interval_steps,
+        )
+        return
+
     run_experiment(
         policy_names=args.policies,
         name=args.name,
@@ -260,6 +368,7 @@ def main():
         llm_policy_params=args.llm_params,
         llm_output_mode=args.llm_output_mode,
         llm_model_name=args.llm_model,
+        llm_model_names=args.llm_models,
         llm_update_interval_steps=args.llm_update_interval_steps,
         ego_position=args.ego_position,
     )

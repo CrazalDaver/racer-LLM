@@ -68,6 +68,19 @@ def _format_lap(value):
     return "--" if value is None else f"{value:.2f}s"
 
 
+def _mode_color(mode):
+    mode_key = str(mode).strip().lower()
+    return {
+        "stable": "black",
+        "push": "tab:blue",
+        "overtake": "tab:green",
+        "block": "red",
+        "recover": "tab:purple",
+        "custom": "0.35",
+        "fixed": "0.35",
+    }.get(mode_key, "black")
+
+
 def load_trace(path):
     data = np.load(path, allow_pickle=False)
     track_csv = _scalar_string(data["track_csv"], params.TRACK_CSV) if "track_csv" in data.files else params.TRACK_CSV
@@ -152,7 +165,9 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
     track_line, = ax.plot(waypoints[:, 0], waypoints[:, 1], "k--", alpha=0.5, label="Track")
     raceline_line, = ax.plot(raceline.x, raceline.y, "m--", alpha=0.65, label="Raceline")
     full_traj, = ax.plot(x, y, color="0.75", linewidth=0.8, label="Full trajectory")
-    trail, = ax.plot([], [], "b-", linewidth=1.6, label="Trajectory so far")
+    trail, = ax.plot([], [], "b-", linewidth=1.6, 
+                    #  label="Trajectory so far"
+                     )
     opponent_trails = []
     opponent_points = []
     if car_x is not None and car_y is not None and car_x.ndim == 2 and car_x.shape[1] > 1:
@@ -172,10 +187,34 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
             opponent_points.append(opponent_point)
     horizon_line, = ax.plot([], [], linestyle="None", color="tab:orange", marker=".", markersize=4, label="ref_traj points")
     raceline_points, = ax.plot([], [], linestyle="None", color="m", marker=".", markersize=4, alpha=0.8, label="raceline source points")
-    car_ref_line, = ax.plot([], [], color="tab:cyan", linewidth=1.0, alpha=0.75, label="Car to ref_traj[0]")
+    # car_ref_line, = ax.plot([], [], color="tab:cyan", linewidth=1.0, alpha=0.75, label="Car to ref_traj[0]")
     car_point, = ax.plot([], [], "bo", markersize=6, label=f"Car{policy_labels[0]}")
-    ref_point, = ax.plot([], [], "o", color="tab:orange", markersize=6, label="ref_traj[0]")
+    # ref_point, = ax.plot([], [], "o", color="tab:orange", markersize=6, label="ref_traj[0]")
     info = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", ha="left")
+    mode_label = ax.text(
+        0.70,
+        0.50,
+        "",
+        transform=ax.transAxes,
+        va="bottom",
+        ha="left",
+        color="black",
+        fontsize=14,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.32", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+    )
+    mode_value = ax.text(
+        0.84,
+        0.50,
+        "",
+        transform=ax.transAxes,
+        va="bottom",
+        ha="left",
+        color="black",
+        fontsize=14,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.32", "facecolor": "white", "edgecolor": "0.75", "alpha": 0.88},
+    )
     # record distance to nearest opponent in front and behind, as well as last and best lap times
     race_info = ax.text(
         0.98, # right align
@@ -249,9 +288,13 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
         offroad_text.set_text("OFF TRACK" if offroad[i] else "")
         collision_text.set_text("NEAR COLLISION" if collision[i] else "")
         ref_speed_text = "" if ref_speed is None else f"\nref_v={ref_speed[i]:.2f} m/s"
-        mode_text = ""
         if show_policy_mode:
-            mode_text = f"\nmode={policy_mode[i]}"
+            mode_label.set_text("Mode:")
+            mode_value.set_text(policy_mode[i])
+            mode_value.set_color(_mode_color(policy_mode[i]))
+        else:
+            mode_label.set_text("")
+            mode_value.set_text("")
         completed_laps = int(np.searchsorted(lap_stats["crossing_times"], time[i], side="right"))
         current_lap = completed_laps + 1
         previous_crossing = time[0] if completed_laps == 0 else lap_stats["crossing_times"][completed_laps - 1]
@@ -275,7 +318,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
             f"t={time[i]:.2f}s\n"
             f"{current_lap_text}\n"
             f"px={px[i]:.2f} m, py={py[i]:.2f} m\n"
-            f"vx={vx[i]:.2f} m/s{ref_speed_text}{mode_text}\n"
+            f"vx={vx[i]:.2f} m/s{ref_speed_text}\n"
             f"throttle={throttle[i]:.2f}, steer={steer[i]:.2f}"
         )
         return (
@@ -288,6 +331,8 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100):
             horizon_line,
             raceline_points,
             info,
+            mode_label,
+            mode_value,
             race_info,
             offroad_text,
             collision_text,

@@ -100,7 +100,7 @@ class SimParams:
     NUM_CARS = 1
     CAR_START_GAP = 3.0
     UNSAFE_DISTANCE = 0.4
-    EARLY_COLLISION_STOP = True # stop early if cars collide immediately after launch
+    EARLY_COLLISION_STOP = False # stop early if cars collide immediately after launch
     EARLY_COLLISION_WINDOW_STEPS = 150 # only apply early collision stop during the first N simulation steps
     EARLY_COLLISION_CONSECUTIVE_STEPS = 3 # require this many consecutive collision steps before stopping
     LLM_MODEL = "my-racing-ctrl-mode"
@@ -111,8 +111,8 @@ class SimParams:
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     ALPHARACER_PARAMS = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # q, zeta, s1, s2, s3
     LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
-    IBR_HORIZON = 20 # 2s at MPC_DT=0.1s, matching the paper baseline.
-    IBR_ITERATIONS = 6
+    IBR_HORIZON = 10 # Matches multi_car_comp_blocking.py's IBR horizon.
+    IBR_ITERATIONS = 3
     IBR_GAMMA = 0.99
     IBR_Q = 1.2
     IBR_ZETA = 1.0

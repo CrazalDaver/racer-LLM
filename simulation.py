@@ -56,6 +56,21 @@ def _resolve_policy_names(policy_type, policy_names, num_cars):
     return [policy_type] * num_cars
 
 
+def _per_car_option(value, car_idx, default=None):
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if car_idx >= len(value):
+            return default
+        item = value[car_idx]
+        if item is None:
+            return default
+        if isinstance(item, str) and item.strip().lower() in {"", "none", "default", "-"}:
+            return default
+        return item
+    return value
+
+
 def create_vehicle_model(model_type, dt, db_params, max_speed):
     model_type = model_type.lower()
     if model_type in {"kinematic", "kinetic", "kinetics"}:
@@ -194,6 +209,7 @@ def save_simulation_trace(trace, track, params):
         policy_params=np.asarray(trace["policy_params"]),
         policy_mode=np.asarray(trace["policy_mode"]),
         policy_names=np.asarray(trace.get("policy_names", [])),
+        llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=object),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -221,6 +237,7 @@ def run_simulation(
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
+    llm_model_names=None,
     llm_update_interval_steps=None,
     v0=0.0,
     velocity_track_weight=None,
@@ -236,6 +253,12 @@ def run_simulation(
     elif num_cars is None:
         num_cars = params.NUM_CARS
     resolved_policy_names = _resolve_policy_names(policy_type, policy_names, num_cars)
+    if llm_model_names is not None and len(llm_model_names) != num_cars:
+        raise ValueError(f"llm_model_names length must equal num_cars ({num_cars}), got {len(llm_model_names)}")
+    resolved_llm_model_names = [
+        _per_car_option(llm_model_names, car_idx, llm_model_name)
+        for car_idx in range(num_cars)
+    ]
     ego_position = int(ego_position)
     if ego_position < 1 or ego_position > num_cars:
         raise ValueError(f"ego_position must be between 1 and {num_cars}, got {ego_position}")
@@ -288,7 +311,7 @@ def run_simulation(
                 alpharacer_params=alpharacer_params,
                 llm_policy_params=llm_policy_params,
                 llm_output_mode=llm_output_mode,
-                llm_model_name=llm_model_name,
+                llm_model_name=resolved_llm_model_names[car_idx],
                 llm_update_interval_steps=llm_update_interval_steps,
             )
         )
@@ -357,6 +380,14 @@ def run_simulation(
         "policy_params": [],
         "policy_mode": [],
         "policy_names": resolved_policy_names,
+        "llm_model_names": [
+            (
+                params.LLM_MODEL
+                if resolved_policy_names[idx] == "llm_alpharacer" and resolved_llm_model_names[idx] is None
+                else resolved_llm_model_names[idx]
+            )
+            for idx in range(num_cars)
+        ],
         "ego_index": ego_idx,
         "ego_position": ego_position,
         "start_ranks": start_ranks,
@@ -368,6 +399,8 @@ def run_simulation(
             f"Simulation with per-car policies {resolved_policy_names} "
             f"and {vehicle_model_type} vehicle model started for {num_cars} cars..."
         )
+        if any(name == "llm_alpharacer" for name in resolved_policy_names):
+            print(f"LLM models by car: {trace['llm_model_names']}")
     elif resolved_policy_names[0] == "llm_alpharacer" and any(name == "ibr" for name in resolved_policy_names[1:]):
         print(
             f"Simulation with ego LLM policy, IBR baseline opponents, "
@@ -684,9 +717,18 @@ if __name__ == "__main__":
     # )
 
     # simulation of multiple cars
+    # run_simulation(
+    #     # run_simulation treats policy_names[0] as the traced ego car.
+    #     # ego_position only changes that ego car's starting rank.
+    #     # ego, oppo 1, oppo 2
+    #     policy_names=["LLM", "IBR", "IBR"], vehicle_model_type="kinematic",
+    #     llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5], velocity_track_weight=2.0, horizon=8,
+    #     v0=0.0, llm_output_mode="mode", llm_update_interval_steps=10,
+    #     ego_position=3,
+    # )
+
     run_simulation(
-        policy_names=["LLM", "centerline", "centerline"], vehicle_model_type="kinematic",
-        llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5], velocity_track_weight=2.0, horizon=8,
-        v0=0.0, llm_output_mode="mode", llm_update_interval_steps=10,
-        ego_position=3,
+        policy_names=["LLM", "LLM", "IBR"],  # ego, oppo1, oppo2
+        llm_model_names=["my-racing-ctrl-mode", "llama3.2:1b", None],
+        vehicle_model_type="kinematic",
     )

@@ -5,6 +5,7 @@ import re
 import urllib.error
 import urllib.request
 
+import casadi as cs
 import numpy as np
 
 from state import CarAction, CarState
@@ -583,6 +584,14 @@ class LLMAlphaRacerPolicy(AlphaRacerPolicy):
 
     def _prompt(self, state: CarState, current_s: float, opponents=None) -> str:
         opponents = opponents or []
+        _, current_py = self.track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=8.0,
+            psi_hint=state.psi,
+            max_heading_error=math.pi / 2.0,
+        )
         opponent_lines = []
         for idx, opponent in enumerate(opponents):
             delta_s = self._progress_delta(opponent["px"], current_s)
@@ -593,15 +602,6 @@ class LLMAlphaRacerPolicy(AlphaRacerPolicy):
                 f"speed_relation={speed_relation}, py={opponent['py']:.3f}, vx={opponent['vx']:.3f}"
             )
         opponent_text = "\n".join(opponent_lines) if opponent_lines else "none"
-
-        _, current_py = self.track.project(
-            state.x,
-            state.y,
-            s_hint=current_s,
-            search_radius=8.0,
-            psi_hint=state.psi,
-            max_heading_error=math.pi / 2.0,
-        )
         preset_lines = "\n".join(
             f"- {name}: q={values[0]:.2f}, zeta={values[1]:.2f}, "
             f"s1={values[2]:.2f}, s2={values[3]:.2f}, s3={values[4]:.2f}"
@@ -734,6 +734,14 @@ class LLMAlphaRacerPolicy(AlphaRacerPolicy):
 
     def _mode_context(self, state: CarState, current_s: float, opponents=None) -> dict:
         opponents = opponents or []
+        _, current_py = self.track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=8.0,
+            psi_hint=state.psi,
+            max_heading_error=math.pi / 2.0,
+        )
         close_slow_front = False
         slow_front = False
         faster_rear = False
@@ -748,15 +756,6 @@ class LLMAlphaRacerPolicy(AlphaRacerPolicy):
                     close_slow_front = close_slow_front or delta_s < 2.5
             elif delta_s < 0.0 and opponent["vx"] > state.vx:
                 faster_rear = faster_rear or abs(delta_s) < 3.0
-
-        _, current_py = self.track.project(
-            state.x,
-            state.y,
-            s_hint=current_s,
-            search_radius=8.0,
-            psi_hint=state.psi,
-            max_heading_error=math.pi / 2.0,
-        )
         return {
             "close_slow_front": close_slow_front,
             "slow_front": slow_front,
@@ -813,218 +812,326 @@ class LLMAlphaRacerPolicy(AlphaRacerPolicy):
         return super().get_reference_trajectory(state, current_s, opponents=opponents)
 
 
+class _StrictIBRSolver:
+    """Frenet-space IBR MPC matching multi_car_comp_blocking.py."""
+
+    def __init__(
+        self,
+        horizon=10,
+        dt=0.1,
+        iterations=3,
+        wheelbase=0.36,
+        steer_scale=0.36,
+        throttle_gain=20.0 / 4.65,
+        friction=1.0,
+        mu=1.6,
+        gravity=9.81,
+        use_upstream_collision_expression=True,
+    ):
+        self.horizon = int(horizon)
+        self.dt = float(dt)
+        self.iterations = int(iterations)
+        self.wheelbase = float(wheelbase)
+        self.steer_scale = float(steer_scale)
+        self.throttle_gain = float(throttle_gain)
+        self.friction = float(friction)
+        self.mu = float(mu)
+        self.gravity = float(gravity)
+        self.use_upstream_collision_expression = bool(use_upstream_collision_expression)
+        self._build_solver()
+
+    def _vehicle_dynamics(self, xk, uk, curvature):
+        s = xk[0]
+        e = xk[1]
+        psi = xk[2]
+        v = xk[3]
+        a = uk[0]
+        delta = uk[1]
+        denom = 1.0 - e * curvature
+        return cs.vertcat(
+            s + (v * cs.cos(psi)) / denom * self.dt,
+            e + v * cs.sin(psi) * self.dt,
+            psi + ((v / self.wheelbase) * cs.tan(self.steer_scale * delta) - v * curvature) * self.dt,
+            v + (self.throttle_gain * a - self.friction) * self.dt,
+        )
+
+    def _build_solver(self):
+        n = self.horizon
+        x = cs.MX.sym("x", 4, n + 1)
+        u = cs.MX.sym("u", 2, n)
+        x0 = cs.MX.sym("x0", 4)
+        curvature = cs.MX.sym("curvature", n)
+        target_speed = cs.MX.sym("target_speed", 1)
+        opp_s = cs.MX.sym("opp_s", n + 1)
+        opp_e = cs.MX.sym("opp_e", n + 1)
+
+        cost = 0
+        g = [x[:, 0] - x0]
+        q = np.diag([0.0, 0.0, 0.3, 0.0])
+        r = np.diag([1.0, 1.0])
+        target_state = np.zeros(4)
+
+        for k in range(n):
+            g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))
+            state_error = x[:, k] - target_state
+            cost += cs.mtimes([state_error.T, q, state_error])
+            cost += cs.mtimes([u[:, k].T, r, u[:, k]])
+            cost += 10.0 * x[1, k] ** 4
+
+        cost += -10.0 * (x[0, n] - x[0, 0])
+
+        for k in range(n):
+            g.append((x[3, k] ** 2) * cs.tan(u[1, k]))
+        for k in range(n):
+            g.append(x[3, k + 1])
+        for k in range(n):
+            if self.use_upstream_collision_expression:
+                # The upstream source compares s against the flattened opponent e row here.
+                g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[0, k] - opp_e[k + 1]) ** 2)
+            else:
+                g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[1, k] - opp_e[k + 1]) ** 2)
+
+        opt_variables = cs.vertcat(cs.reshape(x, -1, 1), cs.reshape(u, -1, 1))
+        constraints = cs.vertcat(*g)
+        params = cs.vertcat(x0, curvature, target_speed, opp_s, opp_e)
+        problem = {"f": cost, "x": opt_variables, "g": constraints, "p": params}
+        opts = {"ipopt.print_level": 0, "print_time": 0, "ipopt.max_iter": 500}
+        self.solver = cs.nlpsol("strict_ibr_solver", "ipopt", problem, opts)
+        self.n_x = 4 * (n + 1)
+        self.n_u = 2 * n
+        self.n_constraints = constraints.size1()
+
+    def _solve_best_response(self, x0, opponent_plan, curvature, target_speed):
+        n = self.horizon
+        x_init = np.tile(np.asarray(x0, dtype=float), (n + 1, 1)).T
+        u_init = np.zeros((2, n))
+        initial_guess = np.concatenate([x_init.T.reshape(-1), u_init.T.reshape(-1)])
+        p_val = np.concatenate(
+            [
+                np.asarray(x0, dtype=float),
+                np.asarray(curvature, dtype=float),
+                np.array([float(target_speed)]),
+                np.asarray(opponent_plan[0], dtype=float),
+                np.asarray(opponent_plan[1], dtype=float),
+            ]
+        )
+
+        lbg = np.zeros(self.n_constraints)
+        ubg = np.zeros(self.n_constraints)
+        friction_start = 4 * (n + 1)
+        speed_start = friction_start + n
+        collision_start = speed_start + n
+        lbg[friction_start:speed_start] = -self.mu * self.gravity * self.wheelbase
+        ubg[friction_start:speed_start] = self.mu * self.gravity * self.wheelbase
+        ubg[speed_start:collision_start] = 1.04 * float(target_speed)
+        lbg[collision_start:] = 0.04
+        ubg[collision_start:] = 500000.0
+
+        solution = self.solver(x0=initial_guess, lbg=lbg, ubg=ubg, p=p_val)
+        stats = self.solver.stats()
+        if not stats.get("success", False):
+            raise RuntimeError(stats.get("return_status", "unknown"))
+        opt = solution["x"].full().flatten()
+        state_plan = opt[: self.n_x].reshape(n + 1, 4).T
+        control_plan = opt[self.n_x :].reshape(n, 2).T
+        return state_plan, control_plan
+
+    def solve_pair(self, neighbor_x0, own_x0, neighbor_curvature, own_curvature, neighbor_speed, own_speed):
+        n = self.horizon
+        neighbor_plan = np.repeat(np.asarray(neighbor_x0[:2], dtype=float).reshape(2, 1), n + 1, axis=1)
+        own_plan = np.repeat(np.asarray(own_x0[:2], dtype=float).reshape(2, 1), n + 1, axis=1)
+        neighbor_u = np.zeros(2)
+        own_u = np.zeros(2)
+        neighbor_state_plan = None
+        own_state_plan = None
+        neighbor_control_plan = None
+        own_control_plan = None
+
+        for i in range(self.iterations):
+            if i % 2 == 0:  # even iterations: solve neighbor
+                neighbor_state_plan, neighbor_control_plan = self._solve_best_response(
+                    neighbor_x0,
+                    own_plan,
+                    neighbor_curvature,
+                    neighbor_speed,
+                )
+                neighbor_plan = neighbor_state_plan[:2, :]
+                neighbor_u = neighbor_control_plan[:, 0]
+            else:  # odd iterations: solve own with opponent known
+                own_state_plan, own_control_plan = self._solve_best_response(
+                    own_x0,
+                    neighbor_plan,
+                    own_curvature,
+                    own_speed,
+                )
+                own_plan = own_state_plan[:2, :]
+                own_u = own_control_plan[:, 0]
+
+        if own_x0[2] > 0.5:
+            own_u = np.array([0.5, -1.0])
+        if own_x0[2] < -0.5:
+            own_u = np.array([0.5, 1.0])
+
+        return {
+            "action": own_u,
+            "state_plan": own_state_plan,
+            "control_plan": own_control_plan,
+            "frenet_plan": own_plan,
+            "neighbor_state_plan": neighbor_state_plan,
+            "neighbor_control_plan": neighbor_control_plan,
+            "neighbor_action": neighbor_u,
+        }
+
+
 class IBRBaselinePolicy(AlphaRacerPolicy):
     """
-    Iterated Best Response baseline for the alpha-RACER policy class.
-    
-    The paper's IBR baseline repeatedly replans each agent against the current
-    plans of the other agents. The original implementation is not public, so
-    this class implements the published structure: round-robin best responses,
-    finite horizon rollouts, and the relative-progress utility.
+    IBR baseline policy in alpha-RACER paper (multi_car_comp_blocking.py).
+    https://arxiv.org/abs/1801.02302 
+    The upstream baseline chooses the nearest interaction partner, solves a
+    two-car Frenet MPC with 3 alternating best responses, and applies the
+    current car's first direct control command.
     """
 
     def __init__(
         self,
         *args,
-        q=1.2,
+        q=1.0,
         zeta=1.0,
-        s1=0.2,
-        s2=0.2,
-        s3=0.2,
-        iterations=6,
-        gamma=0.99,
-        candidate_params=None,
-        unsafe_longitudinal=0.45,
-        unsafe_lateral=0.35,
-        collision_penalty=2.0,
+        s1=0.0,
+        s2=0.0,
+        s3=0.0,
+        iterations=3,  # N=3*2, total iterations
+        gamma=None,
+        ibr_horizon=None,
+        use_upstream_collision_expression=True,
         **kwargs,
     ):
         super().__init__(*args, params=np.array([q, zeta, s1, s2, s3]), **kwargs)
+        solver_horizon = self.mpc.horizon if ibr_horizon is None else int(ibr_horizon)
         self.iterations = int(iterations)
-        self.gamma = float(gamma)
-        self.candidate_params = candidate_params
-        self.unsafe_longitudinal = float(unsafe_longitudinal)
-        self.unsafe_lateral = float(unsafe_lateral)
-        self.collision_penalty = float(collision_penalty)
+        self.ibr_solver = _StrictIBRSolver(
+            horizon=solver_horizon,
+            dt=self.mpc.dt,
+            iterations=self.iterations,
+            wheelbase=self.mpc.p.LF + self.mpc.p.LR,
+            steer_scale=self.mpc.p.Sa,
+            throttle_gain=self.mpc.p.Ta,
+            friction=self.mpc.p.fr,
+            use_upstream_collision_expression=use_upstream_collision_expression,
+        )
         self._ibr_cached_action = None
         self._ibr_cached_action_time = None
         self._ibr_action_valid_until = -np.inf
-        self._ibr_cached_plan = None
         self._ibr_cached_ref_traj = None
         self._ibr_cached_ref_world_horizon = None
         self._ibr_cached_raceline_world_horizon = None
 
-    def _candidate_param_grid(self):
-        candidates = [
-            self.params.copy(),
-            np.array([1.0, 0.95, 0.0, 0.35, 0.0]),
-            np.array([1.2, 1.00, 0.2, 0.25, 0.2]),
-            np.array([1.4, 1.05, 0.45, 0.18, 0.35]),
-            np.array([1.6, 1.10, 0.65, 0.12, 0.8]),
-            np.array([2.0, 0.85, 0.05, 0.70, 0.0]),
-        ]
-        if self.candidate_params is not None:
-            candidates.extend(np.asarray(values, dtype=float) for values in self.candidate_params)
+    def _heading_error(self, state, current_s):
+        _, _, track_psi = self.track.interpolate(current_s)
+        return math.atan2(math.sin(state.psi - track_psi), math.cos(state.psi - track_psi))
 
-        unique = []
-        seen = set()
-        for values in candidates:
-            clipped = np.asarray(values, dtype=float).copy()
-            clipped[0] = np.clip(clipped[0], 0.05, 20.0)
-            clipped[1] = np.clip(clipped[1], 0.1, 3.0)
-            clipped[2] = np.clip(clipped[2], 0.0, self.mpc.track_half_width)
-            clipped[3] = np.clip(clipped[3], 0.001, 5.0)
-            clipped[4] = np.clip(clipped[4], 0.0, 5.0)
-            key = tuple(np.round(clipped, 4))
-            if key not in seen:
-                unique.append(clipped)
-                seen.add(key)
-        return unique
+    def _curvature_lookahead(self, current_s, state):
+        curvature = np.zeros(self.ibr_solver.horizon)
+        ds = 0.5
+        speed = max(float(state.vx), 0.0)
+        for k in range(self.ibr_solver.horizon):
+            s = current_s + k * self.mpc.dt * speed
+            _, _, psi_prev = self.track.interpolate(s - ds)
+            _, _, psi_next = self.track.interpolate(s + ds)
+            dpsi = math.atan2(math.sin(psi_next - psi_prev), math.cos(psi_next - psi_prev))
+            curvature[k] = dpsi / (2.0 * ds)
+        return curvature
 
-    def _state_plan_to_frenet_plan(self, state_plan, current_s):
-        px = np.zeros(state_plan.shape[1])
-        py = np.zeros(state_plan.shape[1])
-        last_s = current_s
-        for k in range(state_plan.shape[1]):
-            s, e = self.track.project(
-                state_plan[0, k],
-                state_plan[1, k],
-                s_hint=last_s,
-                search_radius=8.0,
-                psi_hint=state_plan[2, k],
-                max_heading_error=math.pi / 2.0,
+    def _reference_speed(self, state, current_s):
+        if self.raceline is None:
+            return max(float(state.vx), 0.5)
+        try:
+            idx = self.raceline.nearest_index(
+                state.x,
+                state.y,
+                last_idx=self.last_raceline_idx,
+                back_steps=self.search_back_steps,
+                forward_steps=self.search_forward_steps,
             )
-            px[k] = s
-            py[k] = e
-            last_s = s
-        return {
-            "px": px,
-            "py": py,
-            "vx": np.maximum(state_plan[3], 0.0),
-            "x": state_plan[0].copy(),
-            "y": state_plan[1].copy(),
-        }
+            self.last_raceline_idx = idx
+            self.last_raceline_s = float(self.raceline.s[idx])
+            return min(float(self.raceline.speed[idx]), self.max_speed)
+        except Exception:
+            return max(float(state.vx), 0.5)
 
-    def _relative_progress_utility(self, own_plan, opponent_plans):
-        horizon_lengths = [len(own_plan["px"]) - 1]
-        horizon_lengths.extend(len(plan["px"]) - 1 for plan in opponent_plans)
-        horizon = min(horizon_lengths)
-        value = 0.0
-        discount = 1.0
-        for k in range(horizon):
-            if opponent_plans:
-                max_opp_now = max(plan["px"][k] for plan in opponent_plans)
-                max_opp_next = max(plan["px"][k + 1] for plan in opponent_plans)
-                reward = (own_plan["px"][k + 1] - max_opp_next) - (own_plan["px"][k] - max_opp_now)
-            else:
-                reward = own_plan["px"][k + 1] - own_plan["px"][k]
-
-            safety_cost = 0.0
-            for plan in opponent_plans:
-                dx = abs(self._progress_delta(own_plan["px"][k + 1], plan["px"][k + 1]))
-                dy = abs(own_plan["py"][k + 1] - plan["py"][k + 1])
-                if dx < self.unsafe_longitudinal and dy < self.unsafe_lateral:
-                    safety_cost += self.collision_penalty * (
-                        (self.unsafe_longitudinal - dx) / self.unsafe_longitudinal
-                        + (self.unsafe_lateral - dy) / self.unsafe_lateral
-                    )
-            offroad = max(abs(own_plan["py"][k + 1]) - self.mpc.track_half_width, 0.0)
-            value += discount * (reward - safety_cost - 2.0 * offroad * offroad)
-            discount *= self.gamma
-        return value
-
-    def _make_opponents_from_plans(self, car_idx, car_s, car_e, states, plans):
-        opponents = []
-        for other_idx, plan in plans.items():
-            if other_idx == car_idx:
-                continue
-            opponents.append(
-                {
-                    "car_idx": other_idx,
-                    "px": car_s[other_idx],
-                    "py": car_e[other_idx],
-                    "vx": max(states[other_idx].vx, 0.0),
-                    "px_plan": plan["px"],
-                    "py_plan": plan["py"],
-                    "vx_plan": plan["vx"],
-                }
-            )
-        return opponents
-
-    def _best_response_plan(self, car_idx, state, current_s, car_s, car_e, states, plans):
-        opponents = self._make_opponents_from_plans(car_idx, car_s, car_e, states, plans)
-        opponent_plans = [plans[j] for j in plans if j != car_idx]
-        old_params = self.params.copy()
-        best = None
-
-        for params_candidate in self._candidate_param_grid():
-            self.params = params_candidate.copy()
-            try:
-                ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
-                u_opt, u_first = self.mpc.solve(
-                    state.to_array(),
-                    ref_traj,
-                    self.last_u,
-                    q_weight=self.get_q_weight(),
-                )
-            except Exception:
-                continue
-
-            plan = self._state_plan_to_frenet_plan(self.mpc.last_state_plan, current_s)
-            value = self._relative_progress_utility(plan, opponent_plans)
-            if best is None or value > best["value"]:
-                best = {
-                    "value": value,
-                    "params": self.params.copy(),
-                    "u_opt": u_opt.copy(),
-                    "u_first": u_first.copy(),
-                    "plan": plan,
-                    "ref_traj": ref_traj.copy(),
-                    "ref_world": None if self.last_ref_world_horizon is None else self.last_ref_world_horizon.copy(),
-                    "raceline_world": (
-                        None
-                        if self.last_raceline_world_horizon is None
-                        else self.last_raceline_world_horizon.copy()
-                    ),
-                    "loss": self.mpc.last_loss,
-                    "track_loss": self.mpc.last_track_loss,
-                    "action_loss": self.mpc.last_action_loss,
-                    "velocity_loss": self.mpc.last_velocity_loss,
-                    "heading_loss": self.mpc.last_heading_loss,
-                    "solver_success": self.mpc.last_solver_success,
-                    "solver_status": self.mpc.last_solver_status,
-                    "state_plan": self.mpc.last_state_plan.copy(),
-                    "control_plan": self.mpc.last_control_plan.copy(),
-                }
-
-        self.params = old_params
-        return best
-
-    def _accept_ibr_plan(self, result, sim_time):
-        self.params = result["params"].copy()
-        self.last_ref_traj = result["ref_traj"]
-        self.last_ref_world_horizon = result["ref_world"]
-        self.last_raceline_world_horizon = result["raceline_world"]
-        self.mpc.last_loss = result["loss"]
-        self.mpc.last_track_loss = result["track_loss"]
-        self.mpc.last_action_loss = result["action_loss"]
-        self.mpc.last_velocity_loss = result["velocity_loss"]
-        self.mpc.last_heading_loss = result["heading_loss"]
-        self.mpc.last_solver_success = result["solver_success"]
-        self.mpc.last_solver_status = result["solver_status"]
-        self.mpc.last_state_plan = result["state_plan"]
-        self.mpc.last_control_plan = result["control_plan"]
-        self._ibr_cached_plan = result["plan"]
-        self._ibr_cached_ref_traj = result["ref_traj"]
-        self._ibr_cached_ref_world_horizon = result["ref_world"]
-        self._ibr_cached_raceline_world_horizon = result["raceline_world"]
-        self._ibr_cached_action = CarAction(
-            throttle=float(np.clip(result["u_first"][0], -1.0, 1.0)),
-            steer=float(np.clip(result["u_first"][1], -1.0, 1.0)),
+    def _frenet_x0(self, state, current_s, current_e):
+        return np.array(
+            [
+                float(current_s),
+                float(current_e),
+                float(self._heading_error(state, current_s)),
+                max(float(state.vx), 0.0),
+            ],
+            dtype=float,
         )
+
+    def _make_ref_from_plan(self, plan, speed):
+        horizon = self.mpc.horizon
+        ref = np.zeros((8, horizon + 1))
+        ref_world = np.zeros((2, horizon + 1))
+        plan_len = plan.shape[1]
+        for k in range(horizon + 1):
+            src = min(k, plan_len - 1)
+            s = float(plan[0, src])
+            e = float(plan[1, src])
+            x, y, psi = self.track.interpolate(s)
+            ref[0, k] = s % self.track.total_length
+            ref[1, k] = e
+            ref[2, k] = speed
+            ref[3, k] = psi
+            ref[4, k] = x
+            ref[5, k] = y
+            ref[6, k] = -math.sin(psi)
+            ref[7, k] = math.cos(psi)
+            ref_world[:, k] = self.track.frenet_to_world(s, e)
+        return ref, ref_world
+
+    def plan_against_neighbor(self, own_state, own_s, own_e, neighbor_state, neighbor_s, neighbor_e, sim_time=None):
+        own_x0 = self._frenet_x0(own_state, own_s, own_e)
+        neighbor_x0 = self._frenet_x0(neighbor_state, neighbor_s, neighbor_e)
+        own_speed = self._reference_speed(own_state, own_s)
+        neighbor_speed = self._reference_speed(neighbor_state, neighbor_s)
+        result = self.ibr_solver.solve_pair(
+            neighbor_x0=neighbor_x0,
+            own_x0=own_x0,
+            neighbor_curvature=self._curvature_lookahead(neighbor_s, neighbor_state),
+            own_curvature=self._curvature_lookahead(own_s, own_state),
+            neighbor_speed=neighbor_speed,
+            own_speed=own_speed,
+        )
+        self._accept_ibr_result(result, own_speed, sim_time)
+
+    def _accept_ibr_result(self, result, ref_speed, sim_time):
+        action = np.asarray(result["action"], dtype=float)
+        action = np.clip(action, -1.0, 1.0)
+        self._ibr_cached_action = CarAction(throttle=float(action[0]), steer=float(action[1]))
         self._ibr_cached_action_time = sim_time
         self._ibr_action_valid_until = (sim_time if sim_time is not None else 0.0) + self.mpc.dt
         self.last_u = np.array([self._ibr_cached_action.throttle, self._ibr_cached_action.steer])
+        self.mpc.last_solver_success = True
+        self.mpc.last_solver_status = "Solve_Succeeded"
+        self.mpc.last_control_plan = result["control_plan"]
+
+        if result["state_plan"] is not None:
+            plan = result["state_plan"][:2, :]
+            ref_traj, ref_world = self._make_ref_from_plan(plan, ref_speed)
+            self.last_ref_traj = ref_traj
+            self.last_ref_world_horizon = ref_world
+            self.last_raceline_world_horizon = np.full_like(ref_world, np.nan)
+            self._ibr_cached_ref_traj = ref_traj
+            self._ibr_cached_ref_world_horizon = ref_world
+            self._ibr_cached_raceline_world_horizon = self.last_raceline_world_horizon
+            world_plan = np.zeros((4, plan.shape[1]))
+            for k in range(plan.shape[1]):
+                x, y = self.track.frenet_to_world(plan[0, k], plan[1, k])
+                _, _, psi_center = self.track.interpolate(plan[0, k])
+                world_plan[:, k] = [x, y, psi_center + result["state_plan"][2, k], result["state_plan"][3, k]]
+            self.mpc.last_state_plan = world_plan
 
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
         if (
@@ -1032,80 +1139,58 @@ class IBRBaselinePolicy(AlphaRacerPolicy):
             and sim_time is not None
             and sim_time < self._ibr_action_valid_until - 1e-9
         ):
-            self.last_ref_traj = self._ibr_cached_ref_traj
-            self.last_ref_world_horizon = self._ibr_cached_ref_world_horizon
-            self.last_raceline_world_horizon = self._ibr_cached_raceline_world_horizon
+            self.last_ref_traj = self._ibr_cached_ref_traj if self._ibr_cached_ref_traj is not None else self.last_ref_traj
+            self.last_ref_world_horizon = (
+                self._ibr_cached_ref_world_horizon
+                if self._ibr_cached_ref_world_horizon is not None
+                else self.last_ref_world_horizon
+            )
+            self.last_raceline_world_horizon = (
+                self._ibr_cached_raceline_world_horizon
+                if self._ibr_cached_raceline_world_horizon is not None
+                else self.last_raceline_world_horizon
+            )
             return self._ibr_cached_action
-        return super().get_action(state, current_s, opponents=opponents, sim_time=sim_time)
+        return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
 
 
-def _constant_frenet_plan(policy, state, current_s, current_e):
-    horizon = policy.mpc.horizon
-    px = np.zeros(horizon + 1)
-    py = np.full(horizon + 1, current_e)
-    vx = np.full(horizon + 1, max(state.vx, 0.0))
-    x = np.zeros(horizon + 1)
-    y = np.zeros(horizon + 1)
-    for k in range(horizon + 1):
-        px[k] = current_s + k * policy.mpc.dt * max(state.vx, 0.0)
-        x[k], y[k] = policy.track.frenet_to_world(px[k], py[k])
-    return {"px": px, "py": py, "vx": vx, "x": x, "y": y}
-
-
-def _latest_policy_plan(policy, state, current_s, current_e):
-    if isinstance(policy, IBRBaselinePolicy) and policy._ibr_cached_plan is not None:
-        plan = policy._ibr_cached_plan
-        if len(plan["px"]) >= policy.mpc.horizon + 1:
-            shifted = {}
-            for key, values in plan.items():
-                arr = np.asarray(values)
-                if len(arr) >= policy.mpc.horizon + 1:
-                    shifted[key] = np.r_[arr[1:], arr[-1]]
-            if {"px", "py", "vx", "x", "y"}.issubset(shifted):
-                shifted["px"][0] = current_s
-                shifted["py"][0] = current_e
-                shifted["vx"][0] = max(state.vx, 0.0)
-                shifted["x"][0] = state.x
-                shifted["y"][0] = state.y
-                return shifted
-    if policy.mpc.last_state_plan is not None:
-        try:
-            return policy._state_plan_to_frenet_plan(policy.mpc.last_state_plan, current_s)
-        except AttributeError:
-            pass
-    return _constant_frenet_plan(policy, state, current_s, current_e)
+def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
+    best_idx = None
+    best_abs_delta = np.inf
+    for other_idx, _ in enumerate(states):
+        if other_idx == car_idx:
+            continue
+        delta = policy._progress_delta(car_s[other_idx], car_s[car_idx])
+        abs_delta = abs(delta)
+        if abs_delta < best_abs_delta:
+            best_idx = other_idx
+            best_abs_delta = abs_delta
+    return best_idx
 
 
 def plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=None):
-    ibr_indices = [idx for idx, policy in enumerate(policies) if isinstance(policy, IBRBaselinePolicy)]
-    if not ibr_indices:
-        return
+    for idx, policy in enumerate(policies):
+        if not isinstance(policy, IBRBaselinePolicy):
+            continue
+        if (
+            policy._ibr_cached_action is not None
+            and sim_time is not None
+            and sim_time < policy._ibr_action_valid_until - 1e-9
+        ):
+            continue
 
-    due_indices = [
-        idx for idx in ibr_indices
-        if policies[idx]._ibr_cached_action is None
-        or sim_time is None
-        or sim_time >= policies[idx]._ibr_action_valid_until - 1e-9
-    ]
-    if not due_indices:
-        return
-
-    plans = {
-        idx: _latest_policy_plan(policy, states[idx], car_s[idx], car_e[idx])
-        for idx, policy in enumerate(policies)
-    }
-    iterations = max(policies[idx].iterations for idx in due_indices)
-    best_results = {}
-    for iteration in range(iterations):
-        for idx in due_indices:
-            policy = policies[idx]
-            if iteration >= policy.iterations:
-                continue
-            result = policy._best_response_plan(idx, states[idx], car_s[idx], car_s, car_e, states, plans)
-            if result is None:
-                continue
-            plans[idx] = result["plan"]
-            best_results[idx] = result
-
-    for idx, result in best_results.items():
-        policies[idx]._accept_ibr_plan(result, sim_time)
+        neighbor_idx = _nearest_interaction_neighbor(policy, idx, car_s, states)
+        if neighbor_idx is None:
+            continue
+        try:
+            policy.plan_against_neighbor(
+                own_state=states[idx],
+                own_s=car_s[idx],
+                own_e=car_e[idx],
+                neighbor_state=states[neighbor_idx],
+                neighbor_s=car_s[neighbor_idx],
+                neighbor_e=car_e[neighbor_idx],
+                sim_time=sim_time,
+            )
+        except Exception as exc:
+            policy._report_mpc_failure(exc, states[idx], sim_time=sim_time)
