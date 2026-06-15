@@ -4,9 +4,17 @@ import math
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import casadi as cs
 import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:  # Torch is only required for the original alpha-RACER weight policy.
+    torch = None
+    nn = None
 
 from state import CarAction, CarState
 from track import RaceLine, Track
@@ -248,17 +256,20 @@ class CenterLinePolicy(BasePolicy):
         return ref
 
 
-class AlphaRacerPolicy(BasePolicy):
+class ParameterizedAlphaRacerPolicy(BasePolicy):
     """
-    Five-parameter alpha-RACER policy: q, zeta, s1, s2, s3.
-    q scales the MPC track loss as Q_eff = q * I when config.Q is identity.
+    Shared alpha-RACER MPC reference-trajectory logic parameterized by
+    theta=(q, zeta, s1, s2, s3).
+
+    Subclasses differ only in how theta is chosen: fixed constants, an LLM,
+    or online optimization of a learned alpha-potential function.
     """
 
     def __init__(
         self,
         track,
         mpc,
-        step_distance=1.2,
+        step_distance=1.2, # larger step distance to match the original alpha-RACER policy's raceline lookahead
         params=None,
         raceline: RaceLine = None,
         max_speed=5.0,
@@ -340,6 +351,20 @@ class AlphaRacerPolicy(BasePolicy):
             math.sin((s_a - s_b) * 2.0 * math.pi / self.track.total_length),
             math.cos((s_a - s_b) * 2.0 * math.pi / self.track.total_length),
         ) * self.track.total_length / (2.0 * math.pi)
+
+    def _angle_delta(self, angle_a: float, angle_b: float) -> float:
+        return math.atan2(math.sin(angle_a - angle_b), math.cos(angle_a - angle_b))
+
+    def _track_heading_error(self, psi: float, s: float, reference_minus_heading: bool = True) -> float:
+        _, _, ref_psi = self.track.interpolate(s)
+        if reference_minus_heading:
+            return self._angle_delta(ref_psi, psi)
+        return self._angle_delta(psi, ref_psi)
+
+    def _track_curvature_at(self, s: float, ds: float = 0.25) -> float:
+        _, _, psi_prev = self.track.interpolate(s - ds)
+        _, _, psi_next = self.track.interpolate(s + ds)
+        return self._angle_delta(psi_next, psi_prev) / (2.0 * ds)
 
     def _sign(self, value: float) -> float:
         if value > 0.0:
@@ -482,9 +507,22 @@ class AlphaRacerPolicy(BasePolicy):
         return ref
 
 
-class LLMAlphaRacerPolicy(AlphaRacerPolicy):
+class StaticAlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
     """
-    AlphaRacer policy whose five parameters are supplied by a local LLM.
+    Fixed-parameter controller from the alpha-RACER policy class.
+
+    The five parameters q, zeta, s1, s2, s3 are held constant during
+    simulation, so this is the static-policy baseline.
+    """
+
+
+class AlphaRacerPolicy(StaticAlphaRacerPolicy):
+    """Backward-compatible name for StaticAlphaRacerPolicy."""
+
+
+class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
+    """
+    alpha-RACER policy whose five parameters are supplied by a local LLM.
 
     The LLM only chooses q, zeta, s1, s2, s3. MPC still computes the actual
     throttle/steering command, so bad LLM responses can be clipped or ignored.
@@ -812,6 +850,222 @@ class LLMAlphaRacerPolicy(AlphaRacerPolicy):
         return super().get_reference_trajectory(state, current_s, opponents=opponents)
 
 
+class LLMAlphaRacerPolicy(LLMParameterPolicy):
+    """Backward-compatible name for LLMParameterPolicy."""
+
+
+class _LearnedAlphaPotentialFunction(nn.Module if nn is not None else object):
+    """Neural network approximation of the alpha-potential function."""
+
+    def __init__(self, input_size, hidden_size, output_size):
+        if nn is None:
+            raise ImportError("PyTorch is required for the learned alpha-potential policy.")
+        super().__init__()
+        layers = []
+        self.batch_norm = nn.BatchNorm1d(input_size, affine=False)
+        current = input_size
+        for width in hidden_size:
+            layers.append(nn.Linear(current, width))
+            layers.append(nn.ReLU())
+            current = width
+        layers.append(nn.Linear(current, output_size))
+        self.fc = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if len(x.shape) == 2:
+            x = self.batch_norm(x)
+        elif len(x.shape) == 3:
+            flat = self.batch_norm(x.reshape((-1, x.shape[-1])))
+            x = flat.reshape(x.shape)
+        return self.fc(x)
+
+
+class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
+    """
+    alpha-RACER online policy that searches for parameters maximizing the
+    learned alpha-potential function.
+
+    The original model scores 5 policy parameters per car:
+    sf1, sf2, lookahead_factor, speed_factor, blocking. This project uses
+    q, zeta, s1, s2, s3 in MPC, so the selected parameters are mapped as:
+    q=fixed, zeta=speed_factor^2, s1=sf1, s2=sf2, s3=blocking.
+    """
+
+    ORIGINAL_PARAM_BOUNDS = np.asarray(
+        [
+            [0.1, 0.5],   # sf1
+            [0.1, 0.5],   # sf2
+            [0.15, 0.5],  # lookahead_factor
+            [0.85, 1.1],  # speed_factor
+            [0.0, 1.0],   # blocking
+        ],
+        dtype=float,
+    )
+
+    def __init__(
+        self,
+        *args,
+        weight_path="alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth",
+        q_value=1.0,
+        search_points=7,
+        search_iters=1,
+        opponent_default_original_params=None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if torch is None:
+            raise ImportError("PyTorch is required to use PotentialFunctionPolicy.")
+
+        self.weight_path = Path(weight_path)
+        if not self.weight_path.exists():
+            raise FileNotFoundError(f"alpha-RACER weight file not found: {self.weight_path}")
+
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.potential_function = _LearnedAlphaPotentialFunction(39, [384, 384, 192], 1).to(self.device)
+        state_dict = torch.load(str(self.weight_path), map_location=self.device)
+        self.potential_function.load_state_dict(state_dict)
+        self.potential_function.eval()
+
+        self.q_value = float(q_value)
+        self.search_points = max(2, int(search_points))
+        self.search_iters = max(1, int(search_iters))
+        self.original_params = np.asarray([0.3, 0.2, 0.25, 0.95, 0.0], dtype=float)
+        self.opponent_default_original_params = np.asarray(
+            [0.3, 0.2, 0.25, 0.95, 0.0]
+            if opponent_default_original_params is None
+            else opponent_default_original_params,
+            dtype=float,
+        )
+        self.current_mode = "potential"
+        self.params = self._map_original_params(self.original_params)
+        self._warned_missing_opponents = False
+
+    def _map_original_params(self, original_params):
+        sf1, sf2, _lookahead_factor, speed_factor, blocking = np.asarray(original_params, dtype=float)
+        return np.asarray(
+            [
+                self.q_value,
+                float(np.clip(speed_factor * speed_factor, 0.1, 3.0)),
+                float(np.clip(sf1, 0.0, self.mpc.track_half_width)),
+                float(max(sf2, 1e-3)),
+                float(np.clip(blocking, 0.0, 5.0)),
+            ],
+            dtype=float,
+        )
+
+    def _wrap_delta(self, s_a, s_b):
+        return self._progress_delta(float(s_a), float(s_b))
+
+    def _car_feature_block(self, car):
+        s = float(car["px"])
+        state = car.get("state")
+        psi = float(car.get("psi", getattr(state, "psi", 0.0)))
+        vx = float(car.get("vx", getattr(state, "vx", 0.0)))
+        vy = float(car.get("vy", getattr(state, "vy", 0.0)))
+        omega = float(car.get("omega", getattr(state, "omega", 0.0)))
+        return [
+            float(car["py"]),
+            self._track_heading_error(psi, s),
+            vx,
+            vy,
+            omega,
+        ]
+
+    def _ordered_cars(self, state: CarState, current_s: float, opponents):
+        cars = [
+            {
+                "px": current_s,
+                "py": self.track.project(
+                    state.x,
+                    state.y,
+                    s_hint=current_s,
+                    search_radius=8.0,
+                    psi_hint=state.psi,
+                    max_heading_error=math.pi / 2.0,
+                )[1],
+                "vx": state.vx,
+                "vy": state.vy,
+                "omega": state.omega,
+                "psi": state.psi,
+                "state": state,
+            }
+        ]
+        for opponent in opponents or []:
+            cars.append(dict(opponent))
+
+        if len(cars) < 3:
+            if not self._warned_missing_opponents:
+                self._log(f"[potential-function policy][{self.warning_label}] expected 3 cars; padding missing opponents.")
+                self._warned_missing_opponents = True
+            while len(cars) < 3:
+                cars.append({"px": current_s, "py": 0.0, "vx": 0.0, "vy": 0.0, "omega": 0.0, "psi": state.psi})
+        return cars[:3]
+
+    def _build_original_input(self, state: CarState, current_s: float, opponents, original_params):
+        cars = self._ordered_cars(state, current_s, opponents)
+        s0, s1, s2 = [float(car["px"]) for car in cars]
+        features = [
+            self._wrap_delta(s2, s1),
+            self._wrap_delta(s1, s0),
+            self._wrap_delta(s2, s0),
+        ]
+        for car in cars:
+            features.extend(self._car_feature_block(car))
+        for car in cars:
+            s = float(car["px"])
+            features.append(self._track_curvature_at(s))
+        for car in cars:
+            s = float(car["px"])
+            features.append(
+                self._track_curvature_at(s + max(float(car.get("vx", 0.0)), 0.0) * self.mpc.dt * self.mpc.horizon)
+            )
+
+        param_blocks = [
+            np.asarray(original_params, dtype=float),
+            self.opponent_default_original_params,
+            self.opponent_default_original_params,
+        ]
+        for block in param_blocks:
+            features.extend(block.tolist())
+
+        x = np.asarray(features, dtype=np.float32)
+        x[~np.isfinite(x)] = 0.0
+        if x.shape[0] != 39:
+            raise ValueError(f"Potential-function policy input must have 39 values, got {x.shape[0]}")
+        return x
+
+    def _score_original_params(self, state, current_s, opponents, original_params_batch):
+        rows = [self._build_original_input(state, current_s, opponents, row) for row in original_params_batch]
+        with torch.no_grad():
+            x = torch.tensor(np.asarray(rows), dtype=torch.float32, device=self.device)
+            scores = self.potential_function(x).detach().cpu().reshape(-1).tolist()
+        return np.asarray(scores, dtype=float)
+
+    def _select_original_params(self, state, current_s, opponents):
+        best = self.original_params.copy()
+        bounds = self.ORIGINAL_PARAM_BOUNDS
+        for _ in range(self.search_iters):
+            for dim in range(5):
+                candidates = np.repeat(best[None, :], self.search_points, axis=0)
+                candidates[:, dim] = np.linspace(bounds[dim, 0], bounds[dim, 1], self.search_points)
+                scores = self._score_original_params(state, current_s, opponents, candidates)
+                best = candidates[int(np.argmax(scores))].copy()
+        return best
+
+    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
+        self.original_params = self._select_original_params(state, current_s, opponents or [])
+        self.params = self._map_original_params(self.original_params)
+        return super().get_reference_trajectory(state, current_s, opponents=opponents)
+
+
+class PotentialFunctionMinPolicy(PotentialFunctionPolicy):
+    """Compatibility alias for users who call this a potential-min policy."""
+
+
+class WeightedAlphaRacerPolicy(PotentialFunctionPolicy):
+    """Backward-compatible name for PotentialFunctionPolicy."""
+
+
 class _StrictIBRSolver:
     """Frenet-space IBR MPC matching multi_car_comp_blocking.py."""
 
@@ -983,7 +1237,7 @@ class _StrictIBRSolver:
         }
 
 
-class IBRBaselinePolicy(AlphaRacerPolicy):
+class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
     """
     IBR baseline policy in alpha-RACER paper (multi_car_comp_blocking.py).
     https://arxiv.org/abs/1801.02302 
@@ -1026,20 +1280,12 @@ class IBRBaselinePolicy(AlphaRacerPolicy):
         self._ibr_cached_ref_world_horizon = None
         self._ibr_cached_raceline_world_horizon = None
 
-    def _heading_error(self, state, current_s):
-        _, _, track_psi = self.track.interpolate(current_s)
-        return math.atan2(math.sin(state.psi - track_psi), math.cos(state.psi - track_psi))
-
     def _curvature_lookahead(self, current_s, state):
         curvature = np.zeros(self.ibr_solver.horizon)
-        ds = 0.5
         speed = max(float(state.vx), 0.0)
         for k in range(self.ibr_solver.horizon):
             s = current_s + k * self.mpc.dt * speed
-            _, _, psi_prev = self.track.interpolate(s - ds)
-            _, _, psi_next = self.track.interpolate(s + ds)
-            dpsi = math.atan2(math.sin(psi_next - psi_prev), math.cos(psi_next - psi_prev))
-            curvature[k] = dpsi / (2.0 * ds)
+            curvature[k] = self._track_curvature_at(s, ds=0.5)
         return curvature
 
     def _reference_speed(self, state, current_s):
@@ -1064,7 +1310,7 @@ class IBRBaselinePolicy(AlphaRacerPolicy):
             [
                 float(current_s),
                 float(current_e),
-                float(self._heading_error(state, current_s)),
+                float(self._track_heading_error(state.psi, current_s, reference_minus_heading=False)),
                 max(float(state.vx), 0.0),
             ],
             dtype=float,
@@ -1154,6 +1400,10 @@ class IBRBaselinePolicy(AlphaRacerPolicy):
         return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
 
 
+class IBRBaselinePolicy(IteratedBestResponsePolicy):
+    """Backward-compatible name for IteratedBestResponsePolicy."""
+
+
 def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
     best_idx = None
     best_abs_delta = np.inf
@@ -1170,7 +1420,7 @@ def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
 
 def plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=None):
     for idx, policy in enumerate(policies):
-        if not isinstance(policy, IBRBaselinePolicy):
+        if not isinstance(policy, IteratedBestResponsePolicy):
             continue
         if (
             policy._ibr_cached_action is not None

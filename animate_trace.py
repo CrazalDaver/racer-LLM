@@ -31,8 +31,12 @@ def _short_policy_name(name):
     key = str(name).strip().lower()
     if "llm" in key:
         return "LLM"
-    if key in {"alpharacer", "alpha_racer"}:
-        return "Alpha"
+    if key in {"ibr", "iterated_best_response_policy"}:
+        return "IBR"
+    if key in {"static_policy", "static", "fixed_parameter_controller", "alpharacer", "alpha_racer"}:
+        return "Static"
+    if key in {"potential_function_policy", "potential_function_min_policy", "weighted_alpharacer", "weighted"}:
+        return "Potential"
     return str(name)
 
 

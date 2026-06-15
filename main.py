@@ -37,10 +37,10 @@ def _slug(text):
 
 
 def _policy_params_for_name(policy_names, snapshot):
-    first_policy = _slug(policy_names[0]) if policy_names else "alpha"
-    if first_policy in {"llm", "llm-alpha", "llm-alpharacer", "llm_alpharacer"}:
+    first_policy = _slug(policy_names[0]) if policy_names else "static"
+    if first_policy in {"llm", "llm-alpha", "llm-alpharacer", "llm_alpharacer", "llm_parameter_policy"}:
         return snapshot["LLM_POLICY_PARAMS"]
-    return snapshot["ALPHARACER_PARAMS"]
+    return snapshot.get("STATIC_POLICY_PARAMS", snapshot["ALPHARACER_PARAMS"])
 
 
 def _format_param(value):
@@ -94,6 +94,7 @@ def save_experiment_config(output_dir, policy_names, snapshot):
 
 def simulation_kwargs(
     vehicle_model_type=None,
+    static_policy_params=None,
     alpharacer_params=None,
     llm_policy_params=None,
     llm_output_mode=None,
@@ -103,6 +104,7 @@ def simulation_kwargs(
 ):
     return {
         "vehicle_model_type": vehicle_model_type,
+        "static_policy_params": static_policy_params,
         "alpharacer_params": alpharacer_params,
         "llm_policy_params": llm_policy_params,
         "llm_output_mode": llm_output_mode,
@@ -115,6 +117,7 @@ def simulation_kwargs(
 def _override_snapshot(
     snapshot,
     vehicle_model_type=None,
+    static_policy_params=None,
     alpharacer_params=None,
     llm_policy_params=None,
     llm_output_mode=None,
@@ -126,6 +129,7 @@ def _override_snapshot(
     snapshot = dict(snapshot)
     overrides = simulation_kwargs(
         vehicle_model_type=vehicle_model_type,
+        static_policy_params=static_policy_params,
         alpharacer_params=alpharacer_params,
         llm_policy_params=llm_policy_params,
         llm_output_mode=llm_output_mode,
@@ -135,8 +139,13 @@ def _override_snapshot(
     )
     if overrides["vehicle_model_type"] is not None:
         snapshot["VEHICLE_MODEL"] = overrides["vehicle_model_type"]
-    if overrides["alpharacer_params"] is not None:
-        snapshot["ALPHARACER_PARAMS"] = [float(value) for value in overrides["alpharacer_params"]]
+    fixed_params = overrides["static_policy_params"]
+    if fixed_params is None:
+        fixed_params = overrides["alpharacer_params"]
+    if fixed_params is not None:
+        fixed_params = [float(value) for value in fixed_params]
+        snapshot["STATIC_POLICY_PARAMS"] = fixed_params
+        snapshot["ALPHARACER_PARAMS"] = fixed_params
     if overrides["llm_policy_params"] is not None:
         snapshot["LLM_POLICY_PARAMS"] = [float(value) for value in overrides["llm_policy_params"]]
     if overrides["llm_output_mode"] is not None:
@@ -161,6 +170,7 @@ def run_experiment(
     dpi=100,
     show_plot=False,
     vehicle_model_type=None,
+    static_policy_params=None,
     alpharacer_params=None,
     llm_policy_params=None,
     llm_output_mode=None,
@@ -176,6 +186,7 @@ def run_experiment(
     """
     sim_kwargs = simulation_kwargs(
         vehicle_model_type=vehicle_model_type,
+        static_policy_params=static_policy_params,
         alpharacer_params=alpharacer_params,
         llm_policy_params=llm_policy_params,
         llm_output_mode=llm_output_mode,
@@ -277,6 +288,7 @@ def run_experiment_suite(
     show_plot=False,
     show_ref_debug=False,
     vehicle_model_type=None,
+    static_policy_params=None,
     alpharacer_params=None,
     llm_policy_params=None,
     llm_output_mode=None,
@@ -313,6 +325,7 @@ def run_experiment_suite(
                 show_plot=show_plot,
                 show_ref_debug=show_ref_debug,
                 vehicle_model_type=vehicle_model_type,
+                static_policy_params=static_policy_params,
                 alpharacer_params=alpharacer_params,
                 llm_policy_params=llm_policy_params,
                 llm_output_mode=llm_output_mode,
@@ -349,6 +362,7 @@ def _add_case_args(parser):
 def _add_sim_args(parser):
     group = parser.add_argument_group("simulation")
     group.add_argument("--vehicle-model", choices=["kinematic", "kinetic", "kinetics", "dbm"], default=None)
+    group.add_argument("--static-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
     group.add_argument("--alpha-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
     group.add_argument("--llm-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
     group.add_argument("--llm-output-mode", choices=["auto", "mode", "params"], default=None)
@@ -385,6 +399,7 @@ def main():
         show_plot=args.show_plot,
         show_ref_debug=args.show_ref_debug,
         vehicle_model_type=args.vehicle_model,
+        static_policy_params=args.static_params if args.static_params is not None else args.alpha_params,
         alpharacer_params=args.alpha_params,
         llm_policy_params=args.llm_params,
         llm_output_mode=args.llm_output_mode,

@@ -32,6 +32,7 @@ class ProjectablePath:
         search_radius: float = None,
         psi_hint: float = None,
         max_heading_error: float = None,
+        allow_global_fallback: bool = True,
     ) -> Tuple[float, float]:
         result = self._project_impl(
             x,
@@ -52,7 +53,9 @@ class ProjectablePath:
             )
             if result is not None:
                 return result
-        return self._project_impl(x, y)
+        if allow_global_fallback:
+            return self._project_impl(x, y)
+        raise ValueError("Projection failed within the local progress window.")
 
     def _project_impl(
         self,

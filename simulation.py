@@ -3,7 +3,14 @@ import numpy as np
 from config import make_vehicle_params, params
 from mpc_controller import MPCController
 from plotting import plot_simulation_results
-from policies import AlphaRacerPolicy, CenterLinePolicy, IBRBaselinePolicy, LLMAlphaRacerPolicy, plan_ibr_joint_actions
+from policies import (
+    AlphaRacerPolicy,
+    CenterLinePolicy,
+    IBRBaselinePolicy,
+    LLMAlphaRacerPolicy,
+    WeightedAlphaRacerPolicy,
+    plan_ibr_joint_actions,
+)
 from state import CarState
 from track import Track, load_centerline_csv, load_raceline_csv
 from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
@@ -21,12 +28,50 @@ def progress_delta(s_a, s_b, total_length):
     ) * total_length / (2.0 * np.pi)
 
 
+def project_vehicle_state(track, state, s_hint, search_radius, max_heading_error):
+    try:
+        return track.project(
+            state.x,
+            state.y,
+            s_hint=s_hint,
+            search_radius=search_radius,
+            psi_hint=state.psi,
+            max_heading_error=max_heading_error,
+            allow_global_fallback=False,
+        )
+    except ValueError:
+        try:
+            return track.project(
+                state.x,
+                state.y,
+                s_hint=s_hint,
+                search_radius=search_radius,
+                allow_global_fallback=False,
+            )
+        except ValueError:
+            return track.project(
+                state.x,
+                state.y,
+                s_hint=s_hint,
+                search_radius=search_radius * 3.0,
+                allow_global_fallback=False,
+            )
+
+
 def _normalize_policy_name(policy_name):
     key = str(policy_name).strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
         "alpha": "alpharacer",
         "alpha_racer": "alpharacer",
         "alpharacer": "alpharacer",
+        "weighted": "weighted_alpharacer",
+        "weight": "weighted_alpharacer",
+        "weights": "weighted_alpharacer",
+        "weighted_alpha": "weighted_alpharacer",
+        "weighted_alpha_racer": "weighted_alpharacer",
+        "weighted_alpharacer": "weighted_alpharacer",
+        "ours": "weighted_alpharacer",
+        "ours_high_p": "weighted_alpharacer",
         "llm": "llm_alpharacer",
         "llm_alpha": "llm_alpharacer",
         "llm_alpha_racer": "llm_alpharacer",
@@ -142,6 +187,26 @@ def create_policy(
             ),
             history_length=params.LLM_HISTORY_LENGTH,
             output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode,
+        )
+    if policy_type == "weighted_alpharacer":
+        return WeightedAlphaRacerPolicy(
+            track,
+            mpc,
+            step_distance=params.DT * params.MAX_RACELINE_SPEED,
+            car_idx=car_idx,
+            policy_name=policy_type,
+            params=np.asarray(
+                params.ALPHARACER_PARAMS if alpharacer_params is None else alpharacer_params,
+                dtype=float,
+            ).copy(),
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            search_back_steps=params.RACELINE_SEARCH_BACK_STEPS,
+            search_forward_steps=params.RACELINE_SEARCH_FORWARD_STEPS,
+            weight_path=params.ALPHARACER_WEIGHT_PATH,
+            q_value=params.ALPHARACER_WEIGHT_Q,
+            search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS,
+            search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS,
         )
     if policy_type == "ibr":
         return IBRBaselinePolicy(
@@ -446,13 +511,12 @@ def run_simulation(
         car_s = []
         car_e = []
         for car_idx, state in enumerate(states):
-            s, e_before = track.project(
-                state.x,
-                state.y,
-                s_hint=progress_s[car_idx],
-                search_radius=params.PROJECTION_SEARCH_RADIUS,
-                psi_hint=state.psi,
-                max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
+            s, e_before = project_vehicle_state(
+                track,
+                state,
+                progress_s[car_idx],
+                params.PROJECTION_SEARCH_RADIUS,
+                params.PROJECTION_MAX_HEADING_ERROR,
             )
             progress_s[car_idx] = s
             car_s.append(s)
@@ -462,7 +526,15 @@ def run_simulation(
         plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=step * params.DT)
         for car_idx, state in enumerate(states):
             opponents = [
-                {"px": car_s[j], "py": car_e[j], "vx": max(states[j].vx, 0.0)}
+                {
+                    "px": car_s[j],
+                    "py": car_e[j],
+                    "vx": max(states[j].vx, 0.0),
+                    "vy": states[j].vy,
+                    "omega": states[j].omega,
+                    "psi": states[j].psi,
+                    "state": states[j],
+                }
                 for j in range(num_cars)
                 if j != car_idx
             ]
@@ -596,13 +668,12 @@ def run_simulation(
         next_s = []
         next_e = []
         for car_idx, state in enumerate(states):
-            s, e = track.project(
-                state.x,
-                state.y,
-                s_hint=progress_s[car_idx],
-                search_radius=params.PROJECTION_SEARCH_RADIUS,
-                psi_hint=state.psi,
-                max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
+            s, e = project_vehicle_state(
+                track,
+                state,
+                progress_s[car_idx],
+                params.PROJECTION_SEARCH_RADIUS,
+                params.PROJECTION_MAX_HEADING_ERROR,
             )
             progress_s[car_idx] = s
             next_s.append(s)
@@ -710,7 +781,7 @@ if __name__ == "__main__":
     # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
     # run_simulation(
     #     policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
-    #     alpharacer_params=[1.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
+    #     alpharacer_params=[2.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
     #     ) # most basic settings.
     
     # run_simulation(
@@ -748,6 +819,12 @@ if __name__ == "__main__":
 
     run_simulation(
         policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
-        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
+        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
+        ego_position=2,
         vehicle_model_type="kinematic",
     )
+
+    # run_simulation(
+    # policy_names=["weighted", "LLM", "IBR"],
+    # vehicle_model_type="kinematic", ego_position=1,
+    # )

@@ -74,8 +74,8 @@ class SimParams:
     TOTAL_TIME = 30.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
-    TRACK_WIDTH = 2.0
-    OFFROAD_TOLERANCE = 0.55
+    TRACK_WIDTH = 0.88
+    OFFROAD_TOLERANCE = 0.55 # 
     OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
     MPC_DT = 0.1
 
@@ -93,7 +93,7 @@ class SimParams:
     MAX_RACELINE_SPEED = 5.0
     RACELINE_SEARCH_BACK_STEPS = 20 # searching for the closest point on the raceline
     RACELINE_SEARCH_FORWARD_STEPS = 200
-    PROJECTION_SEARCH_RADIUS = 4.0
+    PROJECTION_SEARCH_RADIUS = 1.0
     PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
     TRACE_OUTPUT = "simulation_trace.npz"
     VEHICLE_MODEL = "kinematic"
@@ -109,7 +109,16 @@ class SimParams:
     LLM_UPDATE_INTERVAL_STEPS = 5 # how often to update the LLM policy in terms of MPC steps
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
-    ALPHARACER_PARAMS = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # q, zeta, s1, s2, s3
+    STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # q, zeta, s1, s2, s3
+    ALPHARACER_PARAMS = STATIC_POLICY_PARAMS  # backward-compatible name
+    POTENTIAL_FUNCTION_WEIGHT_PATH = "alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth"
+    POTENTIAL_FUNCTION_Q = 1.0
+    POTENTIAL_FUNCTION_SEARCH_POINTS = 7
+    POTENTIAL_FUNCTION_SEARCH_ITERS = 1
+    ALPHARACER_WEIGHT_PATH = POTENTIAL_FUNCTION_WEIGHT_PATH  # backward-compatible name
+    ALPHARACER_WEIGHT_Q = POTENTIAL_FUNCTION_Q
+    ALPHARACER_WEIGHT_SEARCH_POINTS = POTENTIAL_FUNCTION_SEARCH_POINTS
+    ALPHARACER_WEIGHT_SEARCH_ITERS = POTENTIAL_FUNCTION_SEARCH_ITERS
     LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
     IBR_HORIZON = 10 # Matches multi_car_comp_blocking.py's IBR horizon.
     IBR_ITERATIONS = 3
