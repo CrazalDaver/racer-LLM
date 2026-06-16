@@ -192,7 +192,7 @@ def plot_simulation_results(
     velocity_dt_multiplier=2,
     trajectory_time_mark_interval=5.0,
 ):
-    half_width = params.TRACK_WIDTH / 2.0
+    half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     dt = params.DT
 
     fig, axes = plt.subplots(4, 2, figsize=(14, 17), constrained_layout=True)
@@ -373,8 +373,13 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
     time = data["time"]
     dt = _time_step(time)
     track_width = float(np.asarray(data["track_width"]).item()) if "track_width" in data.files else 2.0
+    track_half_width = (
+        float(np.asarray(data["track_half_width"]).item())
+        if "track_half_width" in data.files
+        else track_width / 2.0
+    )
     track_length = float(np.asarray(data["track_length"]).item()) if "track_length" in data.files else None
-    params = SimpleNamespace(DT=dt, TRACK_WIDTH=track_width)
+    params = SimpleNamespace(DT=dt, TRACK_WIDTH=track_width, TRACK_HALF_WIDTH=track_half_width)
 
     track_csv = _scalar_string(data["track_csv"]) if "track_csv" in data.files else "track_csv/berlin_2018.csv"
     raceline_csv = (

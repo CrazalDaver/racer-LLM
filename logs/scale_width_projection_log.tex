@@ -1,0 +1,364 @@
+\documentclass[UTF8]{ctexart}
+
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!55!black,
+  citecolor=blue!55!black
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single
+}
+
+\title{Racer-LLM 轨道尺度、宽度与投影问题排查日志}
+\author{Codex 与实验记录}
+\date{2026-06-16}
+
+\begin{document}
+\maketitle
+
+\section{问题背景}
+
+当前实验目标是使用最简单的 MPC 控制单车跟随读取的 raceline，并尽量保持车辆不出界。
+然而在 raw CSV 坐标系下使用赛道半宽 $0.22\,\mathrm{m}$ 时，车辆仍然频繁出界。
+今天的排查重点集中在三个互相耦合的问题：
+
+\begin{enumerate}[label=(\arabic*)]
+  \item 原版 alpha-RACER 中 \texttt{TRACK\_WIDTH=0.22}、\texttt{scale=2.0}、\texttt{track\_width=1.0}、以及 \texttt{\(\pm 0.44\)} 到底分别表示什么；
+  \item 当前项目中的 world 坐标、Frenet 坐标、raceline deviation、MPC reference frame 是否一致；
+  \item 为什么 raw 坐标下按照 $0.22\,\mathrm{m}$ 半宽控制时，MPC 精度仍然不够。
+\end{enumerate}
+
+\section{关键代码证据}
+
+\subsection{Raceline 生成宽度}
+
+原项目 raceline 生成处定义：
+
+\begin{lstlisting}[language=Python]
+TRACK_WIDTH = 0.22
+\end{lstlisting}
+
+对应代码：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/ref_trajs/calculate_raceline.py#L12}{alpha-RACER/ref\_trajs/calculate\_raceline.py:L12}。
+
+该值被写入 raceline 优化器所需的左右边界宽度：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/ref_trajs/calculate_raceline.py#L30-L31}{calculate\_raceline.py:L30--L31}。
+
+本项目读取的 \texttt{berlin\_2018\_raceline\_with\_speeds.csv} 中，最后一列 \texttt{dev\_m} 的最大绝对值约为 $0.206\,\mathrm{m}$。
+这与 raw 坐标下半宽 $0.22\,\mathrm{m}$ 基本吻合，说明 raceline 本身几乎贴着边界。
+
+\subsection{\texttt{params-num.yaml} 中的 scale}
+
+原项目数值仿真配置：
+
+\begin{lstlisting}[language=yaml]
+track_info:
+  track_width: 1.0
+  scale: 2.0
+
+timescale: 2.0
+\end{lstlisting}
+
+对应代码：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/simulators/params-num.yaml#L1-L10}{params-num.yaml:L1--L10}，
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/simulators/params-num.yaml#L36}{params-num.yaml:L36}。
+
+\subsection{WaypointGenerator 中 scale 的实际作用}
+
+原项目 \texttt{WaypointGenerator} 定义在：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/car_dynamics/car_dynamics/controllers_jax/waypoint.py#L69}{car\_dynamics/controllers\_jax/waypoint.py:L69}。
+
+关键逻辑为：
+
+\begin{lstlisting}[language=Python]
+self.raceline = np.array(df_raceline.iloc[:,:4]) + np.array([0, ox, oy, 0])
+self.raceline_dev = 2*np.array(df_raceline.iloc[:,4])
+self.raceline = self.raceline[:,1:]
+self.raceline[:,:2] *= float(yaml_content['track_info']['scale'])
+
+if waypoint_type.find('num') != -1:
+    self.path = np.array(df.iloc[:-1,:])*yaml_content['track_info']['scale'] + np.array([0, ox, oy, 0])
+else:
+    self.path = np.array(df.iloc[:,:]) + np.array([0, ox, oy, 0])
+self.path[:,-1] = speed
+\end{lstlisting}
+
+对应代码：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/car_dynamics/car_dynamics/controllers_jax/waypoint.py#L129-L139}{waypoint.py:L129--L139}。
+
+由此可得：
+
+\begin{itemize}
+  \item raceline 的 $x,y$ 会乘以 \texttt{scale=2.0}；
+  \item raceline 的 \texttt{dev\_m} 没有通过通用 \texttt{scale} 变量缩放，而是写成 \texttt{2 * dev\_m}；
+  \item raceline 的速度列 \texttt{vx\_mps} 没有乘以 2；
+  \item centerline/path 的速度列即使暂时被整体乘以 \texttt{scale}，随后也会被 \texttt{self.path[:,-1] = speed} 覆盖。
+\end{itemize}
+
+因此原版中 scale 后的主要效果是：
+
+\[
+x,y,s,e \text{ 的空间尺度约扩大 } 2 \text{ 倍，而速度不随之扩大。}
+\]
+
+\subsection{\texttt{\(\pm 0.44\)} 的来源}
+
+原项目 \texttt{multi\_car\_comp\_blocking.py} 中有：
+
+\begin{lstlisting}[language=Python]
+e_ = -self.raceline_dev[lookahead_idx]
+if e_ + shift > 0.44:
+    shift = 0.44 - e_
+if e_ + shift < -0.44:
+    shift = -0.44 - e_
+\end{lstlisting}
+
+对应代码：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/car_ros2/car_ros2/multi_car_comp_blocking.py#L496-L500}{multi\_car\_comp\_blocking.py:L496--L500}。
+
+因为 \texttt{raceline\_dev = 2 * dev\_m}，而 raw \texttt{dev\_m} 最大约为 $0.206$，所以 scale 后 deviation 最大约为：
+
+\[
+2 \times 0.206 \approx 0.412.
+\]
+
+这与 clip 半宽 $0.44$ 基本一致。
+因此 \texttt{\(\pm 0.44\)} 更像是 scale 后运行坐标系中的 lateral clip，而不是 raw CSV 坐标下的半宽。
+
+\subsection{\texttt{track\_width: 1.0} 的用途}
+
+\texttt{WaypointGenerator} 中左右边界由以下代码生成：
+
+\begin{lstlisting}[language=Python]
+self.left_boundary = self.calc_shifted_traj(
+    self.path[:,1:],
+    yaml_content['track_info']['track_width']/2. + 0.15
+)
+self.right_boundary = self.calc_shifted_traj(
+    self.path[:,1:],
+    -yaml_content['track_info']['track_width']/2. - 0.2
+)
+\end{lstlisting}
+
+对应代码：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/car_dynamics/car_dynamics/controllers_jax/waypoint.py#L143-L144}{waypoint.py:L143--L144}。
+
+进一步搜索发现，\texttt{left\_boundary/right\_boundary} 主要用于 ROS Path 发布和绘图，例如：
+\href{https://github.com/sastry-group/alpha-RACER/blob/main/car_ros2/car_ros2/multi_car_comp_blocking.py#L1471-L1488}{multi\_car\_comp\_blocking.py:L1471--L1488}。
+
+因此 \texttt{track\_width: 1.0} 更像可视化或场景边界参数，不是 raceline optimizer 的严格半宽，也不是 policy 中 \texttt{\(\pm 0.44\)} 的直接来源。
+
+\section{当前项目中的坐标标准}
+
+本项目仓库：
+\href{https://github.com/CrazalDaver/racer-LLM}{CrazalDaver/racer-LLM}。
+注意：若本地改动尚未 push，GitHub 行号可能不能完全反映当前工作区。
+
+\subsection{World 坐标}
+
+车辆状态定义在：
+\href{https://github.com/CrazalDaver/racer-LLM/blob/main/state.py}{state.py}。
+
+\begin{lstlisting}[language=Python]
+CarState(x, y, vx, vy, psi, omega)
+\end{lstlisting}
+
+其中：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+变量 & 坐标系 & 单位 \\
+\midrule
+\texttt{x, y} & world frame & m \\
+\texttt{psi} & world heading & rad \\
+\texttt{vx, vy} & vehicle/body velocity & m/s \\
+\texttt{omega} & yaw rate & rad/s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Track Frenet 坐标}
+
+本项目几何投影实现在：
+\href{https://github.com/CrazalDaver/racer-LLM/blob/main/track.py}{track.py}。
+
+核心定义为：
+
+\[
+p_y = (p_{\mathrm{world}} - p_{\mathrm{center}})^\top n,
+\quad
+n = (-\sin\psi_{\mathrm{center}}, \cos\psi_{\mathrm{center}}).
+\]
+
+即：
+
+\begin{itemize}
+  \item \texttt{px/s}: 沿 centerline 的累计弧长，单位 m；
+  \item \texttt{py/e}: 相对 centerline 法向偏移，单位 m；
+  \item \texttt{py > 0}: 位于 centerline 前进方向左侧；
+  \item \texttt{py < 0}: 位于 centerline 前进方向右侧。
+\end{itemize}
+
+\subsection{Raceline deviation}
+
+实验确认：
+
+\[
+\mathrm{project}(\mathrm{raceline\_x}, \mathrm{raceline\_y}).p_y \approx -\mathrm{dev\_m}.
+\]
+
+因此当前代码中使用：
+
+\begin{lstlisting}[language=Python]
+p_y = -point["dev_m"]
+\end{lstlisting}
+
+从符号上是合理的。
+相关逻辑在：
+\href{https://github.com/CrazalDaver/racer-LLM/blob/main/policies.py}{policies.py}。
+
+\section{今天发现的关键问题}
+
+\subsection{raw 坐标下速度过激}
+
+原版数值仿真中，\texttt{scale=2.0} 使轨道空间尺度扩大约 2 倍，而 raceline 速度没有随之扩大。
+这意味着：
+
+\[
+\kappa_{\mathrm{scaled}} \approx \frac{1}{2}\kappa_{\mathrm{raw}}.
+\]
+
+在相同速度 $v$ 下，横向加速度需求：
+
+\[
+a_y = v^2 \kappa.
+\]
+
+因此 scale 后同样的 $5\,\mathrm{m/s}$ 会更容易过弯。
+而当前项目如果直接使用 raw CSV 坐标，不做 scale，同时仍使用 raceline 中接近 $5\,\mathrm{m/s}$ 的速度，则弯道横向加速度需求约为原版 scale 后的 2 倍。
+
+这很可能是当前 $0.22\,\mathrm{m}$ 半宽下屡屡出界的核心原因之一。
+
+\subsection{raceline 几乎贴边}
+
+raw 坐标下：
+
+\[
+\max|\mathrm{dev\_m}| \approx 0.206,
+\quad
+w_{\mathrm{half}} = 0.22.
+\]
+
+安全余量只有：
+
+\[
+0.22 - 0.206 = 0.014\,\mathrm{m}.
+\]
+
+这只有约 1.4 cm。即使 MPC 和投影完全正确，DBM 模型误差、离散时间、转向限制、速度过高都会让车辆越界。
+
+\subsection{MPC 模型与 DBM 环境不一致}
+
+当前 MPC 使用 kinematic bicycle 预测：
+\href{https://github.com/CrazalDaver/racer-LLM/blob/main/mpc_controller.py}{mpc\_controller.py}。
+
+而 DBM 环境状态为：
+
+\[
+[x,y,\psi,v_x,v_y,\omega].
+\]
+
+对应代码：
+\href{https://github.com/CrazalDaver/racer-LLM/blob/main/vehicle_model.py}{vehicle\_model.py}。
+
+因此在 DBM 下，即使 kinematic MPC 预测轨迹在边界内，真实 roll-out 也可能由于侧滑和 yaw dynamics 偏离 raceline。
+
+\subsection{投影窗口导致的 py 虚高}
+
+今天还发现一个独立问题：旧版车辆投影逻辑会在上一帧 \texttt{progress\_s} 附近局部搜索。
+在 DBM 出现回退或靠近其他 track branch 时，记录的 \texttt{py} 可能不是全局最近点 deviation。
+
+最新一次 \texttt{simulation\_trace.npz} 中曾出现：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+时间 & 记录的 \texttt{px, py} & 全局最近 \texttt{s, e} & 结论 \\
+\midrule
+$23.92\,\mathrm{s}$ & $(21.76, 6.65)$ & $(13.16, 0.053)$ & \texttt{py=6.65} 是局部投影滞后导致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+随后车辆投影逻辑已改为：
+
+\begin{lstlisting}[language=Python]
+s_wrapped, e = track.project(state.x, state.y)
+return s_hint + progress_delta(s_wrapped, s_hint, track.total_length), e
+\end{lstlisting}
+
+即：
+
+\begin{itemize}
+  \item \texttt{py/e}: 来自全局最近点；
+  \item \texttt{px/s}: 使用上一帧进度做 unwrap，避免跨起终点时跳变。
+\end{itemize}
+
+相关代码：
+\href{https://github.com/CrazalDaver/racer-LLM/blob/main/simulation.py}{simulation.py}。
+
+\section{目前结论}
+
+\begin{enumerate}[label=(\arabic*)]
+  \item \texttt{calculate\_raceline.py} 中的 \texttt{TRACK\_WIDTH=0.22} 是 raw CSV 坐标下 raceline 优化半宽。
+  \item \texttt{params-num.yaml} 中的 \texttt{scale=2.0} 会把运行时空间坐标放大 2 倍。
+  \item 原项目中的 \texttt{\(\pm 0.44\)} 与 $0.22 \times 2$ 对应，属于 scale 后运行坐标系，不应直接当作 raw 坐标下的半宽。
+  \item \texttt{track\_width: 1.0} 主要用于边界可视化或场景 Path 发布，不是 raceline optimizer 的严格半宽。
+  \item 原版 scale 后速度并没有乘 2，因此同样速度在更大轨道上更容易过弯。
+  \item 当前项目若不做 scale，却直接使用 raw 几何和原 raceline 速度，等价于在更小、更弯、更窄的赛道上用相同速度跑，出界风险显著增加。
+\end{enumerate}
+
+\section{建议的下一步}
+
+为了让最简单 MPC 控制先稳定跟随 raceline，建议按以下顺序排查：
+
+\begin{enumerate}[label=(\arabic*)]
+  \item 保持 raw 几何半宽：
+  \[
+  w_{\mathrm{half}} = 0.22.
+  \]
+  \item 参考轨迹内缩，而不是贴着 raceline 最大 deviation 跑：
+  \[
+  |p_y^{\mathrm{ref}}| \leq 0.17 \sim 0.19.
+  \]
+  \item 将速度上限先降到：
+  \[
+  v_{\max} = 3.0 \sim 4.0\,\mathrm{m/s}.
+  \]
+  \item 先用 kinematic 环境确认 MPC 能稳定不出界，再切 DBM。
+  \item 若要复现原版数值环境，应考虑整体引入 \texttt{scale=2.0}，同时一致缩放 centerline、raceline、deviation、车辆位置和动力学解释，而不是只改 track width。
+\end{enumerate}
+
+\section{一句话摘要}
+
+当前最可能的真相是：
+
+\begin{quote}
+原版 alpha-RACER 的数值实验是在 scale 后的更大轨道上用未放大的速度跑；而当前项目直接使用 raw 小轨道和同样速度，导致曲率需求更高、raceline 又几乎贴边，因此 $0.22\,\mathrm{m}$ 半宽下很容易出界。
+\end{quote}
+
+\end{document}

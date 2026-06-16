@@ -74,8 +74,10 @@ class SimParams:
     TOTAL_TIME = 30.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
-    TRACK_WIDTH = 0.88
-    OFFROAD_TOLERANCE = 0.55 # 
+    TRACK_HALF_WIDTH = 0.22
+    TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
+    MPC_BOUNDARY_SLACK = 0.0
+    OFFROAD_TOLERANCE = 0.0
     OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
     MPC_DT = 0.1
 
@@ -91,8 +93,6 @@ class SimParams:
     MAX_STATE_SPEED = 5.0
     MAX_STEER_RATE = 4.0
     MAX_RACELINE_SPEED = 5.0
-    RACELINE_SEARCH_BACK_STEPS = 20 # searching for the closest point on the raceline
-    RACELINE_SEARCH_FORWARD_STEPS = 200
     PROJECTION_SEARCH_RADIUS = 1.0
     PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
     TRACE_OUTPUT = "simulation_trace.npz"
@@ -120,6 +120,12 @@ class SimParams:
     ALPHARACER_WEIGHT_SEARCH_POINTS = POTENTIAL_FUNCTION_SEARCH_POINTS
     ALPHARACER_WEIGHT_SEARCH_ITERS = POTENTIAL_FUNCTION_SEARCH_ITERS
     LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
+    SELF_PLAY_RL_MODEL_PATH = None  # .npz/.json local policy, or SB3 .zip if stable-baselines3 is installed
+    SELF_PLAY_RL_BACKEND = "auto"  # auto, npz, json, npy, sb3/ppo
+    SELF_PLAY_RL_STRICT_LOAD = False  # False falls back to a simple direct policy when the model is unavailable
+    SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
+    SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
+    SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
     IBR_HORIZON = 10 # Matches multi_car_comp_blocking.py's IBR horizon.
     IBR_ITERATIONS = 3
     IBR_GAMMA = 0.99

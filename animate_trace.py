@@ -175,7 +175,12 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     vx = data["vx"]
     throttle = data["throttle"]
     steer = data["steer"]
-    offroad = data["offroad"] if "offroad" in data.files else np.abs(py) > (params.TRACK_WIDTH / 2.0)
+    track_half_width = (
+        float(np.asarray(data["track_half_width"]).item())
+        if "track_half_width" in data.files
+        else getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
+    )
+    offroad = data["offroad"] if "offroad" in data.files else np.abs(py) > track_half_width
     car_offroad = data["car_offroad"] if "car_offroad" in data.files else None
     collision = data["collision"] if "collision" in data.files else np.zeros_like(offroad, dtype=bool)
     car_count = car_x.shape[1] if car_x is not None and car_x.ndim == 2 else 1
@@ -197,7 +202,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     if car_offroad is None and car_x is not None and car_y is not None:
         car_py = data["car_py"] if "car_py" in data.files else None
         if car_py is not None:
-            car_offroad = np.abs(car_py) > (params.TRACK_WIDTH / 2.0)
+            car_offroad = np.abs(car_py) > track_half_width
     if car_offroad is None:
         car_offroad = np.zeros((len(time), car_count), dtype=bool)
         car_offroad[:, 0] = offroad

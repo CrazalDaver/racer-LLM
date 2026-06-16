@@ -101,6 +101,10 @@ def simulation_kwargs(
     llm_model_name=None,
     llm_model_names=None,
     llm_update_interval_steps=None,
+    self_play_rl_model_path=None,
+    self_play_rl_backend=None,
+    self_play_rl_strict_load=None,
+    self_play_rl_action_order=None,
 ):
     return {
         "vehicle_model_type": vehicle_model_type,
@@ -111,6 +115,10 @@ def simulation_kwargs(
         "llm_model_name": llm_model_name,
         "llm_model_names": llm_model_names,
         "llm_update_interval_steps": llm_update_interval_steps,
+        "self_play_rl_model_path": self_play_rl_model_path,
+        "self_play_rl_backend": self_play_rl_backend,
+        "self_play_rl_strict_load": self_play_rl_strict_load,
+        "self_play_rl_action_order": self_play_rl_action_order,
     }
 
 
@@ -124,6 +132,10 @@ def _override_snapshot(
     llm_model_name=None,
     llm_model_names=None,
     llm_update_interval_steps=None,
+    self_play_rl_model_path=None,
+    self_play_rl_backend=None,
+    self_play_rl_strict_load=None,
+    self_play_rl_action_order=None,
     ego_position=None,
 ):
     snapshot = dict(snapshot)
@@ -136,6 +148,10 @@ def _override_snapshot(
         llm_model_name=llm_model_name,
         llm_model_names=llm_model_names,
         llm_update_interval_steps=llm_update_interval_steps,
+        self_play_rl_model_path=self_play_rl_model_path,
+        self_play_rl_backend=self_play_rl_backend,
+        self_play_rl_strict_load=self_play_rl_strict_load,
+        self_play_rl_action_order=self_play_rl_action_order,
     )
     if overrides["vehicle_model_type"] is not None:
         snapshot["VEHICLE_MODEL"] = overrides["vehicle_model_type"]
@@ -156,6 +172,14 @@ def _override_snapshot(
         snapshot["LLM_MODEL_NAMES"] = list(overrides["llm_model_names"])
     if overrides["llm_update_interval_steps"] is not None:
         snapshot["LLM_UPDATE_INTERVAL_STEPS"] = int(overrides["llm_update_interval_steps"])
+    if overrides["self_play_rl_model_path"] is not None:
+        snapshot["SELF_PLAY_RL_MODEL_PATH"] = overrides["self_play_rl_model_path"]
+    if overrides["self_play_rl_backend"] is not None:
+        snapshot["SELF_PLAY_RL_BACKEND"] = overrides["self_play_rl_backend"]
+    if overrides["self_play_rl_strict_load"] is not None:
+        snapshot["SELF_PLAY_RL_STRICT_LOAD"] = bool(overrides["self_play_rl_strict_load"])
+    if overrides["self_play_rl_action_order"] is not None:
+        snapshot["SELF_PLAY_RL_ACTION_ORDER"] = overrides["self_play_rl_action_order"]
     if ego_position is not None:
         snapshot["EGO_POSITION"] = int(ego_position)
     return snapshot
@@ -177,6 +201,10 @@ def run_experiment(
     llm_model_name=None,
     llm_model_names=None,
     llm_update_interval_steps=None,
+    self_play_rl_model_path=None,
+    self_play_rl_backend=None,
+    self_play_rl_strict_load=None,
+    self_play_rl_action_order=None,
     ego_position=1,
     show_ref_debug=False,
 ):
@@ -193,6 +221,10 @@ def run_experiment(
         llm_model_name=llm_model_name,
         llm_model_names=llm_model_names,
         llm_update_interval_steps=llm_update_interval_steps,
+        self_play_rl_model_path=self_play_rl_model_path,
+        self_play_rl_backend=self_play_rl_backend,
+        self_play_rl_strict_load=self_play_rl_strict_load,
+        self_play_rl_action_order=self_play_rl_action_order,
     )
     snapshot = params_snapshot()
     snapshot = _override_snapshot(snapshot, **sim_kwargs, ego_position=ego_position)
@@ -294,6 +326,10 @@ def run_experiment_suite(
     llm_output_mode=None,
     llm_model_name=None,
     llm_update_interval_steps=None,
+    self_play_rl_model_path=None,
+    self_play_rl_backend=None,
+    self_play_rl_strict_load=None,
+    self_play_rl_action_order=None,
 ):
     """
     Run experiments described in start-order coordinates.
@@ -332,6 +368,10 @@ def run_experiment_suite(
                 llm_model_name=llm_model_name,
                 llm_model_names=llm_model_names,
                 llm_update_interval_steps=llm_update_interval_steps,
+                self_play_rl_model_path=self_play_rl_model_path,
+                self_play_rl_backend=self_play_rl_backend,
+                self_play_rl_strict_load=self_play_rl_strict_load,
+                self_play_rl_action_order=self_play_rl_action_order,
                 ego_position=ego_position,
             )
         )
@@ -369,6 +409,10 @@ def _add_sim_args(parser):
     group.add_argument("--llm-model", default=None)
     group.add_argument("--llm-models", nargs="+", default=None)
     group.add_argument("--llm-update-interval-steps", type=int, default=None)
+    group.add_argument("--rl-model-path", default=None)
+    group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
+    group.add_argument("--rl-strict-load", action="store_true")
+    group.add_argument("--rl-action-order", choices=["throttle_steer", "steer_throttle"], default=None)
 
 
 def _add_output_args(parser):
@@ -405,6 +449,10 @@ def main():
         llm_output_mode=args.llm_output_mode,
         llm_model_name=args.llm_model,
         llm_update_interval_steps=args.llm_update_interval_steps,
+        self_play_rl_model_path=args.rl_model_path,
+        self_play_rl_backend=args.rl_backend,
+        self_play_rl_strict_load=args.rl_strict_load if args.rl_strict_load else None,
+        self_play_rl_action_order=args.rl_action_order,
     )
 
     start_order_cases = _parse_start_order_cases(args.start_order)

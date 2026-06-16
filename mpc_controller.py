@@ -26,6 +26,7 @@ class MPCController:
         max_steer_rate,
         db_params,
         track_width,
+        track_boundary_slack=0.0,
         max_state_speed=5.0,
         velocity_track_weight=0.0,
         heading_track_weight=0.0,
@@ -38,6 +39,8 @@ class MPCController:
         self.max_steer_rate = max_steer_rate
         self.p = db_params
         self.track_half_width = track_width / 2.0
+        self.track_boundary_slack = float(track_boundary_slack)
+        self.track_constraint_half_width = self.track_half_width + self.track_boundary_slack
         self.max_speed = max_state_speed
         self.velocity_track_weight = velocity_track_weight
         self.heading_track_weight = heading_track_weight
@@ -178,9 +181,11 @@ class MPCController:
                     (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
                     + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
                 )
-                # in-track constraint: lateral error must be within track half width
-                g_ineq.append(lateral_e - self.track_half_width)
-                g_ineq.append(-lateral_e - self.track_half_width)
+                # References are still clipped to the true track half-width. The
+                # MPC boundary gets a small slack so projection/model mismatch
+                # does not immediately make the optimization infeasible.
+                g_ineq.append(lateral_e - self.track_constraint_half_width)
+                g_ineq.append(-lateral_e - self.track_constraint_half_width)
 
         for k in range(self.horizon):
             if k == 0:

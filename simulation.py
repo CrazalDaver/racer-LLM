@@ -8,6 +8,7 @@ from policies import (
     CenterLinePolicy,
     IBRBaselinePolicy,
     LLMAlphaRacerPolicy,
+    SelfPlayRLPolicy,
     WeightedAlphaRacerPolicy,
     plan_ibr_joint_actions,
 )
@@ -29,33 +30,10 @@ def progress_delta(s_a, s_b, total_length):
 
 
 def project_vehicle_state(track, state, s_hint, search_radius, max_heading_error):
-    try:
-        return track.project(
-            state.x,
-            state.y,
-            s_hint=s_hint,
-            search_radius=search_radius,
-            psi_hint=state.psi,
-            max_heading_error=max_heading_error,
-            allow_global_fallback=False,
-        )
-    except ValueError:
-        try:
-            return track.project(
-                state.x,
-                state.y,
-                s_hint=s_hint,
-                search_radius=search_radius,
-                allow_global_fallback=False,
-            )
-        except ValueError:
-            return track.project(
-                state.x,
-                state.y,
-                s_hint=s_hint,
-                search_radius=search_radius * 3.0,
-                allow_global_fallback=False,
-            )
+    s_wrapped, e = track.project(state.x, state.y)
+    if s_hint is None:
+        return s_wrapped, e
+    return s_hint + progress_delta(s_wrapped, s_hint, track.total_length), e
 
 
 def _normalize_policy_name(policy_name):
@@ -78,6 +56,13 @@ def _normalize_policy_name(policy_name):
         "llm_alpharacer": "llm_alpharacer",
         "llmalpha": "llm_alpharacer",
         "llmalpharacer": "llm_alpharacer",
+        "rl": "self_play_rl",
+        "ppo": "self_play_rl",
+        "ppo_rl": "self_play_rl",
+        "selfplay": "self_play_rl",
+        "self_play": "self_play_rl",
+        "self_play_rl": "self_play_rl",
+        "selfplay_rl": "self_play_rl",
         "ibr": "ibr",
         "center": "centerline",
         "center_line": "centerline",
@@ -136,6 +121,10 @@ def create_policy(
     llm_output_mode=None,
     llm_model_name=None,
     llm_update_interval_steps=None,
+    self_play_rl_model_path=None,
+    self_play_rl_backend=None,
+    self_play_rl_strict_load=None,
+    self_play_rl_action_order=None,
 ):
     policy_type = _normalize_policy_name(policy_type)
     if policy_type == "centerline":
@@ -159,8 +148,6 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
-            search_back_steps=params.RACELINE_SEARCH_BACK_STEPS,
-            search_forward_steps=params.RACELINE_SEARCH_FORWARD_STEPS,
         )
     if policy_type == "llm_alpharacer":
         return LLMAlphaRacerPolicy(
@@ -175,8 +162,6 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
-            search_back_steps=params.RACELINE_SEARCH_BACK_STEPS,
-            search_forward_steps=params.RACELINE_SEARCH_FORWARD_STEPS,
             model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name,
             base_url=params.LLM_BASE_URL,
             timeout=params.LLM_TIMEOUT,
@@ -201,12 +186,38 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
-            search_back_steps=params.RACELINE_SEARCH_BACK_STEPS,
-            search_forward_steps=params.RACELINE_SEARCH_FORWARD_STEPS,
             weight_path=params.ALPHARACER_WEIGHT_PATH,
             q_value=params.ALPHARACER_WEIGHT_Q,
             search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS,
             search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS,
+        )
+    if policy_type == "self_play_rl":
+        return SelfPlayRLPolicy(
+            track,
+            mpc,
+            step_distance=params.DT * params.MAX_RACELINE_SPEED,
+            car_idx=car_idx,
+            policy_name=policy_type,
+            params=np.asarray(
+                params.ALPHARACER_PARAMS if alpharacer_params is None else alpharacer_params,
+                dtype=float,
+            ).copy(),
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            model_path=params.SELF_PLAY_RL_MODEL_PATH if self_play_rl_model_path is None else self_play_rl_model_path,
+            backend=params.SELF_PLAY_RL_BACKEND if self_play_rl_backend is None else self_play_rl_backend,
+            strict_load=(
+                params.SELF_PLAY_RL_STRICT_LOAD
+                if self_play_rl_strict_load is None
+                else self_play_rl_strict_load
+            ),
+            action_order=(
+                params.SELF_PLAY_RL_ACTION_ORDER
+                if self_play_rl_action_order is None
+                else self_play_rl_action_order
+            ),
+            throttle_bounds=params.SELF_PLAY_RL_THROTTLE_BOUNDS,
+            steer_bounds=params.SELF_PLAY_RL_STEER_BOUNDS,
         )
     if policy_type == "ibr":
         return IBRBaselinePolicy(
@@ -224,8 +235,6 @@ def create_policy(
             gamma=params.IBR_GAMMA,
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
-            search_back_steps=params.RACELINE_SEARCH_BACK_STEPS,
-            search_forward_steps=params.RACELINE_SEARCH_FORWARD_STEPS,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
 
@@ -284,6 +293,13 @@ def save_simulation_trace(trace, track, params):
         track_csv=np.asarray(params.TRACK_CSV),
         raceline_csv=np.asarray(params.RACELINE_CSV),
         track_width=np.asarray(params.TRACK_WIDTH),
+        track_half_width=np.asarray(getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)),
+        mpc_boundary_slack=np.asarray(getattr(params, "MPC_BOUNDARY_SLACK", 0.0)),
+        mpc_constraint_half_width=np.asarray(
+            getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
+            + getattr(params, "MPC_BOUNDARY_SLACK", 0.0)
+        ),
+        offroad_tolerance=np.asarray(getattr(params, "OFFROAD_TOLERANCE", 0.0)),
         track_length=np.asarray(track.total_length),
         vehicle_model=np.asarray(trace["vehicle_model"]),
         early_stop=np.asarray(trace.get("early_stop", False)),
@@ -307,6 +323,10 @@ def run_simulation(
     llm_model_name=None,
     llm_model_names=None,
     llm_update_interval_steps=None,
+    self_play_rl_model_path=None,
+    self_play_rl_backend=None,
+    self_play_rl_strict_load=None,
+    self_play_rl_action_order=None,
     v0=0.0,
     velocity_track_weight=None,
     horizon=None,
@@ -364,6 +384,7 @@ def run_simulation(
             max_steer_rate=params.MAX_STEER_RATE,
             db_params=vehicle_params,
             track_width=params.TRACK_WIDTH,
+            track_boundary_slack=params.MPC_BOUNDARY_SLACK,
             max_state_speed=params.MAX_STATE_SPEED,
             velocity_track_weight=mpc_velocity_track_weight,
             heading_track_weight=params.HEADING_TRACK_WEIGHT,
@@ -381,6 +402,10 @@ def run_simulation(
                 llm_output_mode=llm_output_mode,
                 llm_model_name=resolved_llm_model_names[car_idx],
                 llm_update_interval_steps=llm_update_interval_steps,
+                self_play_rl_model_path=self_play_rl_model_path,
+                self_play_rl_backend=self_play_rl_backend,
+                self_play_rl_strict_load=self_play_rl_strict_load,
+                self_play_rl_action_order=self_play_rl_action_order,
             )
         )
         vehicle_models.append(
@@ -398,7 +423,8 @@ def run_simulation(
         states.append(CarState(x=start_x, y=start_y, vx=v0, vy=0.0, psi=start_psi, omega=0.0))
 
     total_steps = int(params.TOTAL_TIME / params.DT)
-    track_half_width = params.TRACK_WIDTH / 2.0
+    track_half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
+    offroad_half_width = track_half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
     progress_s = [-start_ranks[car_idx] * params.CAR_START_GAP for car_idx in range(num_cars)]
 
     traj_x, traj_y, velocities, lateral_errors = [], [], [], []
@@ -598,7 +624,7 @@ def run_simulation(
         trace["raceline_horizon_y"].append(raceline_horizon_y)
         trace["ref_horizon_x"].append(ref_horizon_x)
         trace["ref_horizon_y"].append(ref_horizon_y)
-        trace["offroad"].append(abs(car_e[ego_idx]) > track_half_width)
+        trace["offroad"].append(abs(car_e[ego_idx]) > offroad_half_width)
         trace["collision"].append(False)
         trace["throttle"].append(actions[ego_idx].throttle)
         trace["steer"].append(actions[ego_idx].steer)
@@ -615,7 +641,7 @@ def run_simulation(
             [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
         )
         trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
-        trace["car_offroad"].append([abs(error) > track_half_width for error in car_e])
+        trace["car_offroad"].append([abs(error) > offroad_half_width for error in car_e])
 
         if (step + 1) % 100 == 0 and ego_policy.last_ref_traj is not None:
             frenet_ref_lines.append((ego_state.x, ego_state.y, ref_fx, ref_fy))
@@ -679,8 +705,8 @@ def run_simulation(
             next_s.append(s)
             next_e.append(e)
 
-            if abs(e) > track_half_width:
-                overshoot = abs(e) - track_half_width
+            if abs(e) > offroad_half_width:
+                overshoot = abs(e) - offroad_half_width
                 factor = np.exp(-params.OFFROAD_STRENGTH * overshoot)
                 state.vx *= factor
                 state.vy *= factor
@@ -779,10 +805,10 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
 
     # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
-    # run_simulation(
-    #     policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
-    #     alpharacer_params=[2.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
-    #     ) # most basic settings.
+    run_simulation(
+        policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
+        alpharacer_params=[2.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
+        ) # most basic settings.
     
     # run_simulation(
     #     policy_type="alpharacer",
@@ -817,14 +843,26 @@ if __name__ == "__main__":
     #     vehicle_model_type="kinematic",
     # )
 
-    run_simulation(
-        policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
-        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
-        ego_position=2,
-        vehicle_model_type="kinematic",
-    )
+    # run_simulation(
+    #     policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
+    #     llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
+    #     ego_position=2,
+    #     vehicle_model_type="kinematic",
+    # )
 
     # run_simulation(
     # policy_names=["weighted", "LLM", "IBR"],
     # vehicle_model_type="kinematic", ego_position=1,
+    # )
+
+    # run_simulation(
+    #     policy_names=["self_play_rl", "IBR", "IBR"],
+    #     vehicle_model_type="kinematic",
+    #     ego_position=1,
+    #     # Set self_play_rl_model_path to an exported .npz/.json policy, or to an
+    #     # SB3 PPO .zip when stable-baselines3 is installed. None uses fallback.
+    #     self_play_rl_model_path=None,
+    #     self_play_rl_backend="auto",
+    #     self_play_rl_strict_load=False,
+    #     self_play_rl_action_order="throttle_steer",
     # )
