@@ -152,8 +152,13 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     from matplotlib.animation import FuncAnimation
 
     data, track_csv, raceline_csv = load_trace(trace_path)
-    waypoints = load_centerline_csv(track_csv)
-    raceline = load_raceline_csv(raceline_csv)
+    track_scale = (
+        float(np.asarray(data["track_scale"]).item())
+        if "track_scale" in data.files
+        else 1.0
+    )
+    waypoints = load_centerline_csv(track_csv, scale=track_scale)
+    raceline = load_raceline_csv(raceline_csv, scale=track_scale)
 
     time = data["time"]
     x = data["x"]
@@ -285,6 +290,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
         color="red",
         markersize=6,
         markeredgewidth=1.4,
+        zorder=1.1,
         label="Off-track points",
     )
     info = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", ha="left")

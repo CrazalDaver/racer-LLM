@@ -177,7 +177,12 @@ class RaceLine(ProjectablePath):
         y_ext = np.r_[self.y, self.y[0]]
         speed_ext = np.r_[self.speed, self.speed[0]]
         dev_ext = np.r_[self.dev, self.dev[0]]
-        psi_ext = np.r_[np.unwrap(self.psi), np.unwrap(self.psi)[0]]
+        psi_unwrapped = np.unwrap(self.psi)
+        psi0_closed = psi_unwrapped[-1] + math.atan2(
+            math.sin(psi_unwrapped[0] - psi_unwrapped[-1]),
+            math.cos(psi_unwrapped[0] - psi_unwrapped[-1]),
+        )
+        psi_ext = np.r_[psi_unwrapped, psi0_closed]
 
         return {
             "s_m": s_wrapped,
@@ -202,12 +207,23 @@ class RaceLine(ProjectablePath):
         self._precompute_projection(np.vstack([self.waypoints, self.waypoints[0]]))
 
 
-def load_centerline_csv(path) -> np.ndarray:
-    return np.genfromtxt(Path(path), delimiter=",", comments="#")
+def load_centerline_csv(path, scale: float = 1.0) -> np.ndarray:
+    data = np.genfromtxt(Path(path), delimiter=",", comments="#")
+    data = np.asarray(data, dtype=float)
+    scaled = data.copy()
+    scaled[:, :2] *= float(scale)
+    return scaled
 
 
-def load_raceline_csv(path) -> RaceLine:
-    return RaceLine(np.genfromtxt(Path(path), delimiter=",", comments="#"))
+def load_raceline_csv(path, scale: float = 1.0) -> RaceLine:
+    data = np.genfromtxt(Path(path), delimiter=",", comments="#")
+    data = np.asarray(data, dtype=float)
+    scaled = data.copy()
+    scaled[:, 0] *= float(scale)
+    scaled[:, 1:3] *= float(scale)
+    if scaled.shape[1] >= 5:
+        scaled[:, 4] *= float(scale)
+    return RaceLine(scaled)
 
 
 def _is_near_progress(seg_s: float, s_hint: float, search_radius: float, total_length: float) -> bool:

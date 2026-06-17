@@ -71,10 +71,11 @@ def make_vehicle_params(vehicle_model_type):
 
 class SimParams:
     DT = 0.02
-    TOTAL_TIME = 30.0
+    TOTAL_TIME = 50.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
-    TRACK_HALF_WIDTH = 0.22
+    TRACK_SCALE = 2.0
+    TRACK_HALF_WIDTH = 0.44
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
     MPC_BOUNDARY_SLACK = 0.0
     OFFROAD_TOLERANCE = 0.0
@@ -84,9 +85,9 @@ class SimParams:
     MPC_HORIZON = 8
 
     Q = np.diag([1.0, 1.0])
-    R = np.diag([1.0, 1.0]) * 1e-3
+    R = np.diag([1.0, 1.0]) * 1e-6
 
-    VELOCITY_TRACK_WEIGHT = 2.0 # weight for velocity tracking in MPC cost
+    VELOCITY_TRACK_WEIGHT = 0.0 # weight for velocity tracking in MPC cost
     HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost
 
     MAX_VEL_RATE = 8.0

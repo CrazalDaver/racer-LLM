@@ -292,6 +292,7 @@ def save_simulation_trace(trace, track, params):
         start_ranks=np.asarray(trace.get("start_ranks", [])),
         track_csv=np.asarray(params.TRACK_CSV),
         raceline_csv=np.asarray(params.RACELINE_CSV),
+        track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),
         track_width=np.asarray(params.TRACK_WIDTH),
         track_half_width=np.asarray(getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)),
         mpc_boundary_slack=np.asarray(getattr(params, "MPC_BOUNDARY_SLACK", 0.0)),
@@ -332,8 +333,8 @@ def run_simulation(
     horizon=None,
     ego_position=1,
 ):
-    waypoints = load_centerline_csv(params.TRACK_CSV)
-    raceline = load_raceline_csv(params.RACELINE_CSV)
+    waypoints = load_centerline_csv(params.TRACK_CSV, scale=params.TRACK_SCALE)
+    raceline = load_raceline_csv(params.RACELINE_CSV, scale=params.TRACK_SCALE)
     track = Track(waypoints)
 
     if num_cars is None and policy_names is not None:
@@ -805,10 +806,10 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
 
     # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
-    run_simulation(
-        policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
-        alpharacer_params=[2.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
-        ) # most basic settings.
+    # run_simulation(
+    #     policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
+    #     alpharacer_params=[2.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
+    #     ) # most basic settings.
     
     # run_simulation(
     #     policy_type="alpharacer",
@@ -843,12 +844,13 @@ if __name__ == "__main__":
     #     vehicle_model_type="kinematic",
     # )
 
-    # run_simulation(
-    #     policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
-    #     llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
-    #     ego_position=2,
-    #     vehicle_model_type="kinematic",
-    # )
+    run_simulation(
+        policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
+        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
+        ego_position=2,
+        vehicle_model_type="kinematic",
+        llm_update_interval_steps=50,
+    )
 
     # run_simulation(
     # policy_names=["weighted", "LLM", "IBR"],

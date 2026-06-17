@@ -387,8 +387,13 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         if "raceline_csv" in data.files
         else "track_csv/berlin_2018_raceline_with_speeds.csv"
     )
-    waypoints = load_centerline_csv(track_csv)
-    raceline = load_raceline_csv(raceline_csv)
+    track_scale = (
+        float(np.asarray(data["track_scale"]).item())
+        if "track_scale" in data.files
+        else 1.0
+    )
+    waypoints = load_centerline_csv(track_csv, scale=track_scale)
+    raceline = load_raceline_csv(raceline_csv, scale=track_scale)
 
     x = np.asarray(data["x"])
     y = np.asarray(data["y"])
