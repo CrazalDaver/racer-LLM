@@ -193,6 +193,7 @@ def plot_simulation_results(
     trajectory_time_mark_interval=5.0,
 ):
     half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
+    offroad_half_width = half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
     dt = params.DT
 
     fig, axes = plt.subplots(4, 2, figsize=(14, 17), constrained_layout=True)
@@ -223,7 +224,7 @@ def plot_simulation_results(
                 alpha=0.8,
                 label=f"Opponent {idx + 1}",
             )
-    off_idx = [i for i, e in enumerate(lateral_errors) if abs(e) > half_width]
+    off_idx = [i for i, e in enumerate(lateral_errors) if abs(e) > offroad_half_width]
     if off_idx:
         off_x = [traj_x[i // trajectory_stride] for i in off_idx if i // trajectory_stride < len(traj_x)]
         off_y = [traj_y[i // trajectory_stride] for i in off_idx if i // trajectory_stride < len(traj_y)]
@@ -271,6 +272,9 @@ def plot_simulation_results(
         ax.plot(_time_for(ref_e, dt), ref_e, "k--", alpha=0.8, label="Raceline/ref py")
     ax.axhline(y=half_width, ls="--", c="k")
     ax.axhline(y=-half_width, ls="--", c="k")
+    if abs(offroad_half_width - half_width) > 1e-9:
+        ax.axhline(y=offroad_half_width, ls=":", c="orange", label="Offroad threshold")
+        ax.axhline(y=-offroad_half_width, ls=":", c="orange")
     ax.grid(alpha=0.3)
     ax.set_title("Lateral error vs raceline")
     ax.set_xlabel("Time (s)")
@@ -292,7 +296,7 @@ def plot_simulation_results(
         ax.set_xlabel("Time (s)")
         ax.legend(ncol=2, fontsize=8)
     else:
-        off_flag = [1 if abs(e) > half_width else 0 for e in lateral_errors]
+        off_flag = [1 if abs(e) > offroad_half_width else 0 for e in lateral_errors]
         ax.plot(lateral_time, off_flag, drawstyle="steps-post", c="orange")
         ax.set_ylim(-0.1, 1.1)
         ax.grid(alpha=0.3)
@@ -378,8 +382,14 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         if "track_half_width" in data.files
         else track_width / 2.0
     )
+    offroad_tolerance = float(np.asarray(data["offroad_tolerance"]).item()) if "offroad_tolerance" in data.files else 0.0
     track_length = float(np.asarray(data["track_length"]).item()) if "track_length" in data.files else None
-    params = SimpleNamespace(DT=dt, TRACK_WIDTH=track_width, TRACK_HALF_WIDTH=track_half_width)
+    params = SimpleNamespace(
+        DT=dt,
+        TRACK_WIDTH=track_width,
+        TRACK_HALF_WIDTH=track_half_width,
+        OFFROAD_TOLERANCE=offroad_tolerance,
+    )
 
     track_csv = _scalar_string(data["track_csv"]) if "track_csv" in data.files else "track_csv/berlin_2018.csv"
     raceline_csv = (

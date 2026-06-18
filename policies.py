@@ -62,6 +62,22 @@ class BasePolicy(abc.ABC):
     def get_q_weight(self) -> float:
         return 1.0
 
+    def _recovery_control(self, state: CarState, current_s: float) -> np.ndarray:
+        _, current_e = self.track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=8.0,
+            psi_hint=state.psi,
+            max_heading_error=math.pi / 2.0,
+        )
+        _, _, track_psi = self.track.interpolate(current_s)
+        heading_error = math.atan2(math.sin(state.psi - track_psi), math.cos(state.psi - track_psi))
+        half_width = max(getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width), 1e-6)
+        steer = np.clip(-1.8 * current_e / half_width - 0.7 * heading_error, -1.0, 1.0)
+        throttle = -0.2 if state.vx > 3.0 else 0.45
+        return np.array([throttle, steer], dtype=float)
+
     def _log(self, message: str):
         self.log_fn(message)
 
@@ -199,12 +215,13 @@ class BasePolicy(abc.ABC):
             _, u_first = self.mpc.solve(state_arr, ref_traj, self.last_u, q_weight=self.get_q_weight())
         except Exception as e:
             self._report_mpc_failure(e, state, sim_time=sim_time)
-            u_first = self.last_u
+            u_first = self._recovery_control(state, current_s)
+            self.mpc.last_solver_status = "MPC_recovery"
             try:
                 self.mpc.evaluate_fallback_loss(
                     state_arr,
                     ref_traj,
-                    self.last_u,
+                    u_first,
                     q_weight=self.get_q_weight(),
                 )
             except Exception:
@@ -273,6 +290,7 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
         params=None,
         raceline: RaceLine = None,
         max_speed=5.0,
+        ref_lateral_clip=None,
         car_idx=None,
         policy_name=None,
     ):
@@ -280,11 +298,17 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
         self.params = params if params is not None else np.array([1.0, 1.0, 0, 0, 0])
         self.raceline = raceline
         self.max_speed = max_speed
+        if ref_lateral_clip is None:
+            ref_lateral_clip = getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width)
+        self.ref_lateral_clip = float(max(ref_lateral_clip, 0.0))
         self.last_raceline_s = None
         self.last_raceline_idx = None
 
     def get_q_weight(self) -> float:
         return float(self.params[0])
+
+    def _ref_lateral_limit(self) -> float:
+        return self.ref_lateral_clip
 
     def _nearest_raceline_s(self, state: CarState) -> float:
         self.last_raceline_idx = self.raceline.nearest_index(
@@ -316,22 +340,26 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
             "normal_y": math.cos(psi_center),
         }
 
-    def _raceline_frenet_point(self, raceline_s: float) -> dict:
+    def _raceline_frenet_point(self, raceline_s: float, center_hint: float = None) -> dict:
         point = self.raceline.interpolate(raceline_s)  # Get the raceline point in world coordinates.
-        p_x = point["s_m"]
-        p_y = -point["dev_m"]
-        psi = point["psi_rad"]
-        normal_x = -math.sin(psi)
-        normal_y = math.cos(psi)
-        center_x = point["x_m"] - p_y * normal_x
-        center_y = point["y_m"] - p_y * normal_y
+        center_s, lateral_e = self.track.project(
+            point["x_m"],
+            point["y_m"],
+            s_hint=center_hint,
+            search_radius=8.0,
+            psi_hint=point["psi_rad"],
+            max_heading_error=math.pi / 2.0,
+        )
+        center_x, center_y, psi_center = self.track.interpolate(center_s)
+        normal_x = -math.sin(psi_center)
+        normal_y = math.cos(psi_center)
         return {
-            "track_s": p_x,
-            "lateral_e": p_y,
+            "track_s": center_s,
+            "lateral_e": lateral_e,
             "speed": min(point["vx_mps"], self.max_speed),
             "center_x": center_x,
             "center_y": center_y,
-            "psi_center": psi,
+            "psi_center": psi_center,
             "normal_x": normal_x,
             "normal_y": normal_y,
             "world_x": point["x_m"],
@@ -442,9 +470,11 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
                 max_heading_error=math.pi / 2.0,
             )
             source_s = raceline_s
+            center_hint = current_s
         for k in range(horizon + 1):
             if self.raceline is not None:
-                frenet = self._raceline_frenet_point(source_s)
+                frenet = self._raceline_frenet_point(source_s, center_hint=center_hint)
+                center_hint = frenet["track_s"]
                 raceline_speed_k = max(frenet["speed"], 0.0)
                 p_pert_x = frenet["track_s"]
                 p_pert_y = frenet["lateral_e"]
@@ -458,8 +488,8 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
                 )
                 p_ref_y = float(np.clip(
                     p_pert_y + p_ot + p_bl,
-                    -self.mpc.track_half_width,
-                    self.mpc.track_half_width,
+                    -self._ref_lateral_limit(),
+                    self._ref_lateral_limit(),
                 ))
                 xc, yc = frenet["center_x"], frenet["center_y"]
                 psi_center = frenet["psi_center"]
@@ -483,8 +513,8 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
                 xc, yc, psi = self.track.interpolate(s)
                 offset = np.clip(
                     s1 * math.sin(s3 * s) * math.exp(-s2 * s),
-                    -self.mpc.track_half_width,
-                    self.mpc.track_half_width,
+                    -self._ref_lateral_limit(),
+                    self._ref_lateral_limit(),
                 )
                 ref[0, k] = s % self.track.total_length
                 ref[1, k] = offset
@@ -850,6 +880,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         model_name="my-racing-ctrl",
         base_url="http://localhost:11434",
         timeout=3.0,
+        temperature=0.0,
         update_interval_steps=1,  # Only call the LLM every N steps to reduce latency and instability.
         history_length=5,
         output_mode="auto", # "mode" for discrete mode selection, "params" for direct parameter output, "auto" to infer from model name.
@@ -860,6 +891,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.temperature = float(np.clip(temperature, 0.0, 2.0))
         self.update_interval_steps = max(1, int(update_interval_steps))
         self.history_length = max(0, int(history_length))
         self.output_mode = self._resolve_output_mode(output_mode, model_name)
@@ -880,7 +912,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         self.mode_presets = {
             "stable": np.asarray([1.2, 1.0, 0.25, 0.8, 0.2], dtype=float),
             "push": np.asarray([1.8, 1.08, 0.20, 0.8, 0.2], dtype=float),
-            "overtake": np.asarray([1.0, 1.0, 1.75, 0.18, 0.25], dtype=float),
+            "overtake": np.asarray([1.0, 1.25, 1.75, 0.18, 0.25], dtype=float),
             "block": np.asarray([1.3, 0.98, 0.55, 0.22, 1.2], dtype=float),
             "recover": np.asarray([2.5, 0.85, 0.05, 1.2, 0.0], dtype=float),
         }
@@ -1045,7 +1077,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             "prompt": prompt,
             "format": "json",
             "stream": False,
-            "options": {"temperature": 0.0, "num_predict": 32},
+            "options": {"temperature": self.temperature, "num_predict": 32},
         }
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -1397,6 +1429,7 @@ class _StrictIBRSolver:
         mu=1.6,
         gravity=9.81,
         use_upstream_collision_expression=True,
+        lateral_half_width=None,
     ):
         self.horizon = int(horizon)
         self.dt = float(dt)
@@ -1408,6 +1441,7 @@ class _StrictIBRSolver:
         self.mu = float(mu)
         self.gravity = float(gravity)
         self.use_upstream_collision_expression = bool(use_upstream_collision_expression)
+        self.lateral_half_width = None if lateral_half_width is None else float(lateral_half_width)
         self._build_solver()
 
     def _vehicle_dynamics(self, xk, uk, curvature):
@@ -1460,6 +1494,10 @@ class _StrictIBRSolver:
                 g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[0, k] - opp_e[k + 1]) ** 2)
             else:
                 g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[1, k] - opp_e[k + 1]) ** 2)
+        if self.lateral_half_width is not None:
+            for k in range(1, n + 1):
+                g.append(x[1, k] - self.lateral_half_width)
+                g.append(-x[1, k] - self.lateral_half_width)
 
         opt_variables = cs.vertcat(cs.reshape(x, -1, 1), cs.reshape(u, -1, 1))
         constraints = cs.vertcat(*g)
@@ -1491,11 +1529,15 @@ class _StrictIBRSolver:
         friction_start = 4 * (n + 1)
         speed_start = friction_start + n
         collision_start = speed_start + n
+        lateral_start = collision_start + n
         lbg[friction_start:speed_start] = -self.mu * self.gravity * self.wheelbase
         ubg[friction_start:speed_start] = self.mu * self.gravity * self.wheelbase
         ubg[speed_start:collision_start] = 1.04 * float(target_speed)
-        lbg[collision_start:] = 0.04
-        ubg[collision_start:] = 500000.0
+        lbg[collision_start:lateral_start] = 0.04
+        ubg[collision_start:lateral_start] = 500000.0
+        if self.lateral_half_width is not None:
+            lbg[lateral_start:] = -np.inf
+            ubg[lateral_start:] = 0.0
 
         solution = self.solver(x0=initial_guess, lbg=lbg, ubg=ubg, p=p_val)
         stats = self.solver.stats()
@@ -1574,10 +1616,13 @@ class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
         gamma=None,
         ibr_horizon=None,
         use_upstream_collision_expression=True,
+        lateral_half_width=None,
         **kwargs,
     ):
         super().__init__(*args, params=np.array([q, zeta, s1, s2, s3]), **kwargs)
         solver_horizon = self.mpc.horizon if ibr_horizon is None else int(ibr_horizon)
+        if lateral_half_width is None:
+            lateral_half_width = getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width)
         self.iterations = int(iterations)
         self.ibr_solver = _StrictIBRSolver(
             horizon=solver_horizon,
@@ -1588,6 +1633,7 @@ class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
             throttle_gain=self.mpc.p.Ta,
             friction=self.mpc.p.fr,
             use_upstream_collision_expression=use_upstream_collision_expression,
+            lateral_half_width=float(lateral_half_width),
         )
         self._ibr_cached_action = None
         self._ibr_cached_action_time = None

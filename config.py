@@ -75,10 +75,11 @@ class SimParams:
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
     TRACK_SCALE = 2.0
-    TRACK_HALF_WIDTH = 0.44
+    TRACK_HALF_WIDTH = 0.50
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
-    MPC_BOUNDARY_SLACK = 0.0
-    OFFROAD_TOLERANCE = 0.0
+    MPC_CONSTRAINT_HALF_WIDTH = 0.44
+    REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH
+    OFFROAD_TOLERANCE = 0.05
     OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
     MPC_DT = 0.1
 
@@ -107,7 +108,7 @@ class SimParams:
     LLM_MODEL = "my-racing-ctrl-mode"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
-    LLM_UPDATE_INTERVAL_STEPS = 5 # how often to update the LLM policy in terms of MPC steps
+    LLM_UPDATE_INTERVAL_STEPS = 50 # how often to update the LLM policy in terms of MPC steps
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # q, zeta, s1, s2, s3

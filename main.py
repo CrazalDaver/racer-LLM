@@ -100,6 +100,8 @@ def simulation_kwargs(
     llm_output_mode=None,
     llm_model_name=None,
     llm_model_names=None,
+    llm_temperature=None,
+    llm_temperatures=None,
     llm_update_interval_steps=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -114,6 +116,8 @@ def simulation_kwargs(
         "llm_output_mode": llm_output_mode,
         "llm_model_name": llm_model_name,
         "llm_model_names": llm_model_names,
+        "llm_temperature": llm_temperature,
+        "llm_temperatures": llm_temperatures,
         "llm_update_interval_steps": llm_update_interval_steps,
         "self_play_rl_model_path": self_play_rl_model_path,
         "self_play_rl_backend": self_play_rl_backend,
@@ -131,6 +135,8 @@ def _override_snapshot(
     llm_output_mode=None,
     llm_model_name=None,
     llm_model_names=None,
+    llm_temperature=None,
+    llm_temperatures=None,
     llm_update_interval_steps=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -147,6 +153,8 @@ def _override_snapshot(
         llm_output_mode=llm_output_mode,
         llm_model_name=llm_model_name,
         llm_model_names=llm_model_names,
+        llm_temperature=llm_temperature,
+        llm_temperatures=llm_temperatures,
         llm_update_interval_steps=llm_update_interval_steps,
         self_play_rl_model_path=self_play_rl_model_path,
         self_play_rl_backend=self_play_rl_backend,
@@ -170,6 +178,10 @@ def _override_snapshot(
         snapshot["LLM_MODEL"] = overrides["llm_model_name"]
     if overrides["llm_model_names"] is not None:
         snapshot["LLM_MODEL_NAMES"] = list(overrides["llm_model_names"])
+    if overrides["llm_temperature"] is not None:
+        snapshot["LLM_TEMPERATURE"] = float(overrides["llm_temperature"])
+    if overrides["llm_temperatures"] is not None:
+        snapshot["LLM_TEMPERATURES"] = [float(value) for value in overrides["llm_temperatures"]]
     if overrides["llm_update_interval_steps"] is not None:
         snapshot["LLM_UPDATE_INTERVAL_STEPS"] = int(overrides["llm_update_interval_steps"])
     if overrides["self_play_rl_model_path"] is not None:
@@ -200,6 +212,8 @@ def run_experiment(
     llm_output_mode=None,
     llm_model_name=None,
     llm_model_names=None,
+    llm_temperature=None,
+    llm_temperatures=None,
     llm_update_interval_steps=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -220,6 +234,8 @@ def run_experiment(
         llm_output_mode=llm_output_mode,
         llm_model_name=llm_model_name,
         llm_model_names=llm_model_names,
+        llm_temperature=llm_temperature,
+        llm_temperatures=llm_temperatures,
         llm_update_interval_steps=llm_update_interval_steps,
         self_play_rl_model_path=self_play_rl_model_path,
         self_play_rl_backend=self_play_rl_backend,
@@ -325,6 +341,8 @@ def run_experiment_suite(
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
+    llm_temperature=None,
+    llm_temperatures=None,
     llm_update_interval_steps=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -367,6 +385,8 @@ def run_experiment_suite(
                 llm_output_mode=llm_output_mode,
                 llm_model_name=llm_model_name,
                 llm_model_names=llm_model_names,
+                llm_temperature=llm_temperature,
+                llm_temperatures=llm_temperatures,
                 llm_update_interval_steps=llm_update_interval_steps,
                 self_play_rl_model_path=self_play_rl_model_path,
                 self_play_rl_backend=self_play_rl_backend,
@@ -408,6 +428,8 @@ def _add_sim_args(parser):
     group.add_argument("--llm-output-mode", choices=["auto", "mode", "params"], default=None)
     group.add_argument("--llm-model", default=None)
     group.add_argument("--llm-models", nargs="+", default=None)
+    group.add_argument("--llm-temperature", type=float, default=None)
+    group.add_argument("--llm-temperatures", nargs="+", type=float, default=None)
     group.add_argument("--llm-update-interval-steps", type=int, default=None)
     group.add_argument("--rl-model-path", default=None)
     group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
@@ -448,6 +470,8 @@ def main():
         llm_policy_params=args.llm_params,
         llm_output_mode=args.llm_output_mode,
         llm_model_name=args.llm_model,
+        llm_temperature=args.llm_temperature,
+        llm_temperatures=args.llm_temperatures,
         llm_update_interval_steps=args.llm_update_interval_steps,
         self_play_rl_model_path=args.rl_model_path,
         self_play_rl_backend=args.rl_backend,

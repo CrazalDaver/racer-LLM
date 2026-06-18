@@ -27,6 +27,7 @@ class MPCController:
         db_params,
         track_width,
         track_boundary_slack=0.0,
+        track_constraint_half_width=None,
         max_state_speed=5.0,
         velocity_track_weight=0.0,
         heading_track_weight=0.0,
@@ -39,8 +40,11 @@ class MPCController:
         self.max_steer_rate = max_steer_rate
         self.p = db_params
         self.track_half_width = track_width / 2.0
-        self.track_boundary_slack = float(track_boundary_slack)
-        self.track_constraint_half_width = self.track_half_width + self.track_boundary_slack
+        if track_constraint_half_width is None:
+            self.track_constraint_half_width = self.track_half_width + float(track_boundary_slack)
+        else:
+            self.track_constraint_half_width = float(track_constraint_half_width)
+        self.track_boundary_slack = self.track_constraint_half_width - self.track_half_width
         self.max_speed = max_state_speed
         self.velocity_track_weight = velocity_track_weight
         self.heading_track_weight = heading_track_weight
@@ -175,15 +179,15 @@ class MPCController:
             heading_err = cs.atan2(cs.sin(self.X[2, k] - self.ref[3, k]), cs.cos(self.X[2, k] - self.ref[3, k]))
             heading_cost += self.heading_track_weight * heading_err * heading_err
 
-            # track boundary constraints
-            if k >= 0:
+            # Track boundary constraints for predicted future states. The
+            # measured k=0 state is fixed by equality constraints and may
+            # already be slightly outside the MPC boundary; constraining it
+            # would make recovery problems immediately infeasible.
+            if k >= 1:
                 lateral_e = (
                     (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
                     + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
                 )
-                # References are still clipped to the true track half-width. The
-                # MPC boundary gets a small slack so projection/model mismatch
-                # does not immediately make the optimization infeasible.
                 g_ineq.append(lateral_e - self.track_constraint_half_width)
                 g_ineq.append(-lateral_e - self.track_constraint_half_width)
 

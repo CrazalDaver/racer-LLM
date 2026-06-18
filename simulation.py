@@ -120,6 +120,7 @@ def create_policy(
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
+    llm_temperature=None,
     llm_update_interval_steps=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -148,6 +149,7 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
     if policy_type == "llm_alpharacer":
         return LLMAlphaRacerPolicy(
@@ -162,9 +164,11 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
             model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name,
             base_url=params.LLM_BASE_URL,
             timeout=params.LLM_TIMEOUT,
+            temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature,
             update_interval_steps=(
                 params.LLM_UPDATE_INTERVAL_STEPS
                 if llm_update_interval_steps is None
@@ -186,6 +190,7 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
             weight_path=params.ALPHARACER_WEIGHT_PATH,
             q_value=params.ALPHARACER_WEIGHT_Q,
             search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS,
@@ -204,6 +209,7 @@ def create_policy(
             ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
             model_path=params.SELF_PLAY_RL_MODEL_PATH if self_play_rl_model_path is None else self_play_rl_model_path,
             backend=params.SELF_PLAY_RL_BACKEND if self_play_rl_backend is None else self_play_rl_backend,
             strict_load=(
@@ -235,6 +241,7 @@ def create_policy(
             gamma=params.IBR_GAMMA,
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
 
@@ -284,6 +291,7 @@ def save_simulation_trace(trace, track, params):
         policy_mode=np.asarray(trace["policy_mode"]),
         policy_names=np.asarray(trace.get("policy_names", [])),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
+        llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
@@ -295,12 +303,17 @@ def save_simulation_trace(trace, track, params):
         track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),
         track_width=np.asarray(params.TRACK_WIDTH),
         track_half_width=np.asarray(getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)),
-        mpc_boundary_slack=np.asarray(getattr(params, "MPC_BOUNDARY_SLACK", 0.0)),
         mpc_constraint_half_width=np.asarray(
-            getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
-            + getattr(params, "MPC_BOUNDARY_SLACK", 0.0)
+            getattr(params, "MPC_CONSTRAINT_HALF_WIDTH", getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0))
+        ),
+        ref_lateral_clip=np.asarray(
+            getattr(params, "REF_LATERAL_CLIP", getattr(params, "MPC_CONSTRAINT_HALF_WIDTH", params.TRACK_WIDTH / 2.0))
         ),
         offroad_tolerance=np.asarray(getattr(params, "OFFROAD_TOLERANCE", 0.0)),
+        offroad_half_width=np.asarray(
+            getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
+            + getattr(params, "OFFROAD_TOLERANCE", 0.0)
+        ),
         track_length=np.asarray(track.total_length),
         vehicle_model=np.asarray(trace["vehicle_model"]),
         early_stop=np.asarray(trace.get("early_stop", False)),
@@ -323,6 +336,8 @@ def run_simulation(
     llm_output_mode=None,
     llm_model_name=None,
     llm_model_names=None,
+    llm_temperature=None,
+    llm_temperatures=None,
     llm_update_interval_steps=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -346,6 +361,12 @@ def run_simulation(
         raise ValueError(f"llm_model_names length must equal num_cars ({num_cars}), got {len(llm_model_names)}")
     resolved_llm_model_names = [
         _per_car_option(llm_model_names, car_idx, llm_model_name)
+        for car_idx in range(num_cars)
+    ]
+    if llm_temperatures is not None and len(llm_temperatures) != num_cars:
+        raise ValueError(f"llm_temperatures length must equal num_cars ({num_cars}), got {len(llm_temperatures)}")
+    resolved_llm_temperatures = [
+        _per_car_option(llm_temperatures, car_idx, llm_temperature)
         for car_idx in range(num_cars)
     ]
     ego_position = int(ego_position)
@@ -385,7 +406,7 @@ def run_simulation(
             max_steer_rate=params.MAX_STEER_RATE,
             db_params=vehicle_params,
             track_width=params.TRACK_WIDTH,
-            track_boundary_slack=params.MPC_BOUNDARY_SLACK,
+            track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
             max_state_speed=params.MAX_STATE_SPEED,
             velocity_track_weight=mpc_velocity_track_weight,
             heading_track_weight=params.HEADING_TRACK_WEIGHT,
@@ -402,6 +423,7 @@ def run_simulation(
                 llm_policy_params=llm_policy_params,
                 llm_output_mode=llm_output_mode,
                 llm_model_name=resolved_llm_model_names[car_idx],
+                llm_temperature=resolved_llm_temperatures[car_idx],
                 llm_update_interval_steps=llm_update_interval_steps,
                 self_play_rl_model_path=self_play_rl_model_path,
                 self_play_rl_backend=self_play_rl_backend,
@@ -488,6 +510,16 @@ def run_simulation(
             else ""
             for idx in range(num_cars)
         ],
+        "llm_temperatures": [
+            (
+                params.LLM_TEMPERATURE
+                if resolved_llm_temperatures[idx] is None
+                else float(resolved_llm_temperatures[idx])
+            )
+            if resolved_policy_names[idx] == "llm_alpharacer"
+            else np.nan
+            for idx in range(num_cars)
+        ],
         "ego_index": ego_idx,
         "ego_position": ego_position,
         "start_ranks": start_ranks,
@@ -501,6 +533,7 @@ def run_simulation(
         )
         if any(name == "llm_alpharacer" for name in resolved_policy_names):
             print(f"LLM models by car: {trace['llm_model_names']}")
+            print(f"LLM temperatures by car: {trace['llm_temperatures']}")
     elif resolved_policy_names[0] == "llm_alpharacer" and any(name == "ibr" for name in resolved_policy_names[1:]):
         print(
             f"Simulation with ego LLM policy, IBR baseline opponents, "
@@ -805,10 +838,10 @@ if __name__ == "__main__":
     # Options: "centerline", "alpharacer", "ibr", or "llm_alpharacer"
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
 
-    # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
+    # # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
     # run_simulation(
     #     policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
-    #     alpharacer_params=[2.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=2.0, horizon=8,
+    #     alpharacer_params=[1.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=0.0, horizon=8,
     #     ) # most basic settings.
     
     # run_simulation(
@@ -838,19 +871,20 @@ if __name__ == "__main__":
     #     ego_position=3,
     # )
 
-    # run_simulation(
-    #     policy_names=["LLM", "LLM", "IBR"],  # ego, oppo1, oppo2
-    #     llm_model_names=["my-racing-ctrl-mode", "llama3.2:1b", None],
-    #     vehicle_model_type="kinematic",
-    # )
-
     run_simulation(
-        policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
-        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
-        ego_position=2,
-        vehicle_model_type="kinematic",
-        llm_update_interval_steps=50,
+        policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
+        llm_model_names=["qwen2.5:0.5b", None, None],
+        vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50,
     )
+
+    # qwen size comparison
+    # run_simulation(
+    #     policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
+    #     llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
+    #     ego_position=2,
+    #     vehicle_model_type="kinematic",
+    #     llm_update_interval_steps=50,
+    # )
 
     # run_simulation(
     # policy_names=["weighted", "LLM", "IBR"],
