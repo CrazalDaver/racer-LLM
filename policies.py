@@ -549,8 +549,8 @@ class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
 
     The upstream comparison loads ``PPO.load("trained_policy9")`` and calls
     ``predict`` on a 15-value observation. This class keeps that interface
-    optional: Stable-Baselines3 is imported lazily only for SB3 model files,
-    while JSON/NPZ linear or MLP policies can be used without extra packages.
+    optional: Stable-Baselines3 is imported lazily only for SB3 model files.
+    Native checkpoints from self_play_rl.py are loaded as PyTorch modules.
     """
 
     OBSERVATION_SIZE = 15
@@ -626,6 +626,10 @@ class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
                 self.model = {"type": "linear", "weights": np.load(path), "bias": np.zeros(2)}
                 self.model_kind = "npy"
                 return
+            if self.backend in {"auto", "torch", "pth", "pt"} and suffix in {".pth", ".pt"}:
+                self.model = self._load_torch_policy(path)
+                self.model_kind = "torch"
+                return
             if self.backend in {"auto", "sb3", "ppo"}:
                 self.model = self._load_sb3_policy(path)
                 self.model_kind = "sb3"
@@ -645,6 +649,22 @@ class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
                 "Use a .npz/.json exported policy or install stable-baselines3 to load this file."
             ) from exc
         return PPO.load(str(path))
+
+    def _load_torch_policy(self, path: Path):
+        try:
+            from self_play_rl import load_policy_checkpoint
+        except ImportError as exc:
+            raise ImportError(
+                "PyTorch and self_play_rl.py are required to load native self-play RL checkpoints."
+            ) from exc
+        model, metadata = load_policy_checkpoint(path, device="cpu")
+        if "action_order" in metadata:
+            self.action_order = str(metadata["action_order"]).strip().lower()
+        if "throttle_bounds" in metadata:
+            self.throttle_bounds = tuple(float(v) for v in metadata["throttle_bounds"])
+        if "steer_bounds" in metadata:
+            self.steer_bounds = tuple(float(v) for v in metadata["steer_bounds"])
+        return model
 
     def _load_npz_policy(self, path: Path):
         data = np.load(path, allow_pickle=False)
@@ -910,11 +930,11 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         self.last_llm_error = None
         self._warned_llm_error = False
         self.mode_presets = {
-            "stable": np.asarray([1.2, 1.0, 0.25, 0.8, 0.2], dtype=float),
-            "push": np.asarray([1.8, 1.08, 0.20, 0.8, 0.2], dtype=float),
-            "overtake": np.asarray([1.0, 1.25, 1.75, 0.18, 0.25], dtype=float),
-            "block": np.asarray([1.3, 0.98, 0.55, 0.22, 1.2], dtype=float),
-            "recover": np.asarray([2.5, 0.85, 0.05, 1.2, 0.0], dtype=float),
+            "stable": np.asarray([1.3, 1.0, 0.05, 1.0, 0.0], dtype=float),
+            "push": np.asarray([1.8, 1.25, 0.05, 1.0, 0.0], dtype=float),
+            "overtake": np.asarray([1.0, 1.25, 1.75, 0.18, 0.0], dtype=float),
+            "block": np.asarray([1.6, 0.90, 0.05, 0.45, 2.0], dtype=float),
+            "recover": np.asarray([3.0, 0.70, 0.0, 1.5, 0.0], dtype=float),
         }
         self.mode_aliases = {
             "normal": "stable",
@@ -1015,8 +1035,12 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
                 f"{common_context}"
                 "Parameter guidance: increase q for tighter tracking/recovery only after off-track, collision, or repeated stall; "
                 "do not treat low vx at race start as a recovery condition; reduce zeta when approaching hard turns or unstable; "
-                "increase s1 for larger lateral overtake/block offset; increase s2 for more local/short-range interaction; "
-                "increase s3 only when blocking a faster rear car is useful.\n"
+                "increase s1 only when lateral interaction is useful, and avoid very large s1 because the usable lane width is narrow; "
+                "increase s2 for more local/short-range interaction; increase s3 only when blocking a faster rear car is useful.\n"
+                "For overtaking a close slower front car, prefer cautious zeta below 1.0 and enough lateral offset instead of high zeta, "
+                "otherwise ego can rear-end the front car before it is laterally separated. "
+                "For blocking, use moderate s3 and avoid forcing large defensive offsets unless a faster rear car is clearly threatening. "
+                "If speed is very low while another car is very close, use high q, low zeta, and near-zero interaction to recover.\n"
                 "Use recent LLM outputs to avoid oscillation. If the recent output was overtaking and the same slow front car is still close, "
                 "keep overtaking-style parameters unless the car is off-track, collided, or already clear of that car.\n"
                 "JSON example: {\"q\":1.2,\"zeta\":1.0,\"s1\":0.2,\"s2\":0.8,\"s3\":0.2}"
@@ -1025,15 +1049,14 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         return (
             "You choose one alpha-RACER MPC behavior mode. Return only valid JSON like "
             "{\"mode\":\"stable\"}. Do not invent modes.\n"
-            "Critical rule: if any opponent line has relation=ahead, speed_relation=slower, "
-            "and positive delta_px below 2.5 m, the only valid output is {\"mode\":\"overtake\"}.\n" # emphasize overtake here
             "Available modes:\n"
             f"{preset_lines}\n"
-            "Mode meanings: stable follows the raceline smoothly; push tracks harder and uses slightly higher speed "
-            "integration; overtake creates lateral offset around nearby cars; block defends against a faster rear car; "
-            "recover prioritizes returning to the raceline and reducing lateral interaction.\n"
-            "Selection rules: choose overtake when an opponent is ahead, close, and slower than ego. "
-            "Close means positive delta_px below 2.5 m. "
+            "Mode meanings: stable follows the raceline with almost no lateral interaction; push tracks harder on clear road; "
+            "overtake creates a local lateral offset around a slower front car while avoiding rear-end contact; "
+            "block defends against a faster rear car by moving toward the rear car's lane; "
+            "recover uses tight tracking and low speed integration to leave contact or off-track states.\n"
+            "Selection rules: choose overtake when an opponent is ahead, close, and slower than ego. Close means positive delta_px below 2.5 m. "
+            "If the slower front car is extremely close, delta_px below 0.6 m, and lateral separation from ego is below 0.25 m, avoid push; choose stable or recover to prevent rear-end contact. "
             "Overtake is valid only when there is a slower front opponent with positive delta_px below 3.0 m. "
             "If no opponent line satisfies relation=ahead, speed_relation=slower, and positive delta_px below 3.0 m, do not output overtake. "
             "If a slower front opponent has positive delta_px below 2.5 m, overtake has priority over push. "
@@ -1041,9 +1064,9 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             "If recent outputs include overtake and that slow front opponent is still close, keep overtake until ego is clearly past it. "
             "Clearly past means that opponent's delta_px becomes negative. "
             "After ego is clearly past the slow front opponent, use push on clear track or stable if uncertain. "
-            "Block is invalid unless an opponent has relation=behind and speed_relation=faster. "
-            "Do not choose recover just because py is offset during an overtake; choose recover only when |py| is large, "
-            "after contact, after off-track behavior, or when speed is very low after a crash. "
+            "Block is valid only when an opponent has relation=behind and speed_relation=faster; use it cautiously, not as the default response to any rear car. "
+            "Do not choose recover just because py is offset during an overtake; choose recover when |py| is large, after contact, after off-track behavior, "
+            "or when speed is very low and any opponent is still very close. "
             "Use push only on clear track; otherwise use stable.\n"
             "The underlying parameter meaning is Q=qI track loss weight; zeta scales raceline speed integration; "
             "s1/s2 tune overtaking lateral offset and longitudinal decay; s3 tunes blocking.\n"
@@ -1129,24 +1152,38 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             max_heading_error=math.pi / 2.0,
         )
         close_slow_front = False
+        immediate_slow_front = False
         slow_front = False
         faster_rear = False
         nearest_front_delta = None
+        nearest_rear_delta = None
+        nearest_delta = None
+        nearest_front_lateral_gap = None
         for opponent in opponents:
             delta_s = self._progress_delta(opponent["px"], current_s)
+            if nearest_delta is None or abs(delta_s) < abs(nearest_delta):
+                nearest_delta = delta_s
             if delta_s > 0.0:
                 if nearest_front_delta is None or delta_s < nearest_front_delta:
                     nearest_front_delta = delta_s
+                    nearest_front_lateral_gap = abs(current_py - opponent["py"])
                 if opponent["vx"] < state.vx:
                     slow_front = slow_front or delta_s < 3.0
                     close_slow_front = close_slow_front or delta_s < 2.5
+                    immediate_slow_front = immediate_slow_front or delta_s < 0.8
             elif delta_s < 0.0 and opponent["vx"] > state.vx:
                 faster_rear = faster_rear or abs(delta_s) < 3.0
+                if nearest_rear_delta is None or abs(delta_s) < abs(nearest_rear_delta):
+                    nearest_rear_delta = delta_s
         return {
             "close_slow_front": close_slow_front,
+            "immediate_slow_front": immediate_slow_front,
             "slow_front": slow_front,
             "faster_rear": faster_rear,
             "nearest_front_delta": nearest_front_delta,
+            "nearest_rear_delta": nearest_rear_delta,
+            "nearest_delta": nearest_delta,
+            "nearest_front_lateral_gap": nearest_front_lateral_gap,
             "current_py": current_py,
         }
 
@@ -1157,7 +1194,20 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         context = self._mode_context(state, current_s, opponents)
         guarded_mode = self.current_mode
 
-        if context["close_slow_front"]:
+        near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < 0.7
+        tiny_front_gap = (
+            context["nearest_front_delta"] is not None
+            and context["nearest_front_delta"] < 0.6
+            and context["nearest_front_lateral_gap"] is not None
+            and context["nearest_front_lateral_gap"] < 0.25
+        )
+
+        if state.vx < 0.35 and near_contact:
+            guarded_mode = "recover"
+        elif tiny_front_gap:
+            if guarded_mode in {"push", "overtake", "block"}:
+                guarded_mode = "recover" if state.vx < 0.8 else "stable"
+        elif context["close_slow_front"]:
             if guarded_mode in {"push", "stable", "block"}:
                 guarded_mode = "overtake"
             elif guarded_mode == "recover" and abs(context["current_py"]) < 0.8 and state.vx > 0.5:

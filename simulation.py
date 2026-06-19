@@ -871,20 +871,21 @@ if __name__ == "__main__":
     #     ego_position=3,
     # )
 
-    run_simulation(
-        policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
-        llm_model_names=["qwen2.5:0.5b", None, None],
-        vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50,
-    )
+    # run_simulation(
+    #     policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
+    #     llm_model_names=["qwen2.5:0.5b", None, None],
+    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, llm_temperature = 0.5
+    # )
 
     # qwen size comparison
-    # run_simulation(
-    #     policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
-    #     llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
-    #     ego_position=2,
-    #     vehicle_model_type="kinematic",
-    #     llm_update_interval_steps=50,
-    # )
+    run_simulation(
+        policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
+        llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
+        ego_position=2,
+        vehicle_model_type="kinematic",
+        llm_update_interval_steps=50,
+        llm_temperature=0.2,
+    )
 
     # run_simulation(
     # policy_names=["weighted", "LLM", "IBR"],

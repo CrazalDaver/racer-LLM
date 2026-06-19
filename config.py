@@ -108,6 +108,7 @@ class SimParams:
     LLM_MODEL = "my-racing-ctrl-mode"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
+    LLM_TEMPERATURE = 0.0
     LLM_UPDATE_INTERVAL_STEPS = 50 # how often to update the LLM policy in terms of MPC steps
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
@@ -122,8 +123,8 @@ class SimParams:
     ALPHARACER_WEIGHT_SEARCH_POINTS = POTENTIAL_FUNCTION_SEARCH_POINTS
     ALPHARACER_WEIGHT_SEARCH_ITERS = POTENTIAL_FUNCTION_SEARCH_ITERS
     LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
-    SELF_PLAY_RL_MODEL_PATH = None  # .npz/.json local policy, or SB3 .zip if stable-baselines3 is installed
-    SELF_PLAY_RL_BACKEND = "auto"  # auto, npz, json, npy, sb3/ppo
+    SELF_PLAY_RL_MODEL_PATH = None  # Native .pth from self_play_rl.py, .npz/.json local policy, or SB3 .zip.
+    SELF_PLAY_RL_BACKEND = "auto"  # auto, torch/pth/pt, npz, json, npy, sb3/ppo
     SELF_PLAY_RL_STRICT_LOAD = False  # False falls back to a simple direct policy when the model is unavailable
     SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
