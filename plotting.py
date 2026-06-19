@@ -46,6 +46,21 @@ def _same_length(a, b):
     return a[:n], b[:n]
 
 
+def _mode_runs(modes):
+    runs = []
+    if not modes:
+        return runs
+    start = 0
+    current = modes[0]
+    for idx, mode in enumerate(modes[1:], start=1):
+        if mode != current:
+            runs.append((current, start, idx))
+            start = idx
+            current = mode
+    runs.append((current, start, len(modes)))
+    return runs
+
+
 def compute_lap_stats(time, progress, track_length):
     time = np.asarray(time, dtype=float)
     progress = np.asarray(progress, dtype=float)
@@ -286,15 +301,53 @@ def plot_simulation_results(
     policy_mode_history = _string_list(policy_mode_history)
     policy_params_history = _as_optional_array(policy_params_history)
     uses_llm = any("llm" in name for name in policy_names) or any(mode in {"stable", "push", "overtake", "block", "recover", "custom"} for mode in policy_mode_history)
-    if uses_llm and policy_params_history is not None and policy_params_history.ndim == 2 and policy_params_history.shape[1] >= 5:
-        param_time = np.arange(len(policy_params_history)) * dt
-        labels = ["q", "zeta", "s1", "s2", "s3"]
-        for idx, label in enumerate(labels):
-            ax.plot(param_time, policy_params_history[:, idx], label=label)
-        ax.grid(alpha=0.3)
-        ax.set_title("LLM policy parameters")
+    if uses_llm and policy_mode_history:
+        mode_colors = {
+            "stable": "tab:blue",
+            "push": "tab:green",
+            "overtake": "tab:orange",
+            "block": "tab:red",
+            "recover": "tab:purple",
+            "custom": "tab:gray",
+            "fixed": "0.65",
+        }
+        n_modes = len(policy_mode_history)
+        mode_time = np.arange(n_modes + 1) * dt
+        seen_modes = []
+        for mode, start, end in _mode_runs(policy_mode_history):
+            color = mode_colors.get(mode, "tab:brown")
+            ax.axvspan(mode_time[start], mode_time[end], ymin=0.08, ymax=0.92, color=color, alpha=0.75)
+            center = 0.5 * (mode_time[start] + mode_time[end])
+            width = mode_time[end] - mode_time[start]
+            if width >= 0.25:
+                ax.text(
+                    center,
+                    0.5,
+                    mode,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white",
+                    fontweight="bold",
+                    clip_on=True,
+                )
+            if mode not in seen_modes:
+                seen_modes.append(mode)
+        for mode in seen_modes:
+            ax.barh(
+                [-1],
+                [0],
+                color=mode_colors.get(mode, "tab:brown"),
+                alpha=0.75,
+                label=mode,
+            )
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        ax.set_xlim(mode_time[0], mode_time[-1] if len(mode_time) else 1.0)
+        ax.grid(axis="x", alpha=0.3)
+        ax.set_title("LLM policy mode")
         ax.set_xlabel("Time (s)")
-        ax.legend(ncol=2, fontsize=8)
+        ax.legend(ncol=min(3, max(1, len(seen_modes))), fontsize=8, loc="upper right")
     else:
         off_flag = [1 if abs(e) > offroad_half_width else 0 for e in lateral_errors]
         ax.plot(lateral_time, off_flag, drawstyle="steps-post", c="orange")

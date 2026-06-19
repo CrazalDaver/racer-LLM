@@ -897,7 +897,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
     def __init__(
         self,
         *args,
-        model_name="my-racing-ctrl",
+        model_name="qwen2.5:0.5b",  #"my-racing-ctrl",
         base_url="http://localhost:11434",
         timeout=3.0,
         temperature=0.0,
@@ -932,7 +932,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         self.mode_presets = {
             "stable": np.asarray([1.3, 1.0, 0.05, 1.0, 0.0], dtype=float),
             "push": np.asarray([1.8, 1.25, 0.05, 1.0, 0.0], dtype=float),
-            "overtake": np.asarray([1.0, 1.25, 1.75, 0.18, 0.0], dtype=float),
+            "overtake": np.asarray([1.0, 1.35, 1.75, 0.1, 0.0], dtype=float),
             "block": np.asarray([1.6, 0.90, 0.05, 0.45, 2.0], dtype=float),
             "recover": np.asarray([3.0, 0.70, 0.0, 1.5, 0.0], dtype=float),
         }
@@ -1003,9 +1003,11 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             delta_s = self._progress_delta(opponent["px"], current_s)
             relation = "ahead" if delta_s > 0.0 else "behind" if delta_s < 0.0 else "alongside"
             speed_relation = "slower" if opponent["vx"] < state.vx else "faster" if opponent["vx"] > state.vx else "same_speed"
+            lateral_gap = opponent["py"] - current_py
             opponent_lines.append(
                 f"{idx}: delta_px={delta_s:.3f}, relation={relation}, "
-                f"speed_relation={speed_relation}, py={opponent['py']:.3f}, vx={opponent['vx']:.3f}"
+                f"speed_relation={speed_relation}, py={opponent['py']:.3f}, "
+                f"lateral_gap={lateral_gap:.3f}, vx={opponent['vx']:.3f}"
             )
         opponent_text = "\n".join(opponent_lines) if opponent_lines else "none"
         preset_lines = "\n".join(
@@ -1039,6 +1041,9 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
                 "increase s2 for more local/short-range interaction; increase s3 only when blocking a faster rear car is useful.\n"
                 "For overtaking a close slower front car, prefer cautious zeta below 1.0 and enough lateral offset instead of high zeta, "
                 "otherwise ego can rear-end the front car before it is laterally separated. "
+                "Use push-style parameters only when the nearest front opponent is absent or has delta_px above 4.0 m, and no opponent is near-overlap. "
+                "When any opponent has abs(delta_px) below 0.8 m and abs(lateral_gap) below 0.6 m, do not use push-style parameters with high zeta and near-zero lateral interaction. "
+                "In that near-overlap case, use overtaking-style parameters if ego is still moving and there is room to pass, or stable/recovery-style parameters if the situation is uncertain. "
                 "For blocking, use moderate s3 and avoid forcing large defensive offsets unless a faster rear car is clearly threatening. "
                 "If speed is very low while another car is very close, use high q, low zeta, and near-zero interaction to recover.\n"
                 "Use recent LLM outputs to avoid oscillation. If the recent output was overtaking and the same slow front car is still close, "
@@ -1056,14 +1061,17 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             "block defends against a faster rear car by moving toward the rear car's lane; "
             "recover uses tight tracking and low speed integration to leave contact or off-track states.\n"
             "Selection rules: choose overtake when an opponent is ahead, close, and slower than ego. Close means positive delta_px below 2.5 m. "
-            "If the slower front car is extremely close, delta_px below 0.6 m, and lateral separation from ego is below 0.25 m, avoid push; choose stable or recover to prevent rear-end contact. "
-            "Overtake is valid only when there is a slower front opponent with positive delta_px below 3.0 m. "
-            "If no opponent line satisfies relation=ahead, speed_relation=slower, and positive delta_px below 3.0 m, do not output overtake. "
+            "Also choose overtake to continue an active pass when an opponent is near-overlap: abs(delta_px) below 0.8 m and abs(lateral_gap) below 0.6 m. "
+            "If a car is near-overlap, push is unsafe even when relation is not ahead; choose overtake if ego is still moving and a pass is forming, otherwise choose stable. "
+            "If the slower front car is extremely close, delta_px below 0.6 m, and abs(lateral_gap) below 0.25 m, avoid push and avoid a hard high-speed overtake; choose stable or recover to prevent rear-end contact. "
+            "Overtake is valid when there is a slower front opponent with positive delta_px below 3.0 m, or when the same opponent is near-overlap during a pass. "
+            "If no opponent is ahead/close/slower and no opponent is near-overlap, do not output overtake. "
             "If a slower front opponent has positive delta_px below 2.5 m, overtake has priority over push. "
-            "Push is invalid when any opponent is ahead with positive delta_px below 3.0 m. "
-            "If recent outputs include overtake and that slow front opponent is still close, keep overtake until ego is clearly past it. "
-            "Clearly past means that opponent's delta_px becomes negative. "
-            "After ego is clearly past the slow front opponent, use push on clear track or stable if uncertain. "
+            "Push is allowed only when the nearest front opponent is absent or has delta_px above 4.0 m, no opponent is near-overlap, and ego is not near the lane boundary. "
+            "Push is invalid when any opponent is ahead with positive delta_px below 4.0 m or any opponent is near-overlap. "
+            "If recent outputs include overtake and the same opponent is still ahead or near-overlap, keep overtake until ego is clearly past it. "
+            "Clearly past means that opponent's delta_px is negative with enough longitudinal separation and the track ahead is clear. "
+            "After ego is clearly past the opponent, use push on clear track or stable if uncertain. "
             "Block is valid only when an opponent has relation=behind and speed_relation=faster; use it cautiously, not as the default response to any rear car. "
             "Do not choose recover just because py is offset during an overtake; choose recover when |py| is large, after contact, after off-track behavior, "
             "or when speed is very low and any opponent is still very close. "
@@ -1158,11 +1166,13 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         nearest_front_delta = None
         nearest_rear_delta = None
         nearest_delta = None
+        nearest_lateral_gap = None
         nearest_front_lateral_gap = None
         for opponent in opponents:
             delta_s = self._progress_delta(opponent["px"], current_s)
             if nearest_delta is None or abs(delta_s) < abs(nearest_delta):
                 nearest_delta = delta_s
+                nearest_lateral_gap = abs(current_py - opponent["py"])
             if delta_s > 0.0:
                 if nearest_front_delta is None or delta_s < nearest_front_delta:
                     nearest_front_delta = delta_s
@@ -1183,6 +1193,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             "nearest_front_delta": nearest_front_delta,
             "nearest_rear_delta": nearest_rear_delta,
             "nearest_delta": nearest_delta,
+            "nearest_lateral_gap": nearest_lateral_gap,
             "nearest_front_lateral_gap": nearest_front_lateral_gap,
             "current_py": current_py,
         }
@@ -1195,6 +1206,14 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         guarded_mode = self.current_mode
 
         near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < 0.7
+        near_overlap = (
+            context["nearest_delta"] is not None
+            and abs(context["nearest_delta"]) < 0.8
+            and context["nearest_lateral_gap"] is not None
+            and context["nearest_lateral_gap"] < 0.6
+        )
+        front_clear_for_push = context["nearest_front_delta"] is None or context["nearest_front_delta"] > 4.0
+        push_allowed = front_clear_for_push and not near_overlap and abs(context["current_py"]) < 0.45
         tiny_front_gap = (
             context["nearest_front_delta"] is not None
             and context["nearest_front_delta"] < 0.6
@@ -1212,8 +1231,10 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
                 guarded_mode = "overtake"
             elif guarded_mode == "recover" and abs(context["current_py"]) < 0.8 and state.vx > 0.5:
                 guarded_mode = "overtake"
+        elif guarded_mode == "push" and not push_allowed:
+            guarded_mode = "stable"
         elif guarded_mode == "overtake" and not context["slow_front"]:
-            guarded_mode = "push" if abs(context["current_py"]) < 0.6 and state.vx > 1.0 else "stable"
+            guarded_mode = "push" if push_allowed and state.vx > 1.0 else "stable"
         elif guarded_mode == "block" and not context["faster_rear"]:
             guarded_mode = "stable"
 

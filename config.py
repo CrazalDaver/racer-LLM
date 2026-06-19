@@ -108,11 +108,11 @@ class SimParams:
     LLM_MODEL = "my-racing-ctrl-mode"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
-    LLM_TEMPERATURE = 0.0
+    LLM_TEMPERATURE = 0.2
     LLM_UPDATE_INTERVAL_STEPS = 50 # how often to update the LLM policy in terms of MPC steps
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
-    STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 0.0, 0.0, 0.0])  # q, zeta, s1, s2, s3
+    STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 0.5, 0.5])  # q, zeta, s1, s2, s3
     ALPHARACER_PARAMS = STATIC_POLICY_PARAMS  # backward-compatible name
     POTENTIAL_FUNCTION_WEIGHT_PATH = "alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth"
     POTENTIAL_FUNCTION_Q = 1.0
@@ -132,12 +132,12 @@ class SimParams:
     IBR_HORIZON = 10 # Matches multi_car_comp_blocking.py's IBR horizon.
     IBR_ITERATIONS = 3
     IBR_GAMMA = 0.99
-    IBR_Q = 1.2
-    IBR_ZETA = 1.0
-    IBR_S1 = 0.2
-    IBR_S2 = 0.2
-    IBR_S3 = 0.2
-    IBR_PARAMS = np.array([IBR_Q, IBR_ZETA, IBR_S1, IBR_S2, IBR_S3])
+    # IBR_Q = 1.2
+    # IBR_ZETA = 1.0
+    # IBR_S1 = 0.2
+    # IBR_S2 = 0.2
+    # IBR_S3 = 0.2
+    IBR_PARAMS = np.array([1.0, 1.0, 1.0, 0.2, 0.2])  # q, zeta, s1, s2, s3
 
 
 params = SimParams()

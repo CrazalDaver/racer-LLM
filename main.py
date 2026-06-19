@@ -1,5 +1,7 @@
 import argparse
+import contextlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -9,6 +11,11 @@ import numpy as np
 from animate_trace import make_animation
 from config import params
 from simulation import run_simulation
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 
 def _jsonable(value):
@@ -398,6 +405,134 @@ def run_experiment_suite(
     return output_dirs
 
 
+def run_position_sweep(
+    policy_names=("LLM", "IBR", "IBR"),
+    trials_per_position=33,
+    ego_positions=(1, 2, 3),
+    output_path="result/position_sweep_summary.json",
+    show_progress=True,
+    suppress_simulation_output=True,
+    **run_simulation_kwargs,  # kwargs passed to run_simulation, except ego_position and save_trace
+):
+    """Run each ego starting position repeatedly and count wins.
+
+    This intentionally keeps all simulation logic inside run_simulation.
+    Temporary traces are used only to read the final car progress, then deleted.
+    Car order is fixed as car0=ego, car1=oppo1, car2=oppo2.
+    """
+    policy_names = list(policy_names)
+    if len(policy_names) != 3:
+        raise ValueError(f"policy_names must have length 3, got {len(policy_names)}")
+
+    ego_positions = [int(position) for position in ego_positions]
+    roles = ["ego", "oppo1", "oppo2"]
+    winner_counts = {role: 0 for role in roles}
+    winner_counts_by_position = {
+        str(int(position)): {role: 0 for role in roles}
+        for position in ego_positions
+    }
+    trial_records = []
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_tmp_dir = output_path.parent / f"_{output_path.stem}_tmp"
+    trace_tmp_dir.mkdir(parents=True, exist_ok=True)
+    old_trace_output = params.TRACE_OUTPUT
+    total_trials = int(trials_per_position) * len(ego_positions)
+    trial_id = 0
+
+    try:
+        progress_bar = None
+        if show_progress and tqdm is not None:
+            progress_bar = tqdm(
+                total=total_trials,
+                desc="Position sweep",
+                unit="sim",
+                dynamic_ncols=True,
+                leave=True,
+            )
+        for ego_position in ego_positions:
+            ego_position = int(ego_position)
+            for repeat in range(int(trials_per_position)):
+                trial_id += 1
+                if progress_bar is None:
+                    print(f"[{trial_id}/{total_trials}] ego_position={ego_position}, trial={repeat + 1}")
+                else:
+                    progress_bar.set_postfix(
+                        ego_position=ego_position,
+                        trial=repeat + 1,
+                        refresh=True,
+                    )
+                trace_path = trace_tmp_dir / f"trial_{trial_id:03d}.npz"
+                params.TRACE_OUTPUT = str(trace_path)
+                kwargs = dict(run_simulation_kwargs)
+                kwargs.pop("ego_position", None)
+                kwargs.pop("save_trace", None)
+                kwargs.setdefault("show_plot", False)
+                if suppress_simulation_output:
+                    with open(os.devnull, "w", encoding="utf-8") as sink:
+                        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                            run_simulation(
+                                policy_names=policy_names,
+                                ego_position=ego_position,
+                                save_trace=True,
+                                **kwargs,
+                            )
+                else:
+                    run_simulation(
+                        policy_names=policy_names,
+                        ego_position=ego_position,
+                        save_trace=True,
+                        **kwargs,
+                    )
+
+                with np.load(trace_path, allow_pickle=True) as data:
+                    car_px = np.asarray(data["car_px"], dtype=float)
+                    final_progress = car_px[-1].copy()
+                    winner_index = int(np.nanargmax(final_progress))
+                    winner_role = roles[winner_index]
+                    start_ranks = [int(value) for value in np.asarray(data["start_ranks"]).tolist()]
+                trace_path.unlink(missing_ok=True)
+                if start_ranks[1] > start_ranks[2]:
+                    raise RuntimeError(f"oppo1 should start before oppo2, got {start_ranks}")
+
+                winner_counts[winner_role] += 1
+                winner_counts_by_position[str(ego_position)][winner_role] += 1
+                trial_records.append(
+                    {
+                        "trial": trial_id,
+                        "ego_position": ego_position,
+                        "repeat": repeat + 1,
+                        "winner": winner_role,
+                        "winner_index": winner_index,
+                        "winner_policy": policy_names[winner_index],
+                        "final_progress": [float(value) for value in final_progress],
+                        "start_ranks": start_ranks,
+                    }
+                )
+                if progress_bar is not None:
+                    progress_bar.update(1)
+    finally:
+        if "progress_bar" in locals() and progress_bar is not None:
+            progress_bar.close()
+        params.TRACE_OUTPUT = old_trace_output
+
+    summary = {
+        "policy_names": policy_names,
+        "trials_per_position": int(trials_per_position),
+        "ego_positions": ego_positions,
+        "winner_counts": winner_counts,
+        "winner_counts_by_position": winner_counts_by_position,
+        "trials": trial_records,
+    }
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2, sort_keys=True)
+
+    print(f"Winner counts: {winner_counts}")
+    print(f"Saved summary to {output_path}")
+    return summary
+
+
 def _parse_start_order_cases(start_order_args):
     if not start_order_args:
         return None
@@ -454,76 +589,88 @@ def parse_args():
     _add_output_args(parser)
     return parser.parse_args()
 
-
-def main():
-    args = parse_args()
-    common_kwargs = dict(
-        save_animation=not args.no_animation,
-        stride=args.stride,
-        interval=args.interval,
-        dpi=args.dpi,
-        show_plot=args.show_plot,
-        show_ref_debug=args.show_ref_debug,
-        vehicle_model_type=args.vehicle_model,
-        static_policy_params=args.static_params if args.static_params is not None else args.alpha_params,
-        alpharacer_params=args.alpha_params,
-        llm_policy_params=args.llm_params,
-        llm_output_mode=args.llm_output_mode,
-        llm_model_name=args.llm_model,
-        llm_temperature=args.llm_temperature,
-        llm_temperatures=args.llm_temperatures,
-        llm_update_interval_steps=args.llm_update_interval_steps,
-        self_play_rl_model_path=args.rl_model_path,
-        self_play_rl_backend=args.rl_backend,
-        self_play_rl_strict_load=args.rl_strict_load if args.rl_strict_load else None,
-        self_play_rl_action_order=args.rl_action_order,
-    )
-
-    start_order_cases = _parse_start_order_cases(args.start_order)
-    if start_order_cases is not None:
-        run_experiment_suite(
-            start_order_cases=start_order_cases,
-            llm_model_cases=args.llm_models,
-            name_prefix=args.name or "suite",
-            **common_kwargs,
-        )
-        return
-
-    if args.policies is None:
-        raise ValueError("Pass --policies for one run, or --start-order for a suite.")
-
-    run_experiment(
-        policy_names=args.policies,
-        name=args.name,
-        llm_model_names=args.llm_models,
-        ego_position=args.ego_position,
-        **common_kwargs,
-    )
-
-
 if __name__ == "__main__":
-    # Both lists below are written in start-order coordinates.
-    # ego_position says which start-order slot is treated as ego/car0.
-    START_ORDER_CASES = [
-        (["LLM", "LLM", "LLM"], 3),
-        (["LLM", "LLM", "LLM"], 2),
-        (["LLM", "LLM", "LLM"], 1),
-    ]
+    run_position_sweep(
+        policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
+        trials_per_position=33,
+        ego_positions=[1, 2, 3],
+        output_path="result/position_sweep_summary.json",
+        vehicle_model_type="kinematic",
+        llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5],
+        llm_output_mode="mode",
+        llm_update_interval_steps=50,
+        llm_temperature=0.5,
+    )
 
-    LLM_MODEL_CASES = [
-        ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
-        ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
-        ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
-    ]
+# def main():
+#     args = parse_args()
+#     common_kwargs = dict(
+#         save_animation=not args.no_animation,
+#         stride=args.stride,
+#         interval=args.interval,
+#         dpi=args.dpi,
+#         show_plot=args.show_plot,
+#         show_ref_debug=args.show_ref_debug,
+#         vehicle_model_type=args.vehicle_model,
+#         static_policy_params=args.static_params if args.static_params is not None else args.alpha_params,
+#         alpharacer_params=args.alpha_params,
+#         llm_policy_params=args.llm_params,
+#         llm_output_mode=args.llm_output_mode,
+#         llm_model_name=args.llm_model,
+#         llm_temperature=args.llm_temperature,
+#         llm_temperatures=args.llm_temperatures,
+#         llm_update_interval_steps=args.llm_update_interval_steps,
+#         self_play_rl_model_path=args.rl_model_path,
+#         self_play_rl_backend=args.rl_backend,
+#         self_play_rl_strict_load=args.rl_strict_load if args.rl_strict_load else None,
+#         self_play_rl_action_order=args.rl_action_order,
+#     )
 
-    if len(sys.argv) == 1: # no args, run the above experiment suite as a demo
-        run_experiment_suite(
-            start_order_cases=START_ORDER_CASES,
-            llm_model_cases=LLM_MODEL_CASES,
-            name_prefix="qwen-size-competition",
-            save_animation=True,
-            vehicle_model_type="kinematic",
-            llm_output_mode="mode",
-        )
-    else:
-        main()
+#     start_order_cases = _parse_start_order_cases(args.start_order)
+#     if start_order_cases is not None:
+#         run_experiment_suite(
+#             start_order_cases=start_order_cases,
+#             llm_model_cases=args.llm_models,
+#             name_prefix=args.name or "suite",
+#             **common_kwargs,
+#         )
+#         return
+
+#     if args.policies is None:
+#         raise ValueError("Pass --policies for one run, or --start-order for a suite.")
+
+#     run_experiment(
+#         policy_names=args.policies,
+#         name=args.name,
+#         llm_model_names=args.llm_models,
+#         ego_position=args.ego_position,
+#         **common_kwargs,
+#     )
+
+
+# if __name__ == "__main__":
+#     # Both lists below are written in start-order coordinates.
+#     # ego_position says which start-order slot is treated as ego/car0.
+#     START_ORDER_CASES = [
+#         (["LLM", "LLM", "LLM"], 3),
+#         (["LLM", "LLM", "LLM"], 2),
+#         (["LLM", "LLM", "LLM"], 1),
+#     ]
+
+#     LLM_MODEL_CASES = [
+#         ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
+#         ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
+#         ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"],
+#     ]
+
+#     if len(sys.argv) == 1: # no args, run the above experiment suite as a demo
+#         run_experiment_suite(
+#             start_order_cases=START_ORDER_CASES,
+#             llm_model_cases=LLM_MODEL_CASES,
+#             name_prefix="qwen-size-competition",
+#             save_animation=True,
+#             vehicle_model_type="kinematic",
+#             llm_output_mode="mode",
+#         )
+#     else:
+#         main()
