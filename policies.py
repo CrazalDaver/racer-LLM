@@ -1010,7 +1010,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
                 f"lateral_gap={lateral_gap:.3f}, vx={opponent['vx']:.3f}"
             )
         opponent_text = "\n".join(opponent_lines) if opponent_lines else "none"
-        preset_lines = "\n".join(
+        preset_lines = "\n".join(  # list available modes and their parameters
             f"- {name}: q={values[0]:.2f}, zeta={values[1]:.2f}, "
             f"s1={values[2]:.2f}, s2={values[3]:.2f}, s3={values[4]:.2f}"
             for name, values in self.mode_presets.items()
@@ -1050,6 +1050,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
                 "keep overtaking-style parameters unless the car is off-track, collided, or already clear of that car.\n"
                 "JSON example: {\"q\":1.2,\"zeta\":1.0,\"s1\":0.2,\"s2\":0.8,\"s3\":0.2}"
             )
+        # mode version
         history_text = self._history_text()
         return (
             "You choose one alpha-RACER MPC behavior mode. Return only valid JSON like "
@@ -1060,7 +1061,10 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             "overtake creates a local lateral offset around a slower front car while avoiding rear-end contact; "
             "block defends against a faster rear car by moving toward the rear car's lane; "
             "recover uses tight tracking and low speed integration to leave contact or off-track states.\n"
-            "Selection rules: choose overtake when an opponent is ahead, close, and slower than ego. Close means positive delta_px below 2.5 m. "
+            "Hard mode validity rules: never output push unless every push condition below is true. "
+            "Push conditions: nearest front opponent is absent or has delta_px above 4.0 m; no opponent is near-overlap; abs(py) is below 0.45. "
+            "If any push condition is false, output stable, overtake, block, or recover, but not push. "
+            "Choose overtake when an opponent is ahead, close, and slower than ego. Close means positive delta_px below 2.5 m. "
             "Also choose overtake to continue an active pass when an opponent is near-overlap: abs(delta_px) below 0.8 m and abs(lateral_gap) below 0.6 m. "
             "If a car is near-overlap, push is unsafe even when relation is not ahead; choose overtake if ego is still moving and a pass is forming, otherwise choose stable. "
             "If the slower front car is extremely close, delta_px below 0.6 m, and abs(lateral_gap) below 0.25 m, avoid push and avoid a hard high-speed overtake; choose stable or recover to prevent rear-end contact. "
@@ -1088,7 +1092,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             f"Previous parameters: q={self.params[0]:.3f}, zeta={self.params[1]:.3f}, "
             f"s1={self.params[2]:.3f}, s2={self.params[3]:.3f}, s3={self.params[4]:.3f}.\n"
             f"Recent LLM outputs, oldest to newest:\n{history_text}\n"
-            "Use recent LLM outputs to avoid oscillation while the same close front opponent remains. "
+            "Use recent LLM outputs to avoid oscillation. "
             "Do not continue overtake from history after the close front opponent is gone.\n"
             "JSON example: {\"mode\":\"stable\"}"
         )
@@ -1123,6 +1127,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         return self._extract_json(body.get("response", ""))
 
     def _sanitize_params(self, raw_params: dict) -> np.ndarray:
+        
         if self.output_mode == "params":
             self.current_mode = "custom"
             values = []
@@ -1204,8 +1209,8 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
 
         context = self._mode_context(state, current_s, opponents)
         guarded_mode = self.current_mode
-
-        near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < 0.7
+        
+        near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < 0.7 # near contact threshold
         near_overlap = (
             context["nearest_delta"] is not None
             and abs(context["nearest_delta"]) < 0.8
@@ -1238,7 +1243,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         elif guarded_mode == "block" and not context["faster_rear"]:
             guarded_mode = "stable"
 
-        if guarded_mode != self.current_mode:
+        if guarded_mode != self.current_mode:  # Only log when the mode actually changes due to guarding.
             self.current_mode = guarded_mode
             self.params = self.mode_presets[guarded_mode].copy()
 
@@ -1253,6 +1258,8 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         try:
             raw_params = self._query_llm(prompt)
             self.params = self._sanitize_params(raw_params)
+            # Prompt-only experiment: keep the guard implementation available, but do not
+            # override the LLM mode here. Re-enable this line if prompt rules are not robust.
             self._apply_mode_guard(state, current_s, opponents=opponents)
             self.last_llm_params = self.params.copy()
             self.last_llm_error = None

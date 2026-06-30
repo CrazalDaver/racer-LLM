@@ -592,11 +592,11 @@ def parse_args():
 if __name__ == "__main__":
     run_position_sweep(
         policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
-        trials_per_position=33,
+        trials_per_position=11,
         ego_positions=[1, 2, 3],
         output_path="result/position_sweep_summary.json",
         vehicle_model_type="kinematic",
-        llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5],
+        # llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5],  # 
         llm_output_mode="mode",
         llm_update_interval_steps=50,
         llm_temperature=0.5,
