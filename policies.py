@@ -23,7 +23,14 @@ from track import RaceLine, Track
 class BasePolicy(abc.ABC):
     """
     Policy base class that embeds an MPC solver.
-    Subclasses must implement get_reference_trajectory.
+
+    Implement main components of an MPC-based policy:
+    -   MPC controller: get_action
+    -   MPC solver failure recovery: _recovery_control
+    -   Status reporting: _report_mpc_failure, _report_mpc_recovery, _report_mpc_stall, _report_mpc_stall_recovery
+    -   Interface abstraction: get_q_weight, @abstractmethod get_reference_trajectory
+    
+    Subclasses implement get_reference_trajectory to provide a reference trajectory
     """
 
     def __init__(self, track: Track, mpc, step_distance: float = 0.1, car_idx=None, policy_name=None):
@@ -39,6 +46,8 @@ class BasePolicy(abc.ABC):
         self.last_ref_world_horizon = None
         self.last_raceline_world_horizon = None
         self.log_fn = print
+
+        # MPC failure and stall reporting state
         self._mpc_failure_active = False
         self._mpc_failure_window_start_time = None
         self._mpc_failure_last_report_time = None
@@ -55,14 +64,18 @@ class BasePolicy(abc.ABC):
     def _neutral_steer_command(self) -> float:
         return np.clip(-self.mpc.p.Sb / self.mpc.p.Sa, -1.0, 1.0)
 
+    # different policy is mainly defined by the reference trajectory it provides to the MPC solver
     @abc.abstractmethod
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         pass
 
+    # might be a little bit akward way to get q value...
     def get_q_weight(self) -> float:
         return 1.0
 
+    # simple failure recovery
     def _recovery_control(self, state: CarState, current_s: float) -> np.ndarray:
+        # 
         _, current_e = self.track.project(
             state.x,
             state.y,
@@ -207,6 +220,8 @@ class BasePolicy(abc.ABC):
             self._mpc_stall_window_start_time = sim_time
             self._mpc_stall_window_count = 0
 
+    # Main MPC control interface:
+    # call get_reference_trajectory to get the reference trajectory, then call mpc.solve to get the control action
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
         ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
         self.last_ref_traj = ref_traj
@@ -1050,6 +1065,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
                 "keep overtaking-style parameters unless the car is off-track, collided, or already clear of that car.\n"
                 "JSON example: {\"q\":1.2,\"zeta\":1.0,\"s1\":0.2,\"s2\":0.8,\"s3\":0.2}"
             )
+        
         # mode version
         history_text = self._history_text()
         return (
@@ -1311,6 +1327,9 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
     alpha-RACER online policy that searches for parameters maximizing the
     learned alpha-potential function.
 
+    Implementation of the alpha-potential based policy from the paper:
+    https://arxiv.org/pdf/2412.08855v3
+
     The original model scores 5 policy parameters per car:
     sf1, sf2, lookahead_factor, speed_factor, blocking. This project uses
     q, zeta, s1, s2, s3 in MPC, so the selected parameters are mapped as:
@@ -1319,11 +1338,11 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
 
     ORIGINAL_PARAM_BOUNDS = np.asarray(
         [
-            [0.1, 0.5],   # sf1
-            [0.1, 0.5],   # sf2
+            [0.1, 0.5],   # s1
+            [0.1, 0.5],   # s2
             [0.15, 0.5],  # lookahead_factor
             [0.85, 1.1],  # speed_factor
-            [0.0, 1.0],   # blocking
+            [0.0, 1.0],   # s3
         ],
         dtype=float,
     )
@@ -1365,7 +1384,7 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         self.current_mode = "potential"
         self.params = self._map_original_params(self.original_params)
         self._warned_missing_opponents = False
-
+    
     def _map_original_params(self, original_params):
         sf1, sf2, _lookahead_factor, speed_factor, blocking = np.asarray(original_params, dtype=float)
         return np.asarray(

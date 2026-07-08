@@ -6,13 +6,16 @@ import numpy as np
 
 
 class ProjectablePath:
+    """
+    Base class for paths that support projection of points onto the path.
+    """
     def _precompute_projection(self, projection_waypoints: np.ndarray, set_total_length: bool = False):
         self._projection_waypoints = np.asarray(projection_waypoints, dtype=float)
-        self._seg_vectors = np.diff(self._projection_waypoints, axis=0)
+        self._seg_vectors = np.diff(self._projection_waypoints, axis=0) # The racetrack is composed of connected vector segments.
         self._seg_lengths = np.linalg.norm(self._seg_vectors, axis=1)
         self._cum_len = np.cumsum(np.insert(self._seg_lengths, 0, 0))
         self._tangents = self._seg_vectors / (self._seg_lengths[:, None] + 1e-8)
-        self._normals = np.array([[-t[1], t[0]] for t in self._tangents])
+        self._normals = np.array([[-t[1], t[0]] for t in self._tangents])  # perpendicular 
         self._normals = self._normals / (np.linalg.norm(self._normals, axis=1, keepdims=True) + 1e-8)
 
         if set_total_length:
@@ -57,7 +60,7 @@ class ProjectablePath:
             return self._project_impl(x, y)
         raise ValueError("Projection failed within the local progress window.")
 
-    def _project_impl(
+    def _project_impl(  # 
         self,
         x: float,
         y: float,

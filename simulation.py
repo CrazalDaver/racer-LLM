@@ -42,6 +42,7 @@ def _normalize_policy_name(policy_name):
         "alpha": "alpharacer",
         "alpha_racer": "alpharacer",
         "alpharacer": "alpharacer",
+
         "weighted": "weighted_alpharacer",
         "weight": "weighted_alpharacer",
         "weights": "weighted_alpharacer",
@@ -50,12 +51,14 @@ def _normalize_policy_name(policy_name):
         "weighted_alpharacer": "weighted_alpharacer",
         "ours": "weighted_alpharacer",
         "ours_high_p": "weighted_alpharacer",
+
         "llm": "llm_alpharacer",
         "llm_alpha": "llm_alpharacer",
         "llm_alpha_racer": "llm_alpharacer",
         "llm_alpharacer": "llm_alpharacer",
         "llmalpha": "llm_alpharacer",
         "llmalpharacer": "llm_alpharacer",
+
         "rl": "self_play_rl",
         "ppo": "self_play_rl",
         "ppo_rl": "self_play_rl",
@@ -63,7 +66,9 @@ def _normalize_policy_name(policy_name):
         "self_play": "self_play_rl",
         "self_play_rl": "self_play_rl",
         "selfplay_rl": "self_play_rl",
+
         "ibr": "ibr",
+
         "center": "centerline",
         "center_line": "centerline",
         "centerline": "centerline",
@@ -872,37 +877,17 @@ if __name__ == "__main__":
     # )
 
     # LLM vs baseline IBR 
+    # run_simulation(
+    #     policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
+    #     llm_model_names=["qwen2.5:0.5b", None, None],
+    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
+    #     llm_temperature = 1.0, 
+    # )
+
+    # LLM vs 
     run_simulation(
-        policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
+        policy_names=["LLM", "weighted_alpharacer", "weighted_alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:0.5b", None, None],
         vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
-        llm_temperature = 0.5,
-        
+        llm_temperature = 1.0, 
     )
-
-    # qwen size comparison
-    # run_simulation(
-    #     policy_names=["LLM", "LLM", "LLM"],  # ego, oppo1, oppo2
-    #     llm_model_names=["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b"], # ego, oppo1, oppo2
-    #     ego_position=2,
-    #     vehicle_model_type="kinematic",
-    #     llm_update_interval_steps=50,
-    #     llm_temperature=0.2,
-    # )
-
-    # run_simulation(
-    # policy_names=["weighted", "LLM", "IBR"],
-    # vehicle_model_type="kinematic", ego_position=1,
-    # )
-
-    # run_simulation(
-    #     policy_names=["self_play_rl", "IBR", "IBR"],
-    #     vehicle_model_type="kinematic",
-    #     ego_position=1,
-    #     # Set self_play_rl_model_path to an exported .npz/.json policy, or to an
-    #     # SB3 PPO .zip when stable-baselines3 is installed. None uses fallback.
-    #     self_play_rl_model_path=None,
-    #     self_play_rl_backend="auto",
-    #     self_play_rl_strict_load=False,
-    #     self_play_rl_action_order="throttle_steer",
-    # )
