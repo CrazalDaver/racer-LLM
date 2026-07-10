@@ -830,6 +830,8 @@ class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
         )
 
     def _build_original_observation(self, state: CarState, current_s: float, opponents):
+        # 15-dim observation: 
+        # [delta_s, e, opp_e, own_heading_error, vx, vy, omega, opp_heading_error, opp_vx, opp_vy, opp_omega, kappa_own, kappa_opp, kappa_own_lookahead, kappa_opp_lookahead]
         _, current_e = self.track.project(
             state.x,
             state.y,
@@ -860,21 +862,21 @@ class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
         opp_lookahead_s = float(opponent["px"]) + max(float(opponent.get("vx", 0.0)), 0.0) * lookahead_time
         observation = np.asarray(
             [
-                self._progress_delta(current_s, float(opponent["px"])),
-                current_e,
-                float(opponent.get("py", 0.0)),
-                own_heading_error,
-                float(state.vx),
-                float(state.vy),
-                float(state.omega),
-                opp_heading_error,
-                float(opponent.get("vx", 0.0)),
-                float(opponent.get("vy", 0.0)),
-                float(opponent.get("omega", 0.0)),
-                self._track_curvature_at(current_s),
-                self._track_curvature_at(float(opponent["px"])),
-                self._track_curvature_at(own_lookahead_s),
-                self._track_curvature_at(opp_lookahead_s),
+                self._progress_delta(current_s, float(opponent["px"])), # longitudal distance
+                current_e,                                              # self lateral error
+                float(opponent.get("py", 0.0)),                         # self lateral position
+                own_heading_error,                                      # self heading error
+                float(state.vx),                                        # self longitudinal velocity
+                float(state.vy),                                        # self lateral velocity
+                float(state.omega),                                     # self angular velocity
+                opp_heading_error,                                      # opponent heading error
+                float(opponent.get("vx", 0.0)),                         # opponent longitudinal velocity
+                float(opponent.get("vy", 0.0)),                         # opponent lateral velocity
+                float(opponent.get("omega", 0.0)),                      # opponent angular velocity
+                self._track_curvature_at(current_s),                    # self track curvature
+                self._track_curvature_at(float(opponent["px"])),        # opponent track curvature
+                self._track_curvature_at(own_lookahead_s),              # self lookahead track curvature
+                self._track_curvature_at(opp_lookahead_s),              # opponent lookahead track curvature
             ],
             dtype=float,
         )
@@ -1171,6 +1173,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         return np.asarray(values, dtype=float)
 
     def _mode_context(self, state: CarState, current_s: float, opponents=None) -> dict:
+        # Compute context information for mode guarding, including nearest opponent distances and relative speeds.
         opponents = opponents or []
         _, current_py = self.track.project(
             state.x,
@@ -1447,24 +1450,34 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         return cars[:3]
 
     def _build_original_input(self, state: CarState, current_s: float, opponents, original_params):
+        # build the 39-dim input for alpha-potential function evaluation
         cars = self._ordered_cars(state, current_s, opponents)
         s0, s1, s2 = [float(car["px"]) for car in cars]
+
+        # longitudal distance deltas between the three cars, in order: (s2-s1), (s1-s0), (s2-s0)
+        # 3 features
         features = [
             self._wrap_delta(s2, s1),
             self._wrap_delta(s1, s0),
             self._wrap_delta(s2, s0),
         ]
+
+        # Frenet states features for each car: 3 * 5 = 15 features
         for car in cars:
             features.extend(self._car_feature_block(car))
+
+        # track curvature features for each car: 3 features
         for car in cars:
             s = float(car["px"])
             features.append(self._track_curvature_at(s))
+        
+        # lookahead curvature features for each car: 3 features
         for car in cars:
             s = float(car["px"])
             features.append(
                 self._track_curvature_at(s + max(float(car.get("vx", 0.0)), 0.0) * self.mpc.dt * self.mpc.horizon)
             )
-
+        # policy parameters for each car: 3 * 5 = 15 features
         param_blocks = [
             np.asarray(original_params, dtype=float),
             self.opponent_default_original_params,
@@ -1480,13 +1493,15 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         return x
 
     def _score_original_params(self, state, current_s, opponents, original_params_batch):
+        # alpha-potential function to score given parameters, returning a numpy array of scores
         rows = [self._build_original_input(state, current_s, opponents, row) for row in original_params_batch]
-        with torch.no_grad():
+        with torch.no_grad():  # for inference
             x = torch.tensor(np.asarray(rows), dtype=torch.float32, device=self.device)
             scores = self.potential_function(x).detach().cpu().reshape(-1).tolist()
         return np.asarray(scores, dtype=float)
 
     def _select_original_params(self, state, current_s, opponents):
+        # search for the original parameters that maximize the learned alpha-potential function
         best = self.original_params.copy()
         bounds = self.ORIGINAL_PARAM_BOUNDS
         for _ in range(self.search_iters):
@@ -1512,19 +1527,26 @@ class WeightedAlphaRacerPolicy(PotentialFunctionPolicy):
 
 
 class _StrictIBRSolver:
-    """Frenet-space IBR MPC matching multi_car_comp_blocking.py."""
+    """
+    Frenet-space IBR MPC matching mpc_ibr function in multi_car_comp_blocking.py.
+    For state x = [s, e, psi, v] and control u = [a, delta], the dynamics are:
+        s_{k+1} = s_k + (v_k * cos(psi_k)) / (1 - e_k * curvature_k) * dt
+        e_{k+1} = e_k + v_k * sin(psi_k) * dt
+        psi_{k+1} = psi_k + ((v_k / L) * tan(Sa * delta_k) - v_k * curvature_k) * dt
+        v_{k+1} = v_k + (Ta * a_k - fr)
+    """
 
     def __init__(
         self,
         horizon=10,
-        dt=0.1,
-        iterations=3,
-        wheelbase=0.36,
-        steer_scale=0.36,
-        throttle_gain=20.0 / 4.65,
-        friction=1.0,
-        mu=1.6,
-        gravity=9.81,
+        dt=0.1,             # dt_ibr
+        iterations=3,       # self+opponent optimization iterations
+        wheelbase=0.36,     # L
+        steer_scale=0.36,   # steering mapping scale Sa
+        throttle_gain=20.0 / 4.65,  # Throttle gain Ta
+        friction=1.0,       # rolling friction coefficient fr
+        mu=1.6,             # friction coefficient mu
+        gravity=9.81,       # g
         use_upstream_collision_expression=True,
         lateral_half_width=None,
     ):
@@ -1539,7 +1561,7 @@ class _StrictIBRSolver:
         self.gravity = float(gravity)
         self.use_upstream_collision_expression = bool(use_upstream_collision_expression)
         self.lateral_half_width = None if lateral_half_width is None else float(lateral_half_width)
-        self._build_solver()
+        self._build_solver()    # build CasADi solver for the IBR MPC problem
 
     def _vehicle_dynamics(self, xk, uk, curvature):
         s = xk[0]
@@ -1548,7 +1570,7 @@ class _StrictIBRSolver:
         v = xk[3]
         a = uk[0]
         delta = uk[1]
-        denom = 1.0 - e * curvature
+        denom = 1.0 - e * curvature     # denominator for curvature correction
         return cs.vertcat(
             s + (v * cs.cos(psi)) / denom * self.dt,
             e + v * cs.sin(psi) * self.dt,
@@ -1567,19 +1589,19 @@ class _StrictIBRSolver:
         opp_e = cs.MX.sym("opp_e", n + 1)
 
         cost = 0
-        g = [x[:, 0] - x0]
+        g = [x[:, 0] - x0]  # constraint
         q = np.diag([0.0, 0.0, 0.3, 0.0])
         r = np.diag([1.0, 1.0])
         target_state = np.zeros(4)
 
         for k in range(n):
-            g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))
+            g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))  # kinematic constraints
             state_error = x[:, k] - target_state
             cost += cs.mtimes([state_error.T, q, state_error])
             cost += cs.mtimes([u[:, k].T, r, u[:, k]])
             cost += 10.0 * x[1, k] ** 4
 
-        cost += -10.0 * (x[0, n] - x[0, 0])
+        cost += -10.0 * (x[0, n] - x[0, 0])  # encourage forward progress
 
         for k in range(n):
             g.append((x[3, k] ** 2) * cs.tan(u[1, k]))
@@ -1587,9 +1609,10 @@ class _StrictIBRSolver:
             g.append(x[3, k + 1])
         for k in range(n):
             if self.use_upstream_collision_expression:
-                # The upstream source compares s against the flattened opponent e row here.
+                # The upstream source: s - oppo_e
                 g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[0, k] - opp_e[k + 1]) ** 2)
             else:
+                # e - oppo_e should be more reasonable
                 g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[1, k] - opp_e[k + 1]) ** 2)
         if self.lateral_half_width is not None:
             for k in range(1, n + 1):
@@ -1833,6 +1856,7 @@ class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
             self.mpc.last_state_plan = world_plan
 
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
+        # use cached IBR action if it is still valid for the current simulation time
         if (
             self._ibr_cached_action is not None
             and sim_time is not None
@@ -1872,6 +1896,7 @@ def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
 
 
 def plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=None):
+    # main loop to plan IBR actions for all policies that are IteratedBestResponsePolicy
     for idx, policy in enumerate(policies):
         if not isinstance(policy, IteratedBestResponsePolicy):
             continue
