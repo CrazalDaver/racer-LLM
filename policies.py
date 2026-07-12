@@ -21,17 +21,7 @@ from track import RaceLine, Track
 
 
 class BasePolicy(abc.ABC):
-    """
-    Policy base class that embeds an MPC solver.
-
-    Implement main components of an MPC-based policy:
-    -   MPC controller: get_action
-    -   MPC solver failure recovery: _recovery_control
-    -   Status reporting: _report_mpc_failure, _report_mpc_recovery, _report_mpc_stall, _report_mpc_stall_recovery
-    -   Interface abstraction: get_q_weight, @abstractmethod get_reference_trajectory
-    
-    Subclasses implement get_reference_trajectory to provide a reference trajectory
-    """
+    """Common interface and observable state shared by every driving policy."""
 
     def __init__(self, track: Track, mpc, step_distance: float = 0.1, car_idx=None, policy_name=None):
         self.track = track
@@ -41,11 +31,45 @@ class BasePolicy(abc.ABC):
         self.policy_name = policy_name
         car_label = "car?" if car_idx is None else f"car{car_idx}"
         self.warning_label = car_label if policy_name is None else f"{car_label}:{policy_name}"
-        self.last_u = np.array([0.0, self._neutral_steer_command()])
+
+        self.last_u = np.zeros(2, dtype=float)
         self.last_ref_traj = None
         self.last_ref_world_horizon = None
         self.last_raceline_world_horizon = None
         self.log_fn = print
+
+    @abc.abstractmethod
+    def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
+        """Return the control action selected by this policy."""
+        raise NotImplementedError
+
+    def _log(self, message: str):
+        self.log_fn(message)
+
+    def flush_solver_warnings(self, sim_time=None):
+        """Flush policy-specific solver warnings, if the policy uses a solver."""
+
+    def flush_mpc_warnings(self, sim_time=None):
+        """Backward-compatible wrapper for older simulation callers."""
+        self.flush_solver_warnings(sim_time=sim_time)
+
+
+class MPCPolicy(BasePolicy):
+    """
+    Policy implementation that converts a reference trajectory into an action with MPC.
+
+    Implement main components of an MPC-based policy:
+    -   MPC controller: get_action
+    -   MPC solver failure recovery: _recovery_control
+    -   Status reporting: _report_mpc_failure, _report_mpc_recovery, _report_mpc_stall, _report_mpc_stall_recovery
+    -   Interface abstraction: get_q_weight, @abstractmethod get_reference_trajectory
+
+    Subclasses implement get_reference_trajectory to provide a reference trajectory.
+    """
+
+    def __init__(self, track: Track, mpc, step_distance: float = 0.1, car_idx=None, policy_name=None):
+        super().__init__(track, mpc, step_distance, car_idx=car_idx, policy_name=policy_name)
+        self.last_u = np.array([0.0, self._neutral_steer_command()])
 
         # MPC failure and stall reporting state
         self._mpc_failure_active = False
@@ -90,9 +114,6 @@ class BasePolicy(abc.ABC):
         steer = np.clip(-1.8 * current_e / half_width - 0.7 * heading_error, -1.0, 1.0)
         throttle = -0.2 if state.vx > 3.0 else 0.45
         return np.array([throttle, steer], dtype=float)
-
-    def _log(self, message: str):
-        self.log_fn(message)
 
     def _format_mpc_time(self, sim_time) -> str:
         if sim_time is None:
@@ -197,7 +218,7 @@ class BasePolicy(abc.ABC):
         self._mpc_stall_count = 0
         self._mpc_stall_window_count = 0
 
-    def flush_mpc_warnings(self, sim_time=None):
+    def flush_solver_warnings(self, sim_time=None):
         if self._mpc_failure_active and self._mpc_failure_window_count > 0:
             interval = self._format_mpc_interval(self._mpc_failure_window_start_time, sim_time)
             self._log(
@@ -227,7 +248,14 @@ class BasePolicy(abc.ABC):
         self.last_ref_traj = ref_traj
         state_arr = state.to_array()
         try:
-            _, u_first = self.mpc.solve(state_arr, ref_traj, self.last_u, q_weight=self.get_q_weight())
+            _, u_first = self.mpc.solve(
+                state_arr,
+                ref_traj,
+                self.last_u,
+                q_weight=self.get_q_weight(),
+                opponents=opponents,
+                current_s=current_s,
+            )
         except Exception as e:
             self._report_mpc_failure(e, state, sim_time=sim_time)
             u_first = self._recovery_control(state, current_s)
@@ -238,6 +266,8 @@ class BasePolicy(abc.ABC):
                     ref_traj,
                     u_first,
                     q_weight=self.get_q_weight(),
+                    opponents=opponents,
+                    current_s=current_s,
                 )
             except Exception:
                 self.mpc.last_loss = np.nan
@@ -266,7 +296,7 @@ class BasePolicy(abc.ABC):
         return CarAction(throttle=target_vel, steer=target_steer)
 
 
-class CenterLinePolicy(BasePolicy):
+class CenterLinePolicy(MPCPolicy):
     # Simple baseline policy that tracks the centerline at a constant reference speed.
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         horizon = self.mpc.horizon
@@ -288,13 +318,13 @@ class CenterLinePolicy(BasePolicy):
         return ref
 
 
-class ParameterizedAlphaRacerPolicy(BasePolicy):
+class AlphaRacerReferencePolicy(BasePolicy):
     """
-    Shared alpha-RACER MPC reference-trajectory logic parameterized by
+    Shared alpha-RACER reference-trajectory logic parameterized by
     theta=(q, zeta, s1, s2, s3).
 
-    Subclasses differ only in how theta is chosen: fixed constants, an LLM,
-    or online optimization of a learned alpha-potential function.
+    This class deliberately does not choose an action. Direct-action policies
+    and MPC-backed policies can both reuse its track and interaction helpers.
     """
 
     def __init__(
@@ -545,6 +575,10 @@ class ParameterizedAlphaRacerPolicy(BasePolicy):
         return ref
 
 
+class ParameterizedAlphaRacerPolicy(AlphaRacerReferencePolicy, MPCPolicy):
+    """MPC-backed alpha-RACER policy with parameterized reference generation."""
+
+
 class StaticAlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
     """
     Fixed-parameter controller from the alpha-RACER policy class.
@@ -558,14 +592,13 @@ class AlphaRacerPolicy(StaticAlphaRacerPolicy):
     """Backward-compatible name for StaticAlphaRacerPolicy."""
 
 
-class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
+class SelfPlayRLPolicy(AlphaRacerReferencePolicy):
     """
     Direct-action self-play RL baseline compatible with alpha-RACER's RL branch.
 
     The upstream comparison loads ``PPO.load("trained_policy9")`` and calls
-    ``predict`` on a 15-value observation. This class keeps that interface
-    optional: Stable-Baselines3 is imported lazily only for SB3 model files.
-    Native checkpoints from self_play_rl.py are loaded as PyTorch modules.
+    ``predict`` on a 15-value observation. The local self_play_rl.py follows
+    the same Stable-Baselines3 checkpoint and inference interface.
     """
 
     OBSERVATION_SIZE = 15
@@ -862,7 +895,7 @@ class SelfPlayRLPolicy(ParameterizedAlphaRacerPolicy):
         opp_lookahead_s = float(opponent["px"]) + max(float(opponent.get("vx", 0.0)), 0.0) * lookahead_time
         observation = np.asarray(
             [
-                self._progress_delta(current_s, float(opponent["px"])), # longitudal distance
+                self._progress_delta(float(opponent["px"]), current_s), # opponent minus ego, as upstream
                 current_e,                                              # self lateral error
                 float(opponent.get("py", 0.0)),                         # self lateral position
                 own_heading_error,                                      # self heading error
@@ -1715,7 +1748,7 @@ class _StrictIBRSolver:
         }
 
 
-class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
+class IteratedBestResponsePolicy(AlphaRacerReferencePolicy):
     """
     IBR baseline policy in alpha-RACER paper (multi_car_comp_blocking.py).
     https://arxiv.org/abs/1801.02302 
@@ -1761,6 +1794,49 @@ class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
         self._ibr_cached_ref_traj = None
         self._ibr_cached_ref_world_horizon = None
         self._ibr_cached_raceline_world_horizon = None
+        self._ibr_failure_active = False
+        self._ibr_failure_count = 0
+        self._ibr_failure_start_time = None
+        self._ibr_last_failure = None
+
+    def _report_ibr_failure(self, exc, sim_time=None):
+        self._ibr_failure_count += 1
+        self._ibr_last_failure = str(exc)
+        if not self._ibr_failure_active:
+            self._ibr_failure_active = True
+            self._ibr_failure_start_time = sim_time
+            self._log(
+                f"[IBR warning][{self.warning_label}] solve failed "
+                f"({self._format_ibr_time(sim_time)}); using last control. status={exc}"
+            )
+
+    def _report_ibr_recovery(self, sim_time=None):
+        if not self._ibr_failure_active:
+            return
+        self._log(
+            f"[IBR warning][{self.warning_label}] solve recovered "
+            f"({self._format_ibr_interval(sim_time)}, failed_count={self._ibr_failure_count})"
+        )
+        self._ibr_failure_active = False
+        self._ibr_failure_count = 0
+        self._ibr_failure_start_time = None
+        self._ibr_last_failure = None
+
+    def _format_ibr_time(self, sim_time):
+        return "t=?" if sim_time is None else f"t={sim_time:.2f}s"
+
+    def _format_ibr_interval(self, sim_time):
+        if self._ibr_failure_start_time is None or sim_time is None:
+            return self._format_ibr_time(sim_time)
+        return f"t={self._ibr_failure_start_time:.2f}-{sim_time:.2f}s"
+
+    def flush_solver_warnings(self, sim_time=None):
+        if self._ibr_failure_active:
+            self._log(
+                f"[IBR warning][{self.warning_label}] solve still failing "
+                f"({self._format_ibr_interval(sim_time)}, failed_count={self._ibr_failure_count}); "
+                f"using last control. status={self._ibr_last_failure}"
+            )
 
     def _curvature_lookahead(self, current_s, state):
         curvature = np.zeros(self.ibr_solver.horizon)
@@ -1827,6 +1903,7 @@ class IteratedBestResponsePolicy(ParameterizedAlphaRacerPolicy):
             own_speed=own_speed,
         )
         self._accept_ibr_result(result, own_speed, sim_time)
+        self._report_ibr_recovery(sim_time=sim_time)
 
     def _accept_ibr_result(self, result, ref_speed, sim_time):
         action = np.asarray(result["action"], dtype=float)
@@ -1921,4 +1998,4 @@ def plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=None):
                 sim_time=sim_time,
             )
         except Exception as exc:
-            policy._report_mpc_failure(exc, states[idx], sim_time=sim_time)
+            policy._report_ibr_failure(exc, sim_time=sim_time)

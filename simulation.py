@@ -415,6 +415,11 @@ def run_simulation(
             max_state_speed=params.MAX_STATE_SPEED,
             velocity_track_weight=mpc_velocity_track_weight,
             heading_track_weight=params.HEADING_TRACK_WEIGHT,
+            track_length=track.total_length,
+            min_longitudinal_separation=params.MPC_MIN_LONGITUDINAL_SEPARATION,
+            min_lateral_separation=params.MPC_MIN_LATERAL_SEPARATION,
+            max_constrained_opponents=params.MPC_MAX_CONSTRAINED_OPPONENTS,
+            collision_superellipse_exponent=params.MPC_COLLISION_SUPERELLIPSE_EXPONENT,
         )
         mpcs.append(mpc)
         policies.append(
@@ -799,7 +804,7 @@ def run_simulation(
 
     final_time = last_step * params.DT if last_step >= 0 else 0.0
     for policy in policies:
-        policy.flush_mpc_warnings(sim_time=final_time)
+        policy.flush_solver_warnings(sim_time=final_time)
 
     if save_trace:
         save_simulation_trace(trace, track, params)
@@ -880,14 +885,14 @@ if __name__ == "__main__":
     # run_simulation(
     #     policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
     #     llm_model_names=["qwen2.5:0.5b", None, None],
-    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
-    #     llm_temperature = 1.0, 
+    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50,
+    #     llm_temperature = 1.0,
     # )
-
-    # LLM vs 
+ 
+    # LLM vs alphaRacer opponents
     run_simulation(
         policy_names=["LLM", "weighted_alpharacer", "weighted_alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:0.5b", None, None],
-        vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
+        vehicle_model_type="kinematic", ego_position=1, llm_update_interval_steps=50, 
         llm_temperature = 1.0, 
     )

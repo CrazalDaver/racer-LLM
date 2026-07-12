@@ -31,6 +31,11 @@ class MPCController:
         max_state_speed=5.0,
         velocity_track_weight=0.0,
         heading_track_weight=0.0,
+        track_length=None,
+        min_longitudinal_separation=0.36,
+        min_lateral_separation=0.20,
+        max_constrained_opponents=2,
+        collision_superellipse_exponent=4,
     ):
         self.dt = dt
         self.horizon = horizon
@@ -48,6 +53,15 @@ class MPCController:
         self.max_speed = max_state_speed
         self.velocity_track_weight = velocity_track_weight
         self.heading_track_weight = heading_track_weight
+        self.track_length = None if track_length is None else float(track_length)
+        self.min_longitudinal_separation = float(min_longitudinal_separation)
+        self.min_lateral_separation = float(min_lateral_separation)
+        self.max_constrained_opponents = max(0, int(max_constrained_opponents))
+        self.collision_superellipse_exponent = int(collision_superellipse_exponent)
+        if self.min_longitudinal_separation <= 0.0 or self.min_lateral_separation <= 0.0:
+            raise ValueError("MPC collision separations must be positive")
+        if self.collision_superellipse_exponent < 2 or self.collision_superellipse_exponent % 2:
+            raise ValueError("collision_superellipse_exponent must be an even integer >= 2")
         self.last_loss = np.nan
         self.last_track_loss = np.nan
         self.last_action_loss = np.nan
@@ -57,6 +71,9 @@ class MPCController:
         self.last_solver_status = "not_run"
         self.last_state_plan = None
         self.last_control_plan = None
+        self.last_opponent_s_plan = None
+        self.last_opponent_e_plan = None
+        self.last_opponent_active = None
         self.n_states = 4
         self.n_controls = 2
 
@@ -69,6 +86,23 @@ class MPCController:
         self.ref = cs.SX.sym("ref", 8, self.horizon + 1)    
         self.u_prev = cs.SX.sym("u_prev", self.n_controls, 1) # previous control input for rate penalty
         self.q_weight = cs.SX.sym("q_weight", 1) 
+        # Paper (1g)-(1h): predicted Frenet positions of the nearest vehicle
+        # ahead and behind. Following the paper, opponents keep constant
+        # longitudinal velocity and zero lateral velocity over the horizon.
+        self.opponent_s = cs.SX.sym(
+            "opponent_s",
+            self.max_constrained_opponents,
+            self.horizon + 1,
+        )
+        self.opponent_e = cs.SX.sym(
+            "opponent_e",
+            self.max_constrained_opponents,
+            self.horizon + 1,
+        )
+        self.opponent_active = cs.SX.sym(
+            "opponent_active",
+            self.max_constrained_opponents,
+        )
 
         self._build_problem()
 
@@ -116,13 +150,95 @@ class MPCController:
     def _make_x0_mpc(self, x0):
         return np.array([x0[0], x0[1], wrap_angle(x0[2]), max(x0[3], 0.0)], dtype=float)
 
-    def _make_p_val(self, x0_mpc, ref_traj, u_prev, q_weight):
+    def _progress_delta(self, s_a, s_b):
+        if self.track_length is None:
+            return float(s_a) - float(s_b)
+        return np.arctan2(
+            np.sin((float(s_a) - float(s_b)) * 2.0 * np.pi / self.track_length),
+            np.cos((float(s_a) - float(s_b)) * 2.0 * np.pi / self.track_length),
+        ) * self.track_length / (2.0 * np.pi)
+
+    def _select_interaction_opponents(self, opponents, current_s):
+        if not opponents or self.max_constrained_opponents <= 0:
+            return []
+        enriched = []
+        for opponent in opponents:
+            delta = self._progress_delta(opponent["px"], current_s)
+            enriched.append((delta, opponent))
+        front = [item for item in enriched if item[0] > 0.0]
+        behind = [item for item in enriched if item[0] < 0.0]
+        selected = []
+        if front:
+            selected.append(min(front, key=lambda item: item[0])[1])
+        if behind and len(selected) < self.max_constrained_opponents:
+            selected.append(max(behind, key=lambda item: item[0])[1])
+        if len(selected) < self.max_constrained_opponents:
+            selected_ids = {id(opponent) for opponent in selected}
+            remaining = [
+                item for item in sorted(enriched, key=lambda item: abs(item[0]))
+                if id(item[1]) not in selected_ids
+            ]
+            selected.extend(item[1] for item in remaining[: self.max_constrained_opponents - len(selected)])
+        return selected
+
+    def _prepare_opponent_predictions(self, ref_traj, opponents=None, current_s=None):
+        n = self.max_constrained_opponents
+        opponent_s = np.zeros((n, self.horizon + 1), dtype=float)
+        opponent_e = np.zeros((n, self.horizon + 1), dtype=float)
+        active = np.zeros(n, dtype=float)
+        if n == 0:
+            return opponent_s, opponent_e, active
+
+        if current_s is None:
+            current_s = float(ref_traj[0, 0])
+        selected = self._select_interaction_opponents(opponents, current_s)
+        for opponent_idx, opponent in enumerate(selected):
+            active[opponent_idx] = 1.0
+            for k in range(self.horizon + 1):
+                if "px_plan" in opponent and len(opponent["px_plan"]):
+                    plan_idx = min(k, len(opponent["px_plan"]) - 1)
+                    predicted_s = float(opponent["px_plan"][plan_idx])
+                else:
+                    predicted_s = float(opponent["px"]) + k * self.dt * float(opponent.get("vx", 0.0))
+                if "py_plan" in opponent and len(opponent["py_plan"]):
+                    plan_idx = min(k, len(opponent["py_plan"]) - 1)
+                    predicted_e = float(opponent["py_plan"][plan_idx])
+                else:
+                    predicted_e = float(opponent.get("py", 0.0))
+
+                # Align unwrapped simulator progress with the local wrapped
+                # Frenet coordinate used in the MPC reference at this step.
+                reference_s = float(ref_traj[0, k])
+                opponent_s[opponent_idx, k] = reference_s + self._progress_delta(predicted_s, reference_s)
+                opponent_e[opponent_idx, k] = predicted_e
+        return opponent_s, opponent_e, active
+
+    def _make_p_val(
+        self,
+        x0_mpc,
+        ref_traj,
+        u_prev,
+        q_weight,
+        opponents=None,
+        current_s=None,
+    ):
+        opponent_s, opponent_e, opponent_active = self._prepare_opponent_predictions(
+            ref_traj,
+            opponents=opponents,
+            current_s=current_s,
+        )
+        self.last_opponent_s_plan = opponent_s.copy()
+        self.last_opponent_e_plan = opponent_e.copy()
+        self.last_opponent_active = opponent_active.copy()
         return np.concatenate(
             [
                 x0_mpc.reshape(-1, 1), # initial state
                 ref_traj.T.reshape(-1, 1), # reference trajectory
                 u_prev.reshape(-1, 1), # previous control actions
                 np.array([[float(q_weight)]]), # Q weight
+                opponent_s.T.reshape(-1, 1),
+                opponent_e.T.reshape(-1, 1),
+                opponent_active.reshape(-1, 1),
             ]
         )
 
@@ -134,7 +250,15 @@ class MPCController:
         self.last_velocity_loss = float(velocity_loss)
         self.last_heading_loss = float(heading_loss)
 
-    def evaluate_fallback_loss(self, x0, ref_traj, u_prev, q_weight=1.0):
+    def evaluate_fallback_loss(
+        self,
+        x0,
+        ref_traj,
+        u_prev,
+        q_weight=1.0,
+        opponents=None,
+        current_s=None,
+    ):
         x0_mpc = self._make_x0_mpc(x0)
         U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
         X_guess = np.zeros((self.n_states, self.horizon + 1))
@@ -143,7 +267,14 @@ class MPCController:
             X_guess[:, k + 1] = self._vehicle_dynamics_np(X_guess[:, k], U_guess[:, k])
 
         x_eval = np.concatenate([X_guess.T.reshape(-1), U_guess.T.reshape(-1)])
-        p_val = self._make_p_val(x0_mpc, ref_traj, u_prev, q_weight)
+        p_val = self._make_p_val(
+            x0_mpc,
+            ref_traj,
+            u_prev,
+            q_weight,
+            opponents=opponents,
+            current_s=current_s,
+        )
         self._store_loss_parts(x_eval, p_val)
         return self.last_loss
 
@@ -191,6 +322,27 @@ class MPCController:
                 g_ineq.append(lateral_e - self.track_constraint_half_width)
                 g_ineq.append(-lateral_e - self.track_constraint_half_width)
 
+                # Paper (1g)-(1h) describe separate minimum lateral and
+                # longitudinal separations. Enforcing both inequalities with
+                # logical AND would prohibit ordinary same-lane following and
+                # side-by-side overtaking. Their collision-free meaning is the
+                # disjunction |ds| >= px_min OR |de| >= py_min. A smooth
+                # superellipse is the standard NLP representation of that
+                # rectangular exclusion region and approaches the two paper
+                # bounds more closely than a circular distance constraint.
+                for opponent_idx in range(self.max_constrained_opponents):
+                    delta_s = car_px - self.opponent_s[opponent_idx, k]
+                    delta_e = car_py - self.opponent_e[opponent_idx, k]
+                    collision_metric = (
+                        (delta_s / self.min_longitudinal_separation)
+                        ** self.collision_superellipse_exponent
+                        + (delta_e / self.min_lateral_separation)
+                        ** self.collision_superellipse_exponent
+                    )
+                    g_ineq.append(
+                        self.opponent_active[opponent_idx] * (1.0 - collision_metric)
+                    )
+
         for k in range(self.horizon):
             if k == 0:
                 du = self.U[:, k] - self.u_prev
@@ -208,6 +360,9 @@ class MPCController:
             cs.reshape(self.ref, -1, 1),
             cs.reshape(self.u_prev, -1, 1),
             self.q_weight,
+            cs.reshape(self.opponent_s, -1, 1),
+            cs.reshape(self.opponent_e, -1, 1),
+            self.opponent_active,
         )
 
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
@@ -224,12 +379,27 @@ class MPCController:
         self.n_eq = len(g_eq) * self.n_states
         self.n_total = self.g.size1()
 
-    def solve(self, x0, ref_traj, u_prev, q_weight=1.0):
+    def solve(
+        self,
+        x0,
+        ref_traj,
+        u_prev,
+        q_weight=1.0,
+        opponents=None,
+        current_s=None,
+    ):
         x0_mpc = self._make_x0_mpc(x0)
         X_guess = np.tile(x0_mpc.reshape(-1, 1), (1, self.horizon + 1))
         U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
         x_init = np.concatenate([X_guess.T.reshape(-1), U_guess.T.reshape(-1)])
-        p_val = self._make_p_val(x0_mpc, ref_traj, u_prev, q_weight)
+        p_val = self._make_p_val(
+            x0_mpc,
+            ref_traj,
+            u_prev,
+            q_weight,
+            opponents=opponents,
+            current_s=current_s,
+        )
 
         # constrains for states
         lbx = np.full(self.n_x + self.n_u, -np.inf)

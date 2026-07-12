@@ -1,32 +1,39 @@
-"""
-Self-play PPO baseline for the local alpha-RACER-style simulator.
+"""Train the alpha-RACER self-play RL baseline with Stable-Baselines3 PPO.
 
-This file is intentionally standalone: it defines the policy network, a small
-multi-car racing environment, the PPO training loop, and checkpoint load/save
-helpers.  A trained checkpoint can be loaded by policies.SelfPlayRLPolicy.
+The resulting ``.zip`` file is loaded directly by ``SelfPlayRLPolicy`` through
+``stable_baselines3.PPO.load``.  Training is offline: run this module once,
+then reuse the saved model for simulation experiments.
 
-Example:
-    python self_play_rl.py --total-steps 200000 --num-cars 3 --output self_play_rl_policy.pth
+Paper-style training (long running)::
+
+    python self_play_rl.py --output self_play_rl_policy.zip
+
+Quick pipeline check::
+
+    python self_play_rl.py --iterations 1 --steps-per-iteration 256 \
+        --num-envs 1 --episode-steps 50 --output /tmp/self_play_smoke.zip
+
+The paper appendix specifies 99 round-robin phases, 100K time steps per phase,
+three cars, and eight parallel environments.  Its numerical-results section
+also summarizes the baseline as 2M steps; see ``--paper-total-steps`` for that
+alternative budget.
 """
 
 import argparse
-import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import gymnasium as gym
 import numpy as np
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-except ImportError as exc:  # pragma: no cover - this module is only useful with torch.
-    raise ImportError("self_play_rl.py requires PyTorch for training and inference.") from exc
+from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.env_util import make_vec_env
 
 from config import make_vehicle_params, params
 from state import CarState
-from track import Track, load_centerline_csv, load_raceline_csv
+from track import Track, load_centerline_csv
 from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
 
 
@@ -35,6 +42,7 @@ ACTION_SIZE = 2
 
 
 def progress_delta(s_a, s_b, total_length):
+    """Signed shortest progress from ``s_b`` to ``s_a`` on a closed track."""
     return math.atan2(
         math.sin((s_a - s_b) * 2.0 * math.pi / total_length),
         math.cos((s_a - s_b) * 2.0 * math.pi / total_length),
@@ -45,511 +53,382 @@ def angle_delta(angle_a, angle_b):
     return math.atan2(math.sin(angle_a - angle_b), math.cos(angle_a - angle_b))
 
 
-def mlp(sizes, activation=nn.Tanh, output_activation=nn.Identity):
-    layers = []
-    for idx in range(len(sizes) - 1):
-        act = activation if idx < len(sizes) - 2 else output_activation
-        layers.extend([nn.Linear(sizes[idx], sizes[idx + 1]), act()])
-    return nn.Sequential(*layers)
-
-
-class RunningMeanStd:  # computes mean and std online for normalizing observations
-    def __init__(self, shape, epsilon=1e-4):
-        self.mean = np.zeros(shape, dtype=np.float64)
-        self.var = np.ones(shape, dtype=np.float64)
-        self.count = float(epsilon)
-
-    def update(self, x):
-        x = np.asarray(x, dtype=np.float64)
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
-        batch_count = x.shape[0]
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_count
-        new_mean = self.mean + delta * batch_count / total_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m_2 = m_a + m_b + delta * delta * self.count * batch_count / total_count
-        self.mean = new_mean
-        self.var = m_2 / total_count
-        self.count = total_count
-
-    @property
-    def std(self):
-        return np.sqrt(np.maximum(self.var, 1e-6))
-
-
-class SelfPlayActorCritic(nn.Module):
-    """
-    Gaussian actor-critic with alpha-RACER-compatible direct actions.
-
-    Observations are the 15-value local interaction features used by
-    SelfPlayRLPolicy.  Actions are ordered as [throttle, steer], with inference
-    mapped to throttle in [0, 1] and steer in [-1, 1].
-    """
-
-    def __init__(self, obs_dim=OBSERVATION_SIZE, hidden_sizes=(128, 128), action_dim=ACTION_SIZE):
-        super().__init__()
-        self.obs_dim = int(obs_dim)
-        self.action_dim = int(action_dim)
-        hidden_sizes = tuple(int(v) for v in hidden_sizes)
-        self.actor = mlp((self.obs_dim, *hidden_sizes, self.action_dim))
-        self.critic = mlp((self.obs_dim, *hidden_sizes, 1))
-        self.log_std = nn.Parameter(torch.full((self.action_dim,), -0.5))
-        self.register_buffer("obs_mean", torch.zeros(self.obs_dim))
-        self.register_buffer("obs_std", torch.ones(self.obs_dim))
-
-    def set_obs_stats(self, mean, std):
-        self.obs_mean.copy_(torch.as_tensor(mean, dtype=torch.float32, device=self.obs_mean.device))
-        self.obs_std.copy_(torch.as_tensor(std, dtype=torch.float32, device=self.obs_std.device).clamp_min(1e-6))
-
-    def normalize_obs(self, obs):
-        return (obs - self.obs_mean) / self.obs_std.clamp_min(1e-6)
-
-    def distribution(self, obs):
-        z = self.normalize_obs(obs)
-        mean = self.actor(z)
-        std = torch.exp(self.log_std).expand_as(mean)
-        return torch.distributions.Normal(mean, std)
-
-    def value(self, obs):
-        z = self.normalize_obs(obs)
-        return self.critic(z).squeeze(-1)
-
-    def squash_action(self, raw_action):
-        throttle = torch.sigmoid(raw_action[..., 0])
-        steer = torch.tanh(raw_action[..., 1])
-        return torch.stack([throttle, steer], dim=-1)
-
-    def act(self, obs, deterministic=False):
-        dist = self.distribution(obs)
-        raw_action = dist.mean if deterministic else dist.rsample()
-        log_prob = dist.log_prob(raw_action).sum(dim=-1)
-        return self.squash_action(raw_action), log_prob, self.value(obs), raw_action
-
-    def evaluate_raw_actions(self, obs, raw_action):
-        dist = self.distribution(obs)
-        log_prob = dist.log_prob(raw_action).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
-        return log_prob, entropy, self.value(obs)
-
-    def predict(self, observation, deterministic=True):
-        was_training = self.training
-        self.eval()
-        with torch.no_grad():
-            obs = torch.as_tensor(np.asarray(observation, dtype=np.float32), dtype=torch.float32)
-            if obs.ndim == 1:
-                obs = obs.unsqueeze(0)
-            action, _, _, _ = self.act(obs, deterministic=deterministic)
-        if was_training:
-            self.train()
-        action_np = action.cpu().numpy()
-        if np.asarray(observation).ndim == 1:
-            return action_np[0], None
-        return action_np, None
-
-
-def track_curvature_at(track, s, ds=0.5):
+def track_curvature_at(track, s, ds=0.25):
     _, _, psi_prev = track.interpolate(s - ds)
     _, _, psi_next = track.interpolate(s + ds)
     return angle_delta(psi_next, psi_prev) / (2.0 * ds)
 
 
 def heading_error(track, psi, s):
-    _, _, ref_psi = track.interpolate(s)
-    return angle_delta(psi, ref_psi)
+    _, _, reference_heading = track.interpolate(s)
+    return angle_delta(psi, reference_heading)
 
 
 @dataclass
 class SelfPlayEnvConfig:
     num_cars: int = 3
     episode_steps: int = 500
+    dt: float = 0.1
     vehicle_model: str = "kinematic"
-    v0: float = 2.0
-    car_start_gap: float = 3.0
+    initial_speed: float = 2.0
+    start_gap: float = 3.0
+    start_jitter: float = 0.15
     unsafe_distance: float = 0.4
-    offroad_tolerance: float = 0.05
-    progress_reward: float = 1.0
-    rank_reward: float = 0.25
-    offroad_penalty: float = 5.0
-    collision_penalty: float = 4.0
-    control_penalty: float = 0.01
+    track_half_width: float = 0.5
 
 
-class SelfPlayRacingEnv:
-    """Small numerical self-play environment matching this repository's simulator conventions."""
+class FrozenOpponentPolicy:
+    """Inference-only copy of the learner used by opponents during one phase."""
+
+    def __init__(self, model):
+        self.policy = model.policy_class(
+            model.observation_space,
+            model.action_space,
+            lr_schedule=lambda _: 0.0,
+            **model.policy_kwargs,
+        ).to("cpu")
+        state_dict = {
+            name: value.detach().cpu().clone()
+            for name, value in model.policy.state_dict().items()
+        }
+        self.policy.load_state_dict(state_dict)
+        self.policy.set_training_mode(False)
+
+    def predict(self, observation):
+        action, _ = self.policy.predict(np.asarray(observation, dtype=np.float32), deterministic=True)
+        return np.asarray(action, dtype=np.float32)
+
+
+class SelfPlayRacingEnv(gym.Env):
+    """Three-car racing environment exposing one car as the learning agent.
+
+    One shared PPO policy is trained in round-robin phases.  At phase ``k``,
+    car ``k % num_cars`` is controlled by the learner while the other cars use
+    a frozen snapshot from the preceding phase.  This matches the switching
+    scheme described in the alpha-RACER appendix while producing one reusable
+    SB3 policy.
+    """
+
+    metadata = {"render_modes": []}
 
     def __init__(self, cfg=None, seed=0):
+        super().__init__()
         self.cfg = cfg or SelfPlayEnvConfig()
+        if self.cfg.num_cars < 2:
+            raise ValueError("Self-play requires at least two cars")
         self.rng = np.random.default_rng(seed)
-        waypoints = load_centerline_csv(params.TRACK_CSV, scale=params.TRACK_SCALE)
-        self.raceline = load_raceline_csv(params.RACELINE_CSV, scale=params.TRACK_SCALE)
-        self.track = Track(waypoints)
+        self.track = Track(load_centerline_csv(params.TRACK_CSV, scale=params.TRACK_SCALE))
+        self.action_space = spaces.Box(
+            low=np.asarray([0.0, -1.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(OBSERVATION_SIZE,),
+            dtype=np.float32,
+        )
         vehicle_params = make_vehicle_params(self.cfg.vehicle_model)
         if self.cfg.vehicle_model.lower() in {"kinematic", "kinetic", "kinetics"}:
-            model_cls = lambda: KinematicBicycleModel(params.DT, vehicle_params, max_speed=params.MAX_STATE_SPEED)
+            factory = lambda: KinematicBicycleModel(
+                dt=self.cfg.dt,
+                db_params=vehicle_params,
+                max_speed=params.MAX_STATE_SPEED,
+            )
         else:
-            model_cls = lambda: DynamicBicycleModel(params.DT, vehicle_params)
-        self.vehicle_models = [model_cls() for _ in range(self.cfg.num_cars)]
+            factory = lambda: DynamicBicycleModel(dt=self.cfg.dt, db_params=vehicle_params)
+        self.vehicle_models = [factory() for _ in range(self.cfg.num_cars)]
+        self.learning_car = 0
+        self.opponent_policy = None
         self.states = []
-        self.progress_s = []
-        self.lateral_e = []
+        self.progress_s = np.zeros(self.cfg.num_cars, dtype=float)
+        self.lateral_e = np.zeros(self.cfg.num_cars, dtype=float)
         self.step_count = 0
 
-    def reset(self):
+    def set_self_play_phase(self, learning_car, opponent_policy):
+        self.learning_car = int(learning_car) % self.cfg.num_cars
+        self.opponent_policy = opponent_policy
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
         self.step_count = 0
         self.states = []
-        self.progress_s = []
-        self.lateral_e = []
-        jitter = self.rng.normal(0.0, 0.05, size=self.cfg.num_cars)
+
+        # Randomize the portion of track while retaining the paper's three
+        # ordered starting regions.  Rotation avoids tying a car identity to a
+        # permanent advantage and creates varied curvature interactions.
+        base_s = float(self.rng.uniform(0.0, self.track.total_length))
+        slots = self.rng.permutation(self.cfg.num_cars)
         for car_idx in range(self.cfg.num_cars):
-            start_s = -car_idx * self.cfg.car_start_gap + float(jitter[car_idx])
+            start_s = (
+                base_s
+                - float(slots[car_idx]) * self.cfg.start_gap
+                + float(self.rng.uniform(-self.cfg.start_jitter, self.cfg.start_jitter))
+            )
             start_e = float(self.rng.uniform(-0.05, 0.05))
             x, y = self.track.frenet_to_world(start_s, start_e)
             _, _, psi = self.track.interpolate(start_s)
-            self.states.append(CarState(x=x, y=y, vx=self.cfg.v0, vy=0.0, psi=psi, omega=0.0))
-            self.progress_s.append(start_s)
-            self.lateral_e.append(start_e)
-        return self._observations()
+            self.states.append(
+                CarState(
+                    x=x,
+                    y=y,
+                    vx=self.cfg.initial_speed,
+                    vy=0.0,
+                    psi=psi,
+                    omega=0.0,
+                )
+            )
+            self.progress_s[car_idx] = start_s
+            self.lateral_e[car_idx] = start_e
+
+        self._project_all()
+        return self._observation_for(self.learning_car), self._info()
 
     def _project_all(self):
         for idx, state in enumerate(self.states):
-            s_wrapped, e = self.track.project(
+            projected_s, e = self.track.project(
                 state.x,
                 state.y,
                 s_hint=self.progress_s[idx],
-                search_radius=params.PROJECTION_SEARCH_RADIUS,
+                search_radius=max(params.PROJECTION_SEARCH_RADIUS, 2.0),
                 psi_hint=state.psi,
                 max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
             )
-            self.progress_s[idx] = s_wrapped
+            self.progress_s[idx] += progress_delta(
+                projected_s,
+                self.progress_s[idx],
+                self.track.total_length,
+            )
             self.lateral_e[idx] = e
 
-    def _nearest_opponent_idx(self, car_idx):
-        best_idx = None
-        best_dist = np.inf
-        for other_idx in range(self.cfg.num_cars):
-            if other_idx == car_idx:
-                continue
-            dist = abs(progress_delta(self.progress_s[other_idx], self.progress_s[car_idx], self.track.total_length))
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = other_idx
-        return best_idx
+    def _nearest_opponent(self, car_idx):
+        return min(
+            (idx for idx in range(self.cfg.num_cars) if idx != car_idx),
+            key=lambda idx: abs(
+                progress_delta(
+                    self.progress_s[idx],
+                    self.progress_s[car_idx],
+                    self.track.total_length,
+                )
+            ),
+        )
 
     def _observation_for(self, car_idx):
-        state = self.states[car_idx]
-        current_s = self.progress_s[car_idx]
-        current_e = self.lateral_e[car_idx]
-        opp_idx = self._nearest_opponent_idx(car_idx)
-        if opp_idx is None:
-            opp_s = current_s
-            opp_e = current_e
-            opp = state
-        else:
-            opp_s = self.progress_s[opp_idx]
-            opp_e = self.lateral_e[opp_idx]
-            opp = self.states[opp_idx]
+        opponent_idx = self._nearest_opponent(car_idx)
+        own = self.states[car_idx]
+        opponent = self.states[opponent_idx]
+        own_s = self.progress_s[car_idx]
+        opponent_s = self.progress_s[opponent_idx]
         lookahead_time = params.MPC_DT * params.MPC_HORIZON
-        own_lookahead_s = current_s + max(float(state.vx), 0.0) * lookahead_time
-        opp_lookahead_s = opp_s + max(float(opp.vx), 0.0) * lookahead_time
-        obs = np.asarray(
+        own_lookahead = own_s + max(float(own.vx), 0.0) * lookahead_time
+        opponent_lookahead = opponent_s + max(float(opponent.vx), 0.0) * lookahead_time
+
+        observation = np.asarray(
             [
-                progress_delta(current_s, opp_s, self.track.total_length),
-                current_e,
-                opp_e,
-                heading_error(self.track, state.psi, current_s),
-                state.vx,
-                state.vy,
-                state.omega,
-                heading_error(self.track, opp.psi, opp_s),
-                opp.vx,
-                opp.vy,
-                opp.omega,
-                track_curvature_at(self.track, current_s),
-                track_curvature_at(self.track, opp_s),
-                track_curvature_at(self.track, own_lookahead_s),
-                track_curvature_at(self.track, opp_lookahead_s),
+                # Upstream multi_car_comp_blocking.py uses opponent - ego.
+                progress_delta(opponent_s, own_s, self.track.total_length),
+                self.lateral_e[car_idx],
+                self.lateral_e[opponent_idx],
+                heading_error(self.track, own.psi, own_s),
+                own.vx,
+                own.vy,
+                own.omega,
+                heading_error(self.track, opponent.psi, opponent_s),
+                opponent.vx,
+                opponent.vy,
+                opponent.omega,
+                track_curvature_at(self.track, own_s),
+                track_curvature_at(self.track, opponent_s),
+                track_curvature_at(self.track, own_lookahead),
+                track_curvature_at(self.track, opponent_lookahead),
             ],
             dtype=np.float32,
         )
-        obs[~np.isfinite(obs)] = 0.0
-        return obs
+        observation[~np.isfinite(observation)] = 0.0
+        return observation
 
-    def _observations(self):
-        self._project_all()
-        return np.stack([self._observation_for(idx) for idx in range(self.cfg.num_cars)], axis=0)
-
-    def step(self, actions):
-        actions = np.asarray(actions, dtype=float)
-        prev_s = np.asarray(self.progress_s, dtype=float)
-        prev_e = np.asarray(self.lateral_e, dtype=float)
-        for idx, state in enumerate(self.states):
-            throttle = float(np.clip(actions[idx, 0], 0.0, 1.0))
-            steer = float(np.clip(actions[idx, 1], -1.0, 1.0))
-            next_state = self.vehicle_models[idx].step(state.to_array(), throttle, steer)
-            self.states[idx] = CarState.from_array(next_state)
-
-        self._project_all()
-        current_s = np.asarray(self.progress_s, dtype=float)
-        current_e = np.asarray(self.lateral_e, dtype=float)
-        progress = np.asarray(
-            [progress_delta(current_s[idx], prev_s[idx], self.track.total_length) for idx in range(self.cfg.num_cars)]
+    def _baseline_action(self, car_idx):
+        state = self.states[car_idx]
+        speed_error = params.MAX_RACELINE_SPEED - max(float(state.vx), 0.0)
+        steer = (
+            -1.5 * heading_error(self.track, state.psi, self.progress_s[car_idx])
+            - 0.8 * self.lateral_e[car_idx]
         )
-        mean_other_progress = np.asarray(
-            [
-                np.mean([progress[j] for j in range(self.cfg.num_cars) if j != idx])
-                for idx in range(self.cfg.num_cars)
-            ]
+        return np.asarray(
+            [np.clip(0.35 * speed_error, 0.0, 1.0), np.clip(steer, -1.0, 1.0)],
+            dtype=np.float32,
         )
-        rewards = self.cfg.progress_reward * (progress - mean_other_progress)
-        rewards += self.cfg.rank_reward * (
-            current_s - np.mean(current_s)
-        ) / max(self.track.total_length, 1.0)
-        rewards -= self.cfg.control_penalty * (actions[:, 0] ** 2 + actions[:, 1] ** 2)
 
-        offroad_half_width = params.TRACK_HALF_WIDTH + self.cfg.offroad_tolerance
-        offroad = np.abs(current_e) > offroad_half_width
-        rewards -= self.cfg.offroad_penalty * offroad.astype(float)
-        for idx, is_offroad in enumerate(offroad):
-            if is_offroad:
-                self.states[idx].vx *= 0.5
-                _, _, psi = self.track.interpolate(self.progress_s[idx])
-                self.states[idx].psi = psi
+    def _opponent_action(self, car_idx):
+        if self.opponent_policy is None:
+            return self._baseline_action(car_idx)
+        return self.opponent_policy.predict(self._observation_for(car_idx))
 
-        collision = np.zeros(self.cfg.num_cars, dtype=bool)
+    def _relative_lead(self, car_idx):
+        opponents = [self.progress_s[idx] for idx in range(self.cfg.num_cars) if idx != car_idx]
+        return float(self.progress_s[car_idx] - max(opponents))
+
+    def _apply_racing_incidents(self):
+        offroad = np.abs(self.lateral_e) > self.cfg.track_half_width
+        for idx in np.flatnonzero(offroad):
+            self.states[idx].vx *= 0.5
+            _, _, psi = self.track.interpolate(self.progress_s[idx])
+            self.states[idx].psi = psi
+
+        collisions = 0
         for i in range(self.cfg.num_cars):
             for j in range(i + 1, self.cfg.num_cars):
-                dist = math.hypot(self.states[i].x - self.states[j].x, self.states[i].y - self.states[j].y)
-                if dist <= self.cfg.unsafe_distance:
-                    collision[i] = True
-                    collision[j] = True
-                    if progress_delta(current_s[i], current_s[j], self.track.total_length) >= 0.0:
-                        front_idx, rear_idx = i, j
-                    else:
-                        front_idx, rear_idx = j, i
-                    self.states[front_idx].vx *= 0.5
-                    self.states[rear_idx].vx *= 1.0 / 3.0
-        rewards -= self.cfg.collision_penalty * collision.astype(float)
+                distance = math.hypot(
+                    self.states[i].x - self.states[j].x,
+                    self.states[i].y - self.states[j].y,
+                )
+                if distance > self.cfg.unsafe_distance:
+                    continue
+                collisions += 1
+                if self.progress_s[i] >= self.progress_s[j]:
+                    front, rear = i, j
+                else:
+                    front, rear = j, i
+                # These are the collision dynamics stated in the paper; they
+                # shape reward indirectly through lost relative progress.
+                self.states[front].vx *= 0.5
+                self.states[rear].vx *= 1.0 / 3.0
+        return int(np.sum(offroad)), collisions
 
+    def step(self, action):
+        actions = np.zeros((self.cfg.num_cars, ACTION_SIZE), dtype=np.float32)
+        actions[self.learning_car] = np.clip(action, self.action_space.low, self.action_space.high)
+        for idx in range(self.cfg.num_cars):
+            if idx != self.learning_car:
+                actions[idx] = self._opponent_action(idx)
+
+        previous_lead = self._relative_lead(self.learning_car)
+        for idx, state in enumerate(self.states):
+            next_state = self.vehicle_models[idx].step(
+                state.to_array(),
+                float(actions[idx, 0]),
+                float(actions[idx, 1]),
+            )
+            self.states[idx] = CarState.from_array(next_state)
+        self._project_all()
+        offroad, collisions = self._apply_racing_incidents()
+
+        # Paper utility: change in ego's lead over the furthest-ahead opponent.
+        reward = self._relative_lead(self.learning_car) - previous_lead
         self.step_count += 1
-        done = self.step_count >= self.cfg.episode_steps
-        obs = self._observations()
-        info = {
-            "mean_progress": float(np.mean(progress)),
-            "collisions": int(np.sum(collision) // 2),
-            "offroad": int(np.sum(offroad)),
-            "mean_lateral_error": float(np.mean(np.abs(current_e))),
-            "prev_lateral_error": prev_e,
-        }
-        return obs, rewards.astype(np.float32), done, info
+        terminated = False
+        truncated = self.step_count >= self.cfg.episode_steps
+        info = self._info()
+        info.update({"offroad": offroad, "collisions": collisions})
+        return self._observation_for(self.learning_car), float(reward), terminated, truncated, info
 
-
-class RolloutBuffer:
-    def __init__(self):
-        self.obs = []
-        self.raw_actions = []
-        self.log_probs = []
-        self.rewards = []
-        self.dones = []
-        self.values = []
-
-    def add(self, obs, raw_action, log_prob, reward, done, value):
-        self.obs.append(np.asarray(obs, dtype=np.float32))
-        self.raw_actions.append(np.asarray(raw_action, dtype=np.float32))
-        self.log_probs.append(np.asarray(log_prob, dtype=np.float32))
-        self.rewards.append(np.asarray(reward, dtype=np.float32))
-        self.dones.append(np.asarray(done, dtype=np.float32))
-        self.values.append(np.asarray(value, dtype=np.float32))
-
-    def as_arrays(self):
+    def _info(self):
         return {
-            "obs": np.concatenate(self.obs, axis=0),
-            "raw_actions": np.concatenate(self.raw_actions, axis=0),
-            "log_probs": np.concatenate(self.log_probs, axis=0),
-            "rewards": np.stack(self.rewards, axis=0),
-            "dones": np.stack(self.dones, axis=0),
-            "values": np.stack(self.values, axis=0),
+            "learning_car": self.learning_car,
+            "relative_lead": self._relative_lead(self.learning_car) if self.states else 0.0,
+            "mean_abs_lateral_error": float(np.mean(np.abs(self.lateral_e))),
         }
-
-
-def compute_gae(rewards, dones, values, last_values, gamma, gae_lambda):
-    steps, num_agents = rewards.shape
-    advantages = np.zeros_like(rewards, dtype=np.float32)
-    last_gae = np.zeros(num_agents, dtype=np.float32)
-    for step in reversed(range(steps)):
-        next_values = last_values if step == steps - 1 else values[step + 1]
-        next_nonterminal = 1.0 - dones[step]
-        delta = rewards[step] + gamma * next_values * next_nonterminal - values[step]
-        last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
-        advantages[step] = last_gae
-    returns = advantages + values
-    return advantages.reshape(-1), returns.reshape(-1)
-
-
-def save_checkpoint(path, model, obs_rms, args):
-    checkpoint = {
-        "format": "self_play_rl_actor_critic_v1",
-        "model_state_dict": model.state_dict(),
-        "obs_dim": model.obs_dim,
-        "action_dim": model.action_dim,
-        "hidden_sizes": [module.out_features for module in model.actor if isinstance(module, nn.Linear)][:-1],
-        "obs_mean": obs_rms.mean.astype(np.float32),
-        "obs_std": obs_rms.std.astype(np.float32),
-        "action_order": "throttle_steer",
-        "throttle_bounds": np.asarray([0.0, 1.0], dtype=np.float32),
-        "steer_bounds": np.asarray([-1.0, 1.0], dtype=np.float32),
-        "train_args": vars(args),
-    }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, path)
-
-
-def load_policy_checkpoint(path, device="cpu"):
-    checkpoint = torch.load(Path(path), map_location=device)
-    hidden_sizes = tuple(checkpoint.get("hidden_sizes", (128, 128)))
-    model = SelfPlayActorCritic(
-        obs_dim=int(checkpoint.get("obs_dim", OBSERVATION_SIZE)),
-        hidden_sizes=hidden_sizes,
-        action_dim=int(checkpoint.get("action_dim", ACTION_SIZE)),
-    )
-    model.load_state_dict(checkpoint["model_state_dict"])
-    if "obs_mean" in checkpoint and "obs_std" in checkpoint:
-        model.set_obs_stats(checkpoint["obs_mean"], checkpoint["obs_std"])
-    model.to(device)
-    model.eval()
-    metadata = {
-        "action_order": checkpoint.get("action_order", "throttle_steer"),
-        "throttle_bounds": checkpoint.get("throttle_bounds", np.asarray([0.0, 1.0])),
-        "steer_bounds": checkpoint.get("steer_bounds", np.asarray([-1.0, 1.0])),
-    }
-    return model, metadata
 
 
 def train(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = torch.device(args.device)
+    if args.paper_total_steps:
+        args.iterations = max(1, math.ceil(2_000_000 / args.steps_per_iteration))
+
     cfg = SelfPlayEnvConfig(
         num_cars=args.num_cars,
         episode_steps=args.episode_steps,
+        dt=args.dt,
         vehicle_model=args.vehicle_model,
-        v0=args.v0,
+        initial_speed=args.initial_speed,
+        start_gap=args.start_gap,
     )
-    env = SelfPlayRacingEnv(cfg=cfg, seed=args.seed)
-    model = SelfPlayActorCritic(hidden_sizes=tuple(args.hidden_sizes)).to(device)
-    old_model = copy.deepcopy(model).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, eps=1e-5)
-    obs_rms = RunningMeanStd((OBSERVATION_SIZE,))
+    env = make_vec_env(
+        lambda: SelfPlayRacingEnv(cfg=cfg),
+        n_envs=args.num_envs,
+        seed=args.seed,
+    )
+    rollout_batch_size = args.rollout_steps * args.num_envs
+    batch_size = min(args.batch_size, rollout_batch_size)
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=args.learning_rate,
+        n_steps=args.rollout_steps,
+        batch_size=batch_size,
+        n_epochs=args.epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        ent_coef=args.entropy_coef,
+        verbose=1,
+        seed=args.seed,
+        device=args.device,
+    )
 
-    obs = env.reset()
-    global_step = 0
-    update = 0
-    while global_step < args.total_steps:
-        buffer = RolloutBuffer()
-        episode_returns = []
-        for _ in range(args.rollout_steps):
-            obs_rms.update(obs)
-            model.set_obs_stats(obs_rms.mean, obs_rms.std)
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
-            with torch.no_grad():
-                action_t, log_prob_t, value_t, raw_action_t = old_model.act(obs_t, deterministic=False)
-            actions = action_t.cpu().numpy()
-            next_obs, rewards, done, info = env.step(actions)
-            dones = np.full(args.num_cars, float(done), dtype=np.float32)
-            buffer.add(
-                obs,
-                raw_action_t.cpu().numpy(),
-                log_prob_t.cpu().numpy(),
-                rewards,
-                dones,
-                value_t.cpu().numpy(),
-            )
-            global_step += args.num_cars
-            episode_returns.append(float(np.mean(rewards)))
-            obs = env.reset() if done else next_obs
-
-        model.set_obs_stats(obs_rms.mean, obs_rms.std)
-        old_model.set_obs_stats(obs_rms.mean, obs_rms.std)
-        arrays = buffer.as_arrays()
-        with torch.no_grad():
-            last_values = old_model.value(torch.as_tensor(obs, dtype=torch.float32, device=device)).cpu().numpy()
-        advantages, returns = compute_gae(
-            arrays["rewards"],
-            arrays["dones"],
-            arrays["values"],
-            last_values,
-            args.gamma,
-            args.gae_lambda,
+    checkpoint = None
+    if args.checkpoint_interval > 0:
+        checkpoint_dir = Path(args.output).with_suffix("").parent / "self_play_checkpoints"
+        checkpoint = CheckpointCallback(
+            save_freq=max(args.checkpoint_interval // args.num_envs, 1),
+            save_path=str(checkpoint_dir),
+            name_prefix="self_play_rl",
         )
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        obs_tensor = torch.as_tensor(arrays["obs"], dtype=torch.float32, device=device)
-        raw_action_tensor = torch.as_tensor(arrays["raw_actions"], dtype=torch.float32, device=device)
-        old_log_prob_tensor = torch.as_tensor(arrays["log_probs"], dtype=torch.float32, device=device)
-        adv_tensor = torch.as_tensor(advantages, dtype=torch.float32, device=device)
-        return_tensor = torch.as_tensor(returns, dtype=torch.float32, device=device)
-        batch_size = obs_tensor.shape[0]
-        indices = np.arange(batch_size)
+    frozen_opponents = None
+    for phase in range(args.iterations):
+        learning_car = phase % args.num_cars
+        env.env_method("set_self_play_phase", learning_car, frozen_opponents)
+        print(
+            f"self-play phase {phase + 1}/{args.iterations}: "
+            f"training car {learning_car} for {args.steps_per_iteration} steps"
+        )
+        model.learn(
+            total_timesteps=args.steps_per_iteration,
+            reset_num_timesteps=False,
+            callback=checkpoint,
+            progress_bar=args.progress_bar,
+        )
+        frozen_opponents = FrozenOpponentPolicy(model)
 
-        for _ in range(args.epochs):
-            np.random.shuffle(indices)
-            for start in range(0, batch_size, args.batch_size):
-                mb_idx = indices[start : start + args.batch_size]
-                new_log_prob, entropy, value = model.evaluate_raw_actions(
-                    obs_tensor[mb_idx],
-                    raw_action_tensor[mb_idx],
-                )
-                ratio = torch.exp(new_log_prob - old_log_prob_tensor[mb_idx])
-                unclipped = ratio * adv_tensor[mb_idx]
-                clipped = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * adv_tensor[mb_idx]
-                policy_loss = -torch.min(unclipped, clipped).mean()
-                value_loss = 0.5 * (return_tensor[mb_idx] - value).pow(2).mean()
-                entropy_loss = entropy.mean()
-                loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy_loss
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-
-        old_model.load_state_dict(model.state_dict())
-        update += 1
-        if update % args.log_interval == 0:
-            print(
-                f"update={update} steps={global_step} "
-                f"mean_reward={np.mean(episode_returns):.4f} obs_std={np.mean(obs_rms.std):.3f}"
-            )
-        if args.save_interval > 0 and update % args.save_interval == 0:
-            save_checkpoint(args.output, model, obs_rms, args)
-
-    save_checkpoint(args.output, model, obs_rms, args)
-    print(f"saved self-play RL policy to {args.output}")
+    output = Path(args.output)
+    if output.suffix != ".zip":
+        output = Path(f"{output}.zip")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(output))
+    print(f"saved SB3 self-play policy to {output}")
+    env.close()
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a self-play PPO racing baseline.")
-    parser.add_argument("--output", default="self_play_rl_policy.pth")
-    parser.add_argument("--total-steps", type=int, default=200000)
-    parser.add_argument("--rollout-steps", type=int, default=512)
-    parser.add_argument("--episode-steps", type=int, default=500)
+    parser = argparse.ArgumentParser(description="Train the alpha-RACER self-play PPO baseline.")
+    parser.add_argument("--output", default="self_play_rl_policy.zip")
+    parser.add_argument("--iterations", type=int, default=99)
+    parser.add_argument("--steps-per-iteration", type=int, default=100_000)
+    parser.add_argument(
+        "--paper-total-steps",
+        action="store_true",
+        help="Use the 2M total-step budget stated in the paper's numerical-results section.",
+    )
+    parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--num-cars", type=int, default=3)
-    parser.add_argument("--vehicle-model", default="kinematic", choices=["kinematic", "dbm"])
-    parser.add_argument("--v0", type=float, default=2.0)
-    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[128, 128])
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--episode-steps", type=int, default=500)
+    parser.add_argument("--dt", type=float, default=0.1)
+    parser.add_argument("--vehicle-model", choices=["kinematic", "dbm"], default="dbm")
+    parser.add_argument("--initial-speed", type=float, default=2.0)
+    parser.add_argument("--start-gap", type=float, default=3.0)
+    parser.add_argument("--rollout-steps", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--clip-coef", type=float, default=0.2)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--value-coef", type=float, default=0.5)
-    parser.add_argument("--entropy-coef", type=float, default=0.01)
-    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument("--checkpoint-interval", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--log-interval", type=int, default=1)
-    parser.add_argument("--save-interval", type=int, default=10)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--progress-bar", action="store_true")
     return parser.parse_args()
 
 

@@ -79,6 +79,12 @@ class SimParams:
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
     MPC_CONSTRAINT_HALF_WIDTH = 0.44
     REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH
+    # Minimum separations used by the paper's MPC collision-avoidance
+    # constraints (1g)-(1h).  They approximate the 1/10-scale car footprint.
+    MPC_MIN_LONGITUDINAL_SEPARATION = 0.36
+    MPC_MIN_LATERAL_SEPARATION = 0.20
+    MPC_MAX_CONSTRAINED_OPPONENTS = 2  # nearest car ahead and nearest car behind
+    MPC_COLLISION_SUPERELLIPSE_EXPONENT = 4
     OFFROAD_TOLERANCE = 0.05
     OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
     MPC_DT = 0.1
@@ -105,7 +111,7 @@ class SimParams:
     EARLY_COLLISION_STOP = False # stop early if cars collide immediately after launch
     EARLY_COLLISION_WINDOW_STEPS = 150 # only apply early collision stop during the first N simulation steps
     EARLY_COLLISION_CONSECUTIVE_STEPS = 3 # require this many consecutive collision steps before stopping
-    LLM_MODEL = "my-racing-ctrl-mode"
+    LLM_MODEL = "qwen2.5:0.5b"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.2
@@ -123,9 +129,9 @@ class SimParams:
     ALPHARACER_WEIGHT_SEARCH_POINTS = POTENTIAL_FUNCTION_SEARCH_POINTS
     ALPHARACER_WEIGHT_SEARCH_ITERS = POTENTIAL_FUNCTION_SEARCH_ITERS
     LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
-    SELF_PLAY_RL_MODEL_PATH = None  # Native .pth from self_play_rl.py, .npz/.json local policy, or SB3 .zip.
-    SELF_PLAY_RL_BACKEND = "auto"  # auto, torch/pth/pt, npz, json, npy, sb3/ppo
-    SELF_PLAY_RL_STRICT_LOAD = False  # False falls back to a simple direct policy when the model is unavailable
+    SELF_PLAY_RL_MODEL_PATH = "self_play_rl_policy.zip"  # Created by: python self_play_rl.py
+    SELF_PLAY_RL_BACKEND = "sb3"  # Paper-compatible Stable-Baselines3 PPO checkpoint.
+    SELF_PLAY_RL_STRICT_LOAD = True  # Do not silently replace a missing trained PPO with the heuristic fallback.
     SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
     SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
