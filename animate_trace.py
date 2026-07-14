@@ -33,9 +33,9 @@ def _short_policy_name(name):
         return "LLM"
     if key in {"ibr", "iterated_best_response_policy"}:
         return "IBR"
-    if key in {"static_policy", "static", "fixed_parameter_controller", "alpharacer", "alpha_racer"}:
+    if key in {"static_policy", "static", "static_alpharacer", "fixed_parameter_controller"}:
         return "Static"
-    if key in {"potential_function_policy", "potential_function_min_policy", "weighted_alpharacer", "weighted"}:
+    if key in {"alpharacer", "alpha_racer", "potential_function_policy", "potential_function_min_policy", "weighted_alpharacer", "weighted"}:
         return "Potential"
     if key in {"rule_based_safeguard", "rule_based", "rules", "decision_tree"}:
         return "Rule+Guard"

@@ -355,6 +355,10 @@ class AlphaRacerReferencePolicy(BasePolicy):
     def _ref_lateral_limit(self) -> float:
         return self.ref_lateral_clip
 
+    def _raceline_lookahead_distance(self, state: CarState) -> float:
+        """Optional forward shift of the raceline reference origin."""
+        return 0.0
+
     def _nearest_raceline_s(self, state: CarState) -> float:
         self.last_raceline_idx = self.raceline.nearest_index(
             state.x,
@@ -514,7 +518,7 @@ class AlphaRacerReferencePolicy(BasePolicy):
                 psi_hint=state.psi,
                 max_heading_error=math.pi / 2.0,
             )
-            source_s = raceline_s
+            source_s = raceline_s + self._raceline_lookahead_distance(state)
             center_hint = current_s
         for k in range(horizon + 1):
             if self.raceline is not None:
@@ -586,10 +590,6 @@ class StaticAlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
     The five parameters q, zeta, s1, s2, s3 are held constant during
     simulation, so this is the static-policy baseline.
     """
-
-
-class AlphaRacerPolicy(StaticAlphaRacerPolicy):
-    """Backward-compatible name for StaticAlphaRacerPolicy."""
 
 
 class SelfPlayRLPolicy(AlphaRacerReferencePolicy):
@@ -1431,7 +1431,7 @@ class _LearnedAlphaPotentialFunction(nn.Module if nn is not None else object):
         return self.fc(x)
 
 
-class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
+class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
     """
     alpha-RACER online policy that searches for parameters maximizing the
     learned alpha-potential function.
@@ -1442,15 +1442,19 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
     The original model scores 5 policy parameters per car:
     sf1, sf2, lookahead_factor, speed_factor, blocking. This project uses
     q, zeta, s1, s2, s3 in MPC, so the selected parameters are mapped as:
-    q=fixed, zeta=speed_factor^2, s1=sf1, s2=sf2, s3=blocking.
+    The upstream implementation stores q/2 as ``lookahead_factor`` and
+    sqrt(zeta) as ``speed_factor``.  This project's MPC directly multiplies
+    its tracking cost by q_weight, matching the paper's Q=qI definition, so
+    the executable map is q=2*lookahead_factor, zeta=speed_factor^2,
+    s1=sf1, s2=sf2, s3=blocking.
     """
 
     ORIGINAL_PARAM_BOUNDS = np.asarray(
         [
             [0.1, 0.5],   # s1
             [0.1, 0.5],   # s2
-            [0.15, 0.5],  # lookahead_factor
-            [0.85, 1.1],  # speed_factor
+            [0.15, 0.5],  # lookahead_factor = q/2
+            [0.85, 1.1],  # speed_factor = zeta^0.5
             [0.0, 1.0],   # s3
         ],
         dtype=float,
@@ -1460,15 +1464,16 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         self,
         *args,
         weight_path="alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth",
-        q_value=1.0,
         search_points=7,
-        search_iters=1,
+        search_iters=6,
+        opt_style="grad",
+        gradient_rate=1e-4,
         opponent_default_original_params=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         if torch is None:
-            raise ImportError("PyTorch is required to use PotentialFunctionPolicy.")
+            raise ImportError("PyTorch is required to use AlphaRacerPolicy.")
 
         self.weight_path = Path(weight_path)
         if not self.weight_path.exists():
@@ -1480,9 +1485,12 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         self.potential_function.load_state_dict(state_dict)
         self.potential_function.eval()
 
-        self.q_value = float(q_value)
         self.search_points = max(2, int(search_points))
         self.search_iters = max(1, int(search_iters))
+        self.opt_style = str(opt_style).strip().lower()
+        if self.opt_style not in {"grad", "linear"}:
+            raise ValueError(f"Unknown AlphaRacer optimization style: {opt_style}")
+        self.gradient_rate = float(gradient_rate)
         self.original_params = np.asarray([0.3, 0.2, 0.25, 0.95, 0.0], dtype=float)
         self.opponent_default_original_params = np.asarray(
             [0.3, 0.2, 0.25, 0.95, 0.0]
@@ -1492,13 +1500,19 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         )
         self.current_mode = "potential"
         self.params = self._map_original_params(self.original_params)
+        self.joint_original_params = np.repeat(
+            self.opponent_default_original_params[None, :], 3, axis=0
+        )
+        if self.car_idx is not None and 0 <= self.car_idx < 3:
+            self.joint_original_params[self.car_idx] = self.original_params
         self._warned_missing_opponents = False
+        self._joint_plan_ready = False
     
     def _map_original_params(self, original_params):
-        sf1, sf2, _lookahead_factor, speed_factor, blocking = np.asarray(original_params, dtype=float)
+        sf1, sf2, lookahead_factor, speed_factor, blocking = np.asarray(original_params, dtype=float)
         return np.asarray(
             [
-                self.q_value,
+                float(np.clip(2.0 * lookahead_factor, 1e-6, None)),
                 float(np.clip(speed_factor * speed_factor, 0.1, 3.0)),
                 float(np.clip(sf1, 0.0, self.mpc.track_half_width)),
                 float(max(sf2, 1e-3)),
@@ -1506,6 +1520,55 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
             ],
             dtype=float,
         )
+
+    def _competitive_offsets(
+        self,
+        p_pert_x: float,
+        p_pert_y: float,
+        v_pert_x: float,
+        ego_py_t: float,
+        opponents,
+        k: int,
+    ) -> tuple:
+        """Paper alpha-RACER overtaking and blocking shift equations."""
+        sf1, sf2, _lookahead_factor, _speed_factor, blocking = self.original_params
+        t = k * self.mpc.dt
+        overtaking_shift = 0.0
+        blocking_shift = 0.0
+        for opponent in opponents:
+            opponent_vx = float(opponent.get("vx", 0.0))
+            opponent_py = float(opponent["py"])
+            plan = opponent.get("plan")
+            if plan is not None and len(plan):
+                opponent_px = float(plan[min(k, len(plan) - 1)][0])
+            else:
+                opponent_px = float(opponent["px"]) + opponent_vx * t
+
+            delta_x = self._progress_delta(p_pert_x, opponent_px)
+            lateral_gap = abs(ego_py_t - opponent_py)
+            magnitude = max(
+                (sf1 - lateral_gap) * math.exp(-sf2 * delta_x * delta_x),
+                0.0,
+            )
+            if ego_py_t > opponent_py:
+                overtaking_shift += magnitude
+            elif ego_py_t < opponent_py:
+                overtaking_shift -= magnitude
+
+            # The paper activates blocking for a faster trailing opponent.
+            # Writing the speed difference as v_opp-v_pert keeps the gain
+            # non-negative, as in the official executable implementation.
+            is_trailing = float(opponent.get("delta", 0.0)) < 0.0
+            speed_gap = opponent_vx - v_pert_x
+            ego_still_ahead = delta_x >= 0.0
+            if is_trailing and speed_gap > 0.0 and ego_still_ahead:
+                block_gain = 1.0 - math.exp(-blocking * speed_gap)
+                proximity = math.exp(-sf2 * delta_x * delta_x)
+                blocking_shift += (
+                    (opponent_py - p_pert_y) * block_gain * proximity
+                )
+
+        return overtaking_shift, blocking_shift
 
     def _wrap_delta(self, s_a, s_b):
         return self._progress_delta(float(s_a), float(s_b))
@@ -1555,9 +1618,12 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
                 cars.append({"px": current_s, "py": 0.0, "vx": 0.0, "vy": 0.0, "omega": 0.0, "psi": state.psi})
         return cars[:3]
 
-    def _build_original_input(self, state: CarState, current_s: float, opponents, original_params):
-        # build the 39-dim input for alpha-potential function evaluation
-        cars = self._ordered_cars(state, current_s, opponents)
+    def _build_joint_input(self, cars, joint_params):
+        """Build the canonical 39-D input without reordering vehicle roles."""
+        cars = list(cars[:3])
+        # Pad missing cars with default values if fewer than 3 are provided.
+        while len(cars) < 3:
+            cars.append({"px": cars[0]["px"], "py": 0.0, "vx": 0.0, "vy": 0.0, "omega": 0.0, "psi": 0.0})
         s0, s1, s2 = [float(car["px"]) for car in cars]
 
         # longitudal distance deltas between the three cars, in order: (s2-s1), (s1-s0), (s2-s0)
@@ -1583,12 +1649,9 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
             features.append(
                 self._track_curvature_at(s + max(float(car.get("vx", 0.0)), 0.0) * self.mpc.dt * self.mpc.horizon)
             )
+
         # policy parameters for each car: 3 * 5 = 15 features
-        param_blocks = [
-            np.asarray(original_params, dtype=float),
-            self.opponent_default_original_params,
-            self.opponent_default_original_params,
-        ]
+        param_blocks = np.asarray(joint_params, dtype=float).reshape(3, 5)
         for block in param_blocks:
             features.extend(block.tolist())
 
@@ -1597,6 +1660,53 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         if x.shape[0] != 39:
             raise ValueError(f"Potential-function policy input must have 39 values, got {x.shape[0]}")
         return x
+
+    def _build_original_input(self, state: CarState, current_s: float, opponents, original_params):
+        """Compatibility path for using one policy outside the joint simulator."""
+        cars = self._ordered_cars(state, current_s, opponents)
+        opponent_params = [
+            np.asarray(op.get("original_params", self.opponent_default_original_params), dtype=float)
+            for op in (opponents or [])[:2]
+        ]
+        while len(opponent_params) < 2:
+            opponent_params.append(self.opponent_default_original_params)
+        return self._build_joint_input(cars, [original_params, *opponent_params])
+
+    def _score_joint_params(self, cars, joint_params_batch):
+        # use the learned alpha-potential function to score a batch of joint parameters, returning a numpy array of scores
+        rows = [self._build_joint_input(cars, row) for row in joint_params_batch]
+        with torch.no_grad():
+            x = torch.tensor(np.asarray(rows), dtype=torch.float32, device=self.device)
+            return self.potential_function(x).detach().cpu().numpy().reshape(-1)
+
+    def _maximize_joint_params(self, cars, initial_joint):
+        """Warm-started optimizer matching the paper's default online phase."""
+        joint = np.asarray(initial_joint, dtype=np.float32).reshape(3, 5).copy()
+        bounds = self.ORIGINAL_PARAM_BOUNDS.astype(np.float32)
+        if self.opt_style == "linear":
+            for _ in range(self.search_iters):
+                for flat_idx in range(15):
+                    car_idx, dim = divmod(flat_idx, 5)
+                    candidates = np.repeat(joint[None, :, :], self.search_points, axis=0)
+                    candidates[:, car_idx, dim] = np.linspace(
+                        bounds[dim, 0], bounds[dim, 1], self.search_points
+                    )
+                    scores = self._score_joint_params(cars, candidates)
+                    joint = candidates[int(np.argmax(scores))].copy()
+            return joint
+        # gradient-based optimization, using the learned alpha-potential function as a differentiable surrogate for the true objective
+        base = self._build_joint_input(cars, joint)  # 39-D input for the current joint parameters
+        x = torch.tensor(base[None, :], dtype=torch.float32, device=self.device)
+        lower = torch.tensor(bounds[:, 0], dtype=torch.float32, device=self.device).repeat(3)  # lower bounds for the 15 policy parameters
+        upper = torch.tensor(bounds[:, 1], dtype=torch.float32, device=self.device).repeat(3)  # repeat: 3 cars
+        for _ in range(self.search_iters):
+            x = x.detach().requires_grad_(True)
+            score = self.potential_function(x).sum()
+            gradient = torch.autograd.grad(score, x)[0]
+            with torch.no_grad():
+                policy_values = x[0, -15:] + self.gradient_rate * gradient[0, -15:]
+                x[0, -15:] = torch.maximum(torch.minimum(policy_values, upper), lower)
+        return x.detach().cpu().numpy()[0, -15:].reshape(3, 5)
 
     def _score_original_params(self, state, current_s, opponents, original_params_batch):
         # alpha-potential function to score given parameters, returning a numpy array of scores
@@ -1619,17 +1729,68 @@ class PotentialFunctionPolicy(ParameterizedAlphaRacerPolicy):
         return best
 
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
-        self.original_params = self._select_original_params(state, current_s, opponents or [])
+        if self._joint_plan_ready:  # cache
+            self._joint_plan_ready = False
+        else:
+            self.original_params = self._select_original_params(state, current_s, opponents or [])
         self.params = self._map_original_params(self.original_params)
         return super().get_reference_trajectory(state, current_s, opponents=opponents)
 
 
-class PotentialFunctionMinPolicy(PotentialFunctionPolicy):
+class PotentialFunctionPolicy(AlphaRacerPolicy):
+    """Compatibility alias for the learned-potential AlphaRacer policy."""
+
+
+class PotentialFunctionMinPolicy(AlphaRacerPolicy):
     """Compatibility alias for users who call this a potential-min policy."""
 
 
-class WeightedAlphaRacerPolicy(PotentialFunctionPolicy):
-    """Backward-compatible name for PotentialFunctionPolicy."""
+class WeightedAlphaRacerPolicy(AlphaRacerPolicy):
+    """Deprecated compatibility alias for AlphaRacerPolicy."""
+
+
+def plan_alpharacer_joint_params(policies, states, car_s, car_e):
+    """Jointly optimize all three AlphaRacer parameter blocks.
+
+    Vehicle features and parameter blocks remain in global car-index order,
+    matching the role ordering used to train the 39-D potential model.
+    """
+    alpha_indices = [idx for idx, policy in enumerate(policies) if isinstance(policy, AlphaRacerPolicy)]
+    if not alpha_indices:
+        return
+
+    anchor = policies[alpha_indices[0]]
+    cars = [
+        {
+            "px": float(car_s[idx]),
+            "py": float(car_e[idx]),
+            "vx": float(states[idx].vx),
+            "vy": float(states[idx].vy),
+            "omega": float(states[idx].omega),
+            "psi": float(states[idx].psi),
+            "state": states[idx],
+        }
+        for idx in range(min(len(states), 3))
+    ]
+    if not cars:
+        return
+
+    joint = anchor.joint_original_params.copy()
+    for idx in alpha_indices:
+        if idx < 3:
+            joint[idx] = policies[idx].original_params
+    # The potential is a function of the complete joint policy, even when an
+    # opponent executes a non-AlphaRacer baseline.  Those opponent blocks are
+    # latent equilibrium estimates; only AlphaRacer-owned blocks are executed.
+    joint = anchor._maximize_joint_params(cars, joint)
+    anchor.joint_original_params = joint.copy()
+
+    for idx in alpha_indices:
+        if idx < 3:
+            policies[idx].joint_original_params = joint.copy()
+            policies[idx].original_params = joint[idx].copy()
+            policies[idx].params = policies[idx]._map_original_params(joint[idx])
+            policies[idx]._joint_plan_ready = True
 
 
 class _StrictIBRSolver:

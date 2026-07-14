@@ -10,7 +10,8 @@ from policies import (
     LLMAlphaRacerPolicy,
     RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
-    WeightedAlphaRacerPolicy,
+    StaticAlphaRacerPolicy,
+    plan_alpharacer_joint_params,
     plan_ibr_joint_actions,
 )
 from state import CarState
@@ -44,14 +45,25 @@ def _normalize_policy_name(policy_name):
         "alpha_racer": "alpharacer",
         "alpharacer": "alpharacer",
 
-        "weighted": "weighted_alpharacer",
-        "weight": "weighted_alpharacer",
-        "weights": "weighted_alpharacer",
-        "weighted_alpha": "weighted_alpharacer",
-        "weighted_alpha_racer": "weighted_alpharacer",
-        "weighted_alpharacer": "weighted_alpharacer",
-        "ours": "weighted_alpharacer",
-        "ours_high_p": "weighted_alpharacer",
+        "weighted": "alpharacer",
+        "weight": "alpharacer",
+        "weights": "alpharacer",
+        "weighted_alpha": "alpharacer",
+        "weighted_alpha_racer": "alpharacer",
+        "weighted_alpharacer": "alpharacer",
+        "potential": "alpharacer",
+        "potential_function": "alpharacer",
+        "potential_function_policy": "alpharacer",
+        "potential_function_min_policy": "alpharacer",
+        "ours": "alpharacer",
+        "ours_high_p": "alpharacer",
+
+        "static": "static_alpharacer",
+        "static_alpha": "static_alpharacer",
+        "static_alpha_racer": "static_alpharacer",
+        "static_alpharacer": "static_alpharacer",
+        "fixed_alpha": "static_alpharacer",
+        "fixed_alpharacer": "static_alpharacer",
 
         "llm": "llm_alpharacer",
         "llm_alpha": "llm_alpharacer",
@@ -149,8 +161,8 @@ def create_policy(
             car_idx=car_idx,
             policy_name=policy_type,
         )
-    if policy_type == "alpharacer":
-        return AlphaRacerPolicy(
+    if policy_type == "static_alpharacer":
+        return StaticAlphaRacerPolicy(
             track,
             mpc,
             step_distance=params.DT * params.MAX_RACELINE_SPEED,
@@ -211,8 +223,8 @@ def create_policy(
             ),
             history_length=params.LLM_HISTORY_LENGTH,
         )
-    if policy_type == "weighted_alpharacer":
-        return WeightedAlphaRacerPolicy(
+    if policy_type == "alpharacer":
+        return AlphaRacerPolicy(
             track,
             mpc,
             step_distance=params.DT * params.MAX_RACELINE_SPEED,
@@ -226,9 +238,10 @@ def create_policy(
             max_speed=params.MAX_RACELINE_SPEED,
             ref_lateral_clip=params.REF_LATERAL_CLIP,
             weight_path=params.ALPHARACER_WEIGHT_PATH,
-            q_value=params.ALPHARACER_WEIGHT_Q,
             search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS,
             search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS,
+            opt_style=params.POTENTIAL_FUNCTION_OPT_STYLE,
+            gradient_rate=params.POTENTIAL_FUNCTION_GRADIENT_RATE,
         )
     if policy_type == "self_play_rl":
         return SelfPlayRLPolicy(
@@ -379,7 +392,7 @@ def run_simulation(
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
     self_play_rl_action_order=None,
-    v0=0.0,
+    v0=params.v0 if hasattr(params, "v0") else 0.0,
     velocity_track_weight=None,
     horizon=None,
     ego_position=1,
@@ -575,6 +588,7 @@ def run_simulation(
     print(
         "Simulation setup: "
         f"track={params.TRACK_CSV}, scale={params.TRACK_SCALE:g}, "
+        f"half_width={params.TRACK_HALF_WIDTH:g}, "
         f"policies={resolved_policy_names}, ego_start_position={ego_position}/{num_cars}, "
         f"vehicle_model={vehicle_model_type}"
     )
@@ -620,6 +634,7 @@ def run_simulation(
             car_e.append(e_before)
 
         actions = []
+        plan_alpharacer_joint_params(policies, states, car_s, car_e)
         plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=step * params.DT)
         for car_idx, state in enumerate(states):
             opponents = [
@@ -878,18 +893,19 @@ def run_simulation(
 
 
 if __name__ == "__main__":
-    # Options: "centerline", "alpharacer", "ibr", or "llm_alpharacer"
+    # Options: "centerline", "alpharacer" (potential), "static_alpharacer",
+    # "ibr", or "llm_alpharacer". "weighted_alpharacer" aliases "alpharacer".
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
     # # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
     # run_simulation(
-    #     policy_type="alpharacer", v0=5, vehicle_model_type="kinematic",
+    #     policy_type="static_alpharacer", v0=5, vehicle_model_type="kinematic",
     #     alpharacer_params=[1.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=0.0, horizon=8,
     #     ) # most basic settings.
     
     # run_simulation(
-    #     policy_type="alpharacer",
+    #     policy_type="static_alpharacer",
     #     v0=0,
     #     vehicle_model_type="dbm",
     #     alpharacer_params=[1.0, 1.0, 0.0, 0.0, 0.0],
@@ -899,7 +915,7 @@ if __name__ == "__main__":
 
     # multiple cars with different policies
     # run_simulation(
-    #     policy_names=["alpharacer", "centerline", "centerline"], vehicle_model_type="kinematic",
+    #     policy_names=["static_alpharacer", "centerline", "centerline"], vehicle_model_type="kinematic",
     #     alpharacer_params=[1.0, 1.0, 1.3, 0.3, 0.3], velocity_track_weight=2.0, horizon=8,
     #     ego_position=3,
     # )
@@ -925,8 +941,9 @@ if __name__ == "__main__":
  
     # LLM vs alphaRacer opponents
     run_simulation(
-        track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
-        policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
+        v0 = 0,
+        # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
+        policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:0.5b", None, None],
         vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
         llm_temperature = 1.0, 

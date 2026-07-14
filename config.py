@@ -72,12 +72,13 @@ def make_vehicle_params(vehicle_model_type):
 class SimParams:
     DT = 0.02
     TOTAL_TIME = 50.0
+    v0 = 0.0,
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
     TRACK_SCALE = 2.0
-    TRACK_HALF_WIDTH = 0.50
+    TRACK_HALF_WIDTH = 0.44
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
-    MPC_CONSTRAINT_HALF_WIDTH = 0.44
+    MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH
     REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH
     # Minimum separations used by the paper's MPC collision-avoidance
     # constraints (1g)-(1h).  They approximate the 1/10-scale car footprint.
@@ -121,11 +122,11 @@ class SimParams:
     STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 0.5, 0.5])  # q, zeta, s1, s2, s3
     ALPHARACER_PARAMS = STATIC_POLICY_PARAMS  # backward-compatible name
     POTENTIAL_FUNCTION_WEIGHT_PATH = "alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth"
-    POTENTIAL_FUNCTION_Q = 1.0
+    POTENTIAL_FUNCTION_OPT_STYLE = "grad"  # Paper/default upstream online optimizer.
+    POTENTIAL_FUNCTION_GRADIENT_RATE = 1e-4
     POTENTIAL_FUNCTION_SEARCH_POINTS = 7
-    POTENTIAL_FUNCTION_SEARCH_ITERS = 1
+    POTENTIAL_FUNCTION_SEARCH_ITERS = 6
     ALPHARACER_WEIGHT_PATH = POTENTIAL_FUNCTION_WEIGHT_PATH  # backward-compatible name
-    ALPHARACER_WEIGHT_Q = POTENTIAL_FUNCTION_Q
     ALPHARACER_WEIGHT_SEARCH_POINTS = POTENTIAL_FUNCTION_SEARCH_POINTS
     ALPHARACER_WEIGHT_SEARCH_ITERS = POTENTIAL_FUNCTION_SEARCH_ITERS
     LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3

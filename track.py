@@ -12,6 +12,7 @@ class TrackSpec:
     centerline: str
     raceline: str
     scale: float = 1.0
+    half_width: float = 0.5
 
 
 # alpha-RACER's numerical simulator applies track_info.scale=2.0 to Berlin.
@@ -23,16 +24,19 @@ TRACKS: Mapping[str, TrackSpec] = {
         "track_csv/berlin_2018.csv",
         "track_csv/berlin_2018_raceline_with_speeds.csv",
         2.0,
+        0.44,
     ),
     "modena": TrackSpec(
         "track_csv/modena_2019.csv",
         "track_csv/modena_2019_with_speeds.csv",
         2.0,
+        0.37,
     ),
     "rounded_rectangle": TrackSpec(
         "track_csv/rounded_rectangle.csv",
         "track_csv/rounded_rectangle_with_speeds.csv",
         1.0,
+        0.50,
     ),
 }
 
@@ -63,7 +67,13 @@ def configure_track(sim_params, name: str = "berlin", *, scale: float = None) ->
             raise FileNotFoundError(f"Track file is missing: {filename}")
     sim_params.TRACK_CSV = spec.centerline
     sim_params.RACELINE_CSV = spec.raceline
-    sim_params.TRACK_SCALE = spec.scale if scale is None else float(scale)
+    applied_scale = spec.scale if scale is None else float(scale)
+    applied_half_width = spec.half_width * applied_scale / spec.scale
+    sim_params.TRACK_SCALE = applied_scale
+    sim_params.TRACK_HALF_WIDTH = applied_half_width
+    sim_params.TRACK_WIDTH = 2.0 * applied_half_width
+    sim_params.MPC_CONSTRAINT_HALF_WIDTH = applied_half_width
+    sim_params.REF_LATERAL_CLIP = applied_half_width
     return spec
 
 
@@ -346,7 +356,10 @@ def main():
     args = _parse_args()
     if args.list:
         for name, spec in TRACKS.items():
-            print(f"{name}: scale={spec.scale:g}, centerline={spec.centerline}, raceline={spec.raceline}")
+            print(
+                f"{name}: scale={spec.scale:g}, half_width={spec.half_width:g}, "
+                f"centerline={spec.centerline}, raceline={spec.raceline}"
+            )
         return
 
     from simulation import run_simulation
