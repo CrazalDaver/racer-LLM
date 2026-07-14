@@ -1,8 +1,70 @@
+import argparse
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Mapping, Tuple
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class TrackSpec:
+    centerline: str
+    raceline: str
+    scale: float = 1.0
+
+
+# alpha-RACER's numerical simulator applies track_info.scale=2.0 to Berlin.
+# Modena uses the same 1:31 source-to-ref_trajs conversion, so it follows the
+# same numerical scaling. Rounded rectangle uses a separate 1:10 conversion
+# and already has a 0.5 m half-width at scale 1.0.
+TRACKS: Mapping[str, TrackSpec] = {
+    "berlin": TrackSpec(
+        "track_csv/berlin_2018.csv",
+        "track_csv/berlin_2018_raceline_with_speeds.csv",
+        2.0,
+    ),
+    "modena": TrackSpec(
+        "track_csv/modena_2019.csv",
+        "track_csv/modena_2019_with_speeds.csv",
+        2.0,
+    ),
+    "rounded_rectangle": TrackSpec(
+        "track_csv/rounded_rectangle.csv",
+        "track_csv/rounded_rectangle_with_speeds.csv",
+        1.0,
+    ),
+}
+
+TRACK_ALIASES = {
+    "berlin_2018": "berlin",
+    "modena_2019": "modena",
+    "rounded-rectangle": "rounded_rectangle",
+    "rectangle": "rounded_rectangle",
+}
+
+
+def get_track_spec(name: str = "berlin") -> TrackSpec:
+    """Return a registered alpha-RACER track configuration."""
+    key = str(name).strip().lower()
+    key = TRACK_ALIASES.get(key, key)
+    try:
+        return TRACKS[key]
+    except KeyError as exc:
+        choices = ", ".join(TRACKS)
+        raise ValueError(f"Unknown track {name!r}; choose one of: {choices}") from exc
+
+
+def configure_track(sim_params, name: str = "berlin", *, scale: float = None) -> TrackSpec:
+    """Apply a registered track to the mutable simulation parameters."""
+    spec = get_track_spec(name)
+    for filename in (spec.centerline, spec.raceline):
+        if not Path(filename).is_file():
+            raise FileNotFoundError(f"Track file is missing: {filename}")
+    sim_params.TRACK_CSV = spec.centerline
+    sim_params.RACELINE_CSV = spec.raceline
+    sim_params.TRACK_SCALE = spec.scale if scale is None else float(scale)
+    return spec
 
 
 class ProjectablePath:
@@ -221,6 +283,16 @@ def load_centerline_csv(path, scale: float = 1.0) -> np.ndarray:
 def load_raceline_csv(path, scale: float = 1.0) -> RaceLine:
     data = np.genfromtxt(Path(path), delimiter=",", comments="#")
     data = np.asarray(data, dtype=float)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    # Some upstream alpha-RACER files have an uncommented text header.
+    data = data[np.all(np.isfinite(data), axis=1)]
+    if data.shape[1] == 3:
+        # Native alpha-RACER layout: x_m, y_m, vx_mps.  RaceLine uses an
+        # explicit progress column, so derive it from consecutive points.
+        xy = data[:, :2]
+        s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))]
+        data = np.column_stack([s, xy, data[:, 2]])
     scaled = data.copy()
     scaled[:, 0] *= float(scale)
     scaled[:, 1:3] *= float(scale)
@@ -251,3 +323,47 @@ def _unwrap_progress(s: float, s_hint: float, total_length: float) -> float:
         math.sin((s - s_hint) * 2.0 * math.pi / total_length),
         math.cos((s - s_hint) * 2.0 * math.pi / total_length),
     ) * total_length / (2.0 * math.pi)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Run simulation.py on a selectable alpha-RACER track.")
+    parser.add_argument("--track", default="berlin", help="berlin (default), modena, or rounded_rectangle")
+    parser.add_argument("--list", action="store_true", help="list registered tracks and exit")
+    parser.add_argument("--scale", type=float, default=None, help="override the selected track's configured scale")
+    parser.add_argument("--policy", default="centerline")
+    parser.add_argument("--policies", nargs="+", default=None, help="optional per-car policy names")
+    parser.add_argument("--num-cars", type=int, default=None)
+    parser.add_argument("--vehicle-model", choices=["kinematic", "dbm"], default=None)
+    parser.add_argument("--v0", type=float, default=0.0)
+    parser.add_argument("--ego-position", type=int, default=1)
+    parser.add_argument("--no-trace", action="store_true")
+    parser.add_argument("--no-plot", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    """Command-line entry point for selecting a track and running simulation."""
+    args = _parse_args()
+    if args.list:
+        for name, spec in TRACKS.items():
+            print(f"{name}: scale={spec.scale:g}, centerline={spec.centerline}, raceline={spec.raceline}")
+        return
+
+    from simulation import run_simulation
+
+    run_simulation(
+        policy_type=args.policy,
+        track_name=args.track,
+        track_scale=args.scale,
+        policy_names=args.policies,
+        num_cars=args.num_cars,
+        vehicle_model_type=args.vehicle_model,
+        v0=args.v0,
+        ego_position=args.ego_position,
+        save_trace=not args.no_trace,
+        show_plot=not args.no_plot,
+    )
+
+
+if __name__ == "__main__":
+    main()

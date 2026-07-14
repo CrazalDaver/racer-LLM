@@ -8,12 +8,13 @@ from policies import (
     CenterLinePolicy,
     IBRBaselinePolicy,
     LLMAlphaRacerPolicy,
+    RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
     WeightedAlphaRacerPolicy,
     plan_ibr_joint_actions,
 )
 from state import CarState
-from track import Track, load_centerline_csv, load_raceline_csv
+from track import Track, configure_track, load_centerline_csv, load_raceline_csv
 from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
 
 try:
@@ -58,6 +59,13 @@ def _normalize_policy_name(policy_name):
         "llm_alpharacer": "llm_alpharacer",
         "llmalpha": "llm_alpharacer",
         "llmalpharacer": "llm_alpharacer",
+
+        "rule": "rule_based_safeguard",
+        "rules": "rule_based_safeguard",
+        "rule_based": "rule_based_safeguard",
+        "rule_based_safeguard": "rule_based_safeguard",
+        "safeguard_baseline": "rule_based_safeguard",
+        "decision_tree": "rule_based_safeguard",
 
         "rl": "self_play_rl",
         "ppo": "self_play_rl",
@@ -181,6 +189,27 @@ def create_policy(
             ),
             history_length=params.LLM_HISTORY_LENGTH,
             output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode,
+        )
+    if policy_type == "rule_based_safeguard":
+        return RuleBasedSafeguardPolicy(
+            track,
+            mpc,
+            step_distance=params.DT * params.MAX_RACELINE_SPEED,
+            car_idx=car_idx,
+            policy_name=policy_type,
+            params=np.asarray(
+                params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params,
+                dtype=float,
+            ).copy(),
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
+            update_interval_steps=(
+                params.LLM_UPDATE_INTERVAL_STEPS
+                if llm_update_interval_steps is None
+                else llm_update_interval_steps
+            ),
+            history_length=params.LLM_HISTORY_LENGTH,
         )
     if policy_type == "weighted_alpharacer":
         return WeightedAlphaRacerPolicy(
@@ -331,6 +360,8 @@ def save_simulation_trace(trace, track, params):
 
 def run_simulation(
     policy_type="centerline",
+    track_name=None,
+    track_scale=None,
     save_trace=True,
     show_plot=True,
     num_cars=None,
@@ -353,6 +384,11 @@ def run_simulation(
     horizon=None,
     ego_position=1,
 ):
+    if track_name is not None:
+        configure_track(params, track_name, scale=track_scale)
+    elif track_scale is not None:
+        params.TRACK_SCALE = float(track_scale)
+
     waypoints = load_centerline_csv(params.TRACK_CSV, scale=params.TRACK_SCALE)
     raceline = load_raceline_csv(params.RACELINE_CSV, scale=params.TRACK_SCALE)
     track = Track(waypoints)
@@ -536,24 +572,15 @@ def run_simulation(
         "vehicle_model": vehicle_model_type,
     }
 
-    if policy_names is not None:
-        print(
-            f"Simulation with per-car policies {resolved_policy_names} "
-            f"and {vehicle_model_type} vehicle model started for {num_cars} cars..."
-        )
-        if any(name == "llm_alpharacer" for name in resolved_policy_names):
-            print(f"LLM models by car: {trace['llm_model_names']}")
-            print(f"LLM temperatures by car: {trace['llm_temperatures']}")
-    elif resolved_policy_names[0] == "llm_alpharacer" and any(name == "ibr" for name in resolved_policy_names[1:]):
-        print(
-            f"Simulation with ego LLM policy, IBR baseline opponents, "
-            f"and {vehicle_model_type} vehicle model started for {num_cars} cars..."
-        )
-    else:
-        print(
-            f"Simulation with {resolved_policy_names[0]} policy and "
-            f"{vehicle_model_type} vehicle model started for {num_cars} cars..."
-        )
+    print(
+        "Simulation setup: "
+        f"track={params.TRACK_CSV}, scale={params.TRACK_SCALE:g}, "
+        f"policies={resolved_policy_names}, ego_start_position={ego_position}/{num_cars}, "
+        f"vehicle_model={vehicle_model_type}"
+    )
+    if any(name == "llm_alpharacer" for name in resolved_policy_names):
+        print(f"LLM models by car: {trace['llm_model_names']}")
+        print(f"LLM temperatures by car: {trace['llm_temperatures']}")
     progress_iter = range(total_steps)
     progress_bar = None
     if tqdm is not None:
@@ -767,9 +794,15 @@ def run_simulation(
             velocities.append(states[ego_idx].vx)
 
         if (step + 1) % 200 == 0:
+            current_position = 1 + sum(
+                progress_s[car_idx] > progress_s[ego_idx]
+                for car_idx in range(num_cars)
+                if car_idx != ego_idx
+            )
             message = (
                 f"Step {step+1}/{total_steps}, t={(step+1)*params.DT:.1f}s, "
-                f"ego={ego_position}, vx={states[ego_idx].vx:.2f} m/s, e={next_e[ego_idx]:.3f}, "
+                f"position={current_position}/{num_cars}, "
+                f"vx={states[ego_idx].vx:.2f} m/s, e={next_e[ego_idx]:.3f}, "
                 f"throttle={actions[ego_idx].throttle:.2f}, steer={actions[ego_idx].steer:.2f}"
             )
             if progress_bar is not None:
@@ -847,6 +880,7 @@ def run_simulation(
 if __name__ == "__main__":
     # Options: "centerline", "alpharacer", "ibr", or "llm_alpharacer"
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
+    # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
     # # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
     # run_simulation(
@@ -891,8 +925,9 @@ if __name__ == "__main__":
  
     # LLM vs alphaRacer opponents
     run_simulation(
-        policy_names=["LLM", "weighted_alpharacer", "weighted_alpharacer"],  # ego, oppo1, oppo2
+        track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
+        policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:0.5b", None, None],
-        vehicle_model_type="kinematic", ego_position=1, llm_update_interval_steps=50, 
+        vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
         llm_temperature = 1.0, 
     )

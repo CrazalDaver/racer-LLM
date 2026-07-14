@@ -1332,6 +1332,79 @@ class LLMAlphaRacerPolicy(LLMParameterPolicy):
     """Backward-compatible name for LLMParameterPolicy."""
 
 
+class RuleBasedSafeguardPolicy(LLMParameterPolicy):
+    """Deterministic ablation of the safeguarded discrete-mode LLM policy.
+
+    It observes the same Frenet interaction state, selects one of the exact
+    same five mode presets, and then passes the choice through the same mode
+    guard.  No language model or network request is used.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs["model_name"] = "rule_based_safeguard"
+        kwargs["output_mode"] = "mode"
+        kwargs["temperature"] = 0.0
+        super().__init__(*args, **kwargs)
+        self.last_rule_params = self.params.copy()
+
+    def _select_rule_mode(self, state: CarState, current_s: float, opponents=None) -> str:
+        context = self._mode_context(state, current_s, opponents)
+        nearest_delta = context["nearest_delta"]
+        nearest_lateral_gap = context["nearest_lateral_gap"]
+        near_contact = nearest_delta is not None and abs(nearest_delta) < 0.7
+        near_overlap = (
+            nearest_delta is not None
+            and abs(nearest_delta) < 0.8
+            and nearest_lateral_gap is not None
+            and nearest_lateral_gap < 0.6
+        )
+        tiny_front_gap = (
+            context["nearest_front_delta"] is not None
+            and context["nearest_front_delta"] < 0.6
+            and context["nearest_front_lateral_gap"] is not None
+            and context["nearest_front_lateral_gap"] < 0.25
+        )
+
+        heading_error = abs(self._track_heading_error(state.psi, current_s))
+        lookahead_s = current_s + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon
+        lookahead_curvature = abs(self._track_curvature_at(lookahead_s))
+        near_boundary = abs(context["current_py"]) >= 0.9 * self.mpc.track_half_width
+
+        # Ordered decision tree: recovery and collision avoidance have highest
+        # priority, followed by passing, defending, and clear-road pace.
+        if near_boundary or heading_error > 0.8 or (state.vx < 0.35 and near_contact):
+            return "recover"
+        if tiny_front_gap:
+            return "recover" if state.vx < 0.8 else "stable"
+        if context["close_slow_front"]:
+            return "overtake"
+        if near_overlap:
+            return "overtake" if context["slow_front"] and state.vx > 0.5 else "stable"
+        if context["faster_rear"]:
+            return "block"
+        front_clear = context["nearest_front_delta"] is None or context["nearest_front_delta"] > 4.0
+        if front_clear and state.vx > 1.0 and lookahead_curvature < 0.35:
+            return "push"
+        return "stable"
+
+    def update_params_from_rules(self, state: CarState, current_s: float, opponents=None):
+        self._llm_call_count += 1
+        if self._llm_call_count > 1 and (self._llm_call_count - 1) % self.update_interval_steps != 0:
+            self.params = self.last_rule_params.copy()
+            return
+
+        self.current_mode = self._select_rule_mode(state, current_s, opponents=opponents)
+        self.params = self.mode_presets[self.current_mode].copy()
+        self._apply_mode_guard(state, current_s, opponents=opponents)
+        self.last_rule_params = self.params.copy()
+
+    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
+        self.update_params_from_rules(state, current_s, opponents=opponents)
+        return ParameterizedAlphaRacerPolicy.get_reference_trajectory(
+            self, state, current_s, opponents=opponents
+        )
+
+
 class _LearnedAlphaPotentialFunction(nn.Module if nn is not None else object):
     """Neural network approximation of the alpha-potential function."""
 

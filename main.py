@@ -45,7 +45,19 @@ def _slug(text):
 
 def _policy_params_for_name(policy_names, snapshot):
     first_policy = _slug(policy_names[0]) if policy_names else "static"
-    if first_policy in {"llm", "llm-alpha", "llm-alpharacer", "llm_alpharacer", "llm_parameter_policy"}:
+    if first_policy in {
+        "llm",
+        "llm-alpha",
+        "llm-alpharacer",
+        "llm_alpharacer",
+        "llm_parameter_policy",
+        "rule",
+        "rules",
+        "rule-based",
+        "rule_based_safeguard",
+        "safeguard_baseline",
+        "decision_tree",
+    }:
         return snapshot["LLM_POLICY_PARAMS"]
     return snapshot.get("STATIC_POLICY_PARAMS", snapshot["ALPHARACER_PARAMS"])
 

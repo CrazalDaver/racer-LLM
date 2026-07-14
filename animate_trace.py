@@ -37,6 +37,8 @@ def _short_policy_name(name):
         return "Static"
     if key in {"potential_function_policy", "potential_function_min_policy", "weighted_alpharacer", "weighted"}:
         return "Potential"
+    if key in {"rule_based_safeguard", "rule_based", "rules", "decision_tree"}:
+        return "Rule+Guard"
     return str(name)
 
 
@@ -210,7 +212,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     llm_mode_indices = [
         idx
         for idx, name in enumerate(policy_names[:car_count])
-        if "llm" in name.lower()
+        if ("llm" in name.lower() or "rule_based_safeguard" in name.lower())
         and car_policy_mode is not None
         and np.any((car_policy_mode[:, idx] != "custom") & (car_policy_mode[:, idx] != "fixed"))
     ]

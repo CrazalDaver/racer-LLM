@@ -106,7 +106,7 @@ class SimParams:
     TRACE_OUTPUT = "simulation_trace.npz"
     VEHICLE_MODEL = "kinematic"
     NUM_CARS = 1
-    CAR_START_GAP = 3.0
+    CAR_START_GAP = 6.0
     UNSAFE_DISTANCE = 0.4
     EARLY_COLLISION_STOP = False # stop early if cars collide immediately after launch
     EARLY_COLLISION_WINDOW_STEPS = 150 # only apply early collision stop during the first N simulation steps

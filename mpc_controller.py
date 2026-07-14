@@ -288,7 +288,7 @@ class MPCController:
         # initial state constraint
         g_eq = [self.X[:, 0] - self.x0]
 
-        # dynamics constraints： x_{k+1} = f(x_k, u_k)
+        # dynamics constraints： x_{k+1} = f(x_k, u_k) (1b)
         for k in range(self.horizon):
             x_next = self._vehicle_dynamics(self.X[:, k], self.U[:, k])
             g_eq.append(self.X[:, k + 1] - x_next)
@@ -319,6 +319,8 @@ class MPCController:
                     (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
                     + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
                 )
+
+                # Enforce the MPC track boundary constraint (1f)
                 g_ineq.append(lateral_e - self.track_constraint_half_width)
                 g_ineq.append(-lateral_e - self.track_constraint_half_width)
 
@@ -349,6 +351,8 @@ class MPCController:
             else:
                 du = self.U[:, k] - self.U[:, k - 1]
             action_cost += du.T @ self.R @ du
+
+            # Control rate constraints (1d)-(1e)
             g_ineq.append(du[1] - self.max_steer_rate)
             g_ineq.append(-du[1] - self.max_steer_rate)
 
