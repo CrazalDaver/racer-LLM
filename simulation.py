@@ -165,7 +165,6 @@ def create_policy(
         return StaticAlphaRacerPolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
             params=np.asarray(
@@ -180,7 +179,6 @@ def create_policy(
         return LLMAlphaRacerPolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
             params=np.asarray(
@@ -206,7 +204,6 @@ def create_policy(
         return RuleBasedSafeguardPolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
             params=np.asarray(
@@ -227,7 +224,6 @@ def create_policy(
         return AlphaRacerPolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
             params=np.asarray(
@@ -247,7 +243,6 @@ def create_policy(
         return SelfPlayRLPolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
             params=np.asarray(
@@ -276,7 +271,6 @@ def create_policy(
         return IBRBaselinePolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
             q=params.IBR_PARAMS[0],
@@ -339,6 +333,10 @@ def save_simulation_trace(trace, track, params):
         policy_names=np.asarray(trace.get("policy_names", [])),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
+        llm_raw_call_indices=np.asarray(trace.get("llm_raw_call_indices", []), dtype=int),
+        llm_raw_prompts=np.asarray(trace.get("llm_raw_prompts", []), dtype=str),
+        llm_raw_responses=np.asarray(trace.get("llm_raw_responses", []), dtype=str),
+        llm_raw_errors=np.asarray(trace.get("llm_raw_errors", []), dtype=str),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
@@ -853,6 +851,26 @@ def run_simulation(
     final_time = last_step * params.DT if last_step >= 0 else 0.0
     for policy in policies:
         policy.flush_solver_warnings(sim_time=final_time)
+
+    # Save the latest five actual LLM calls per car. Padding keeps these as
+    # regular string arrays that np.load can read without allow_pickle=True.
+    raw_histories = [getattr(policy, "llm_raw_io_history", [])[-5:] for policy in policies]
+    trace["llm_raw_call_indices"] = [
+        [-1] * (5 - len(history)) + [item["call"] for item in history]
+        for history in raw_histories
+    ]
+    trace["llm_raw_prompts"] = [
+        [""] * (5 - len(history)) + [item["prompt"] for item in history]
+        for history in raw_histories
+    ]
+    trace["llm_raw_responses"] = [
+        [""] * (5 - len(history)) + [item["response"] for item in history]
+        for history in raw_histories
+    ]
+    trace["llm_raw_errors"] = [
+        [""] * (5 - len(history)) + [item["error"] for item in history]
+        for history in raw_histories
+    ]
 
     if save_trace:
         save_simulation_trace(trace, track, params)

@@ -47,5 +47,5 @@ Output rules:
 {"mode":"stable"}
 """
 
-PARAMETER temperature 0
+PARAMETER temperature 1.0
 PARAMETER num_predict 32

@@ -23,10 +23,9 @@ from track import RaceLine, Track
 class BasePolicy(abc.ABC):
     """Common interface and observable state shared by every driving policy."""
 
-    def __init__(self, track: Track, mpc, step_distance: float = 0.1, car_idx=None, policy_name=None):
+    def __init__(self, track: Track, mpc, car_idx=None, policy_name=None):
         self.track = track
         self.mpc = mpc
-        self.step_distance = step_distance
         self.car_idx = car_idx
         self.policy_name = policy_name
         car_label = "car?" if car_idx is None else f"car{car_idx}"
@@ -67,8 +66,8 @@ class MPCPolicy(BasePolicy):
     Subclasses implement get_reference_trajectory to provide a reference trajectory.
     """
 
-    def __init__(self, track: Track, mpc, step_distance: float = 0.1, car_idx=None, policy_name=None):
-        super().__init__(track, mpc, step_distance, car_idx=car_idx, policy_name=policy_name)
+    def __init__(self, track: Track, mpc, car_idx=None, policy_name=None):
+        super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
         self.last_u = np.array([0.0, self._neutral_steer_command()])
 
         # MPC failure and stall reporting state
@@ -298,6 +297,10 @@ class MPCPolicy(BasePolicy):
 
 class CenterLinePolicy(MPCPolicy):
     # Simple baseline policy that tracks the centerline at a constant reference speed.
+    def __init__(self, track: Track, mpc, step_distance: float = 0.1, car_idx=None, policy_name=None):
+        super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
+        self.step_distance = float(step_distance)
+
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         horizon = self.mpc.horizon
         ref = np.zeros((8, horizon + 1))
@@ -331,7 +334,6 @@ class AlphaRacerReferencePolicy(BasePolicy):
         self,
         track,
         mpc,
-        step_distance=1.2, # larger step distance to match the original alpha-RACER policy's raceline lookahead
         params=None,
         raceline: RaceLine = None,
         max_speed=5.0,
@@ -339,8 +341,10 @@ class AlphaRacerReferencePolicy(BasePolicy):
         car_idx=None,
         policy_name=None,
     ):
-        super().__init__(track, mpc, step_distance, car_idx=car_idx, policy_name=policy_name)
+        super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
         self.params = params if params is not None else np.array([1.0, 1.0, 0, 0, 0])
+        if raceline is None:
+            raise ValueError("AlphaRacerReferencePolicy requires a raceline")
         self.raceline = raceline
         self.max_speed = max_speed
         if ref_lateral_clip is None:
@@ -501,79 +505,68 @@ class AlphaRacerReferencePolicy(BasePolicy):
         return p_ot, p_bl
 
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
+        """
+        Compute the reference trajectory: p^ref = p^* + p^ot + p^bl,
+        where p^* is the raceline reference,
+        p^ot is the overtaking offset, and p^bl is the blocking offset.
+        The reference trajectory is returned in Frenet coordinates relative to the track centerline.
+        """
         horizon = self.mpc.horizon
         q, zeta, s1, s2, s3 = self.params
         ref = np.zeros((8, horizon + 1))
         ref_world = np.zeros((2, horizon + 1))
         raceline_world = np.full((2, horizon + 1), np.nan)
+        
+        # Select the nearest leading and trailing opponents (j^*, j_*)
         selected_opponents = self._closest_opponents(current_s, opponents)
-        if self.raceline is not None:
-            raceline_s = self._nearest_raceline_s(state)
-            self.last_raceline_s = raceline_s
-            _, ego_py_t = self.track.project(
-                state.x,
-                state.y,
-                s_hint=current_s,
-                search_radius=8.0,
-                psi_hint=state.psi,
-                max_heading_error=math.pi / 2.0,
-            )
-            source_s = raceline_s + self._raceline_lookahead_distance(state)
-            center_hint = current_s
+        raceline_s = self._nearest_raceline_s(state)
+        self.last_raceline_s = raceline_s
+        _, ego_py_t = self.track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=8.0,
+            psi_hint=state.psi,
+            max_heading_error=math.pi / 2.0,
+        )
+        source_s = raceline_s + self._raceline_lookahead_distance(state)
+        center_hint = current_s
         for k in range(horizon + 1):
-            if self.raceline is not None:
-                frenet = self._raceline_frenet_point(source_s, center_hint=center_hint)
-                center_hint = frenet["track_s"]
-                raceline_speed_k = max(frenet["speed"], 0.0)
-                p_pert_x = frenet["track_s"]
-                p_pert_y = frenet["lateral_e"]
-                p_ot, p_bl = self._competitive_offsets(
-                    p_pert_x,
-                    p_pert_y,
-                    zeta * raceline_speed_k,
-                    ego_py_t,
-                    selected_opponents,
-                    k,
-                )
-                p_ref_y = float(np.clip(
-                    p_pert_y + p_ot + p_bl,
-                    -self._ref_lateral_limit(),
-                    self._ref_lateral_limit(),
-                ))
-                xc, yc = frenet["center_x"], frenet["center_y"]
-                psi_center = frenet["psi_center"]
-                ref_world[:, k] = [
-                    xc + p_ref_y * frenet["normal_x"],
-                    yc + p_ref_y * frenet["normal_y"],
-                ]
-                raceline_world[:, k] = [frenet["world_x"], frenet["world_y"]]
-                ref[0, k] = p_pert_x
-                ref[1, k] = p_ref_y
-                ref[2, k] = raceline_speed_k
-                ref[3, k] = psi_center
-                ref[4, k] = xc
-                ref[5, k] = yc
-                ref[6, k] = -math.sin(psi_center)
-                ref[7, k] = math.cos(psi_center)
+            frenet = self._raceline_frenet_point(source_s, center_hint=center_hint)
+            center_hint = frenet["track_s"]
+            raceline_speed_k = max(frenet["speed"], 0.0)
+            p_pert_x = frenet["track_s"]
+            p_pert_y = frenet["lateral_e"]
+            p_ot, p_bl = self._competitive_offsets(
+                p_pert_x,
+                p_pert_y,
+                zeta * raceline_speed_k,
+                ego_py_t,
+                selected_opponents,
+                k,
+            )
+            p_ref_y = float(np.clip(
+                p_pert_y + p_ot + p_bl,
+                -self._ref_lateral_limit(),
+                self._ref_lateral_limit(),
+            ))
+            xc, yc = frenet["center_x"], frenet["center_y"]
+            psi_center = frenet["psi_center"]
+            ref_world[:, k] = [
+                xc + p_ref_y * frenet["normal_x"],
+                yc + p_ref_y * frenet["normal_y"],
+            ]
+            raceline_world[:, k] = [frenet["world_x"], frenet["world_y"]]
+            ref[0, k] = p_pert_x
+            ref[1, k] = p_ref_y
+            ref[2, k] = raceline_speed_k
+            ref[3, k] = psi_center
+            ref[4, k] = xc
+            ref[5, k] = yc
+            ref[6, k] = -math.sin(psi_center)
+            ref[7, k] = math.cos(psi_center)
 
-                source_s += zeta * raceline_speed_k * self.mpc.dt
-            else:
-                s = current_s + k * self.step_distance
-                xc, yc, psi = self.track.interpolate(s)
-                offset = np.clip(
-                    s1 * math.sin(s3 * s) * math.exp(-s2 * s),
-                    -self._ref_lateral_limit(),
-                    self._ref_lateral_limit(),
-                )
-                ref[0, k] = s % self.track.total_length
-                ref[1, k] = offset
-                ref[2, k] = state.vx
-                ref[3, k] = psi
-                ref[4, k] = xc
-                ref[5, k] = yc
-                ref[6, k] = -math.sin(psi)
-                ref[7, k] = math.cos(psi)
-                ref_world[:, k] = self.track.frenet_to_world(ref[0, k], ref[1, k])
+            source_s += zeta * raceline_speed_k * self.mpc.dt
         self.last_ref_world_horizon = ref_world
         self.last_raceline_world_horizon = raceline_world
         return ref
@@ -968,6 +961,8 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         if self.output_mode not in {"mode", "params"}:
             raise ValueError(f"Unknown LLM output mode: {output_mode}")
         self.llm_decision_history = []
+        self.llm_raw_io_history = []
+        self._last_raw_llm_response = ""
         self._llm_call_count = 0
         self.param_bounds = param_bounds if param_bounds is not None else {
             "q": (0.05, 20.0),
@@ -1158,6 +1153,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             return json.loads(match.group(0))
 
     def _query_llm(self, prompt: str) -> dict:
+        self._last_raw_llm_response = ""
         payload = {
             "model": self.model_name,
             "prompt": prompt,
@@ -1174,8 +1170,21 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         )
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             raw = response.read().decode("utf-8")
+            # print(raw)
         body = json.loads(raw)
-        return self._extract_json(body.get("response", ""))
+        self._last_raw_llm_response = str(body.get("response", ""))
+        return self._extract_json(self._last_raw_llm_response)
+
+    def _record_llm_raw_io(self, prompt: str, error=None):
+        self.llm_raw_io_history.append(
+            {
+                "call": self._llm_call_count,
+                "prompt": prompt,
+                "response": self._last_raw_llm_response,
+                "error": "" if error is None else str(error),
+            }
+        )
+        self.llm_raw_io_history = self.llm_raw_io_history[-5:]
 
     def _sanitize_params(self, raw_params: dict) -> np.ndarray:
         
@@ -1307,6 +1316,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             return
 
         prompt = self._prompt(state, current_s, opponents=opponents)
+        self._last_raw_llm_response = ""
         try:
             raw_params = self._query_llm(prompt)
             self.params = self._sanitize_params(raw_params)
@@ -1316,7 +1326,9 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
             self.last_llm_params = self.params.copy()
             self.last_llm_error = None
             self._record_llm_decision()
+            self._record_llm_raw_io(prompt)
         except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, KeyError) as exc:
+            self._record_llm_raw_io(prompt, error=exc)
             self.last_llm_error = str(exc)
             self.params = self.last_llm_params.copy()
             if not self._warned_llm_error:
