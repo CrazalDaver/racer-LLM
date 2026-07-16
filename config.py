@@ -93,7 +93,7 @@ class SimParams:
     MPC_HORIZON = 8
 
     Q = np.diag([1.0, 1.0])
-    R = np.diag([1.0, 1.0]) * 1e-6
+    R = np.diag([1.0, 1.0]) #* 1e-6
 
     VELOCITY_TRACK_WEIGHT = 0.0 # weight for velocity tracking in MPC cost
     HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost

@@ -321,7 +321,7 @@ class CenterLinePolicy(MPCPolicy):
         return ref
 
 
-class AlphaRacerReferencePolicy(BasePolicy):
+class RefTrajPolicy(BasePolicy):
     """
     Shared alpha-RACER reference-trajectory logic parameterized by
     theta=(q, zeta, s1, s2, s3).
@@ -344,7 +344,7 @@ class AlphaRacerReferencePolicy(BasePolicy):
         super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
         self.params = params if params is not None else np.array([1.0, 1.0, 0, 0, 0])
         if raceline is None:
-            raise ValueError("AlphaRacerReferencePolicy requires a raceline")
+            raise ValueError("RefTrajPolicy requires a raceline")
         self.raceline = raceline
         self.max_speed = max_speed
         if ref_lateral_clip is None:
@@ -370,13 +370,13 @@ class AlphaRacerReferencePolicy(BasePolicy):
         )
         return float(self.raceline.s[self.last_raceline_idx])
 
-    def _raceline_frenet_state(self, raceline_s: float, center_hint: float = None) -> dict:
+    def _raceline_frenet_state(self, raceline_s: float, centerline_s_hint: float = None) -> dict:
         # Given an s value along the raceline, compute the corresponding Frenet state relative to the track centerline.
         point = self.raceline.interpolate(raceline_s)  # Get the raceline point in world coordinates.
         center_s, lateral_e = self.track.project(
             point["x_m"],
             point["y_m"],
-            s_hint=center_hint,
+            s_hint=centerline_s_hint,
             search_radius=8.0,
             psi_hint=point["psi_rad"],
             max_heading_error=math.pi / 2.0,
@@ -393,12 +393,12 @@ class AlphaRacerReferencePolicy(BasePolicy):
             "normal_y": math.cos(psi_center),
         }
 
-    def _raceline_frenet_point(self, raceline_s: float, center_hint: float = None) -> dict:
+    def _raceline_frenet_point(self, raceline_s: float, centerline_s_hint: float = None) -> dict:
         point = self.raceline.interpolate(raceline_s)  # Get the raceline point in world coordinates.
         center_s, lateral_e = self.track.project(
             point["x_m"],
             point["y_m"],
-            s_hint=center_hint,
+            s_hint=centerline_s_hint,
             search_radius=8.0,
             psi_hint=point["psi_rad"],
             max_heading_error=math.pi / 2.0,
@@ -474,21 +474,13 @@ class AlphaRacerReferencePolicy(BasePolicy):
         opponents,
         k: int,
     ) -> tuple:
+        """Return the paper's overtaking and blocking offsets."""
         _, _, s1, s2, s3 = self.params
         p_ot = 0.0
         p_bl = 0.0
 
         for opponent in opponents:
-            plan_idx = None
-            if "px_plan" in opponent:
-                plan_idx = min(k, len(opponent["px_plan"]) - 1)
-            opp_px = (
-                opponent["px_plan"][plan_idx]
-                if plan_idx is not None
-                else opponent["px"] + k * self.mpc.dt * opponent["vx"]
-            )
-            opp_py = opponent["py_plan"][plan_idx] if plan_idx is not None and "py_plan" in opponent else opponent["py"]
-            opp_vx = opponent["vx_plan"][plan_idx] if plan_idx is not None and "vx_plan" in opponent else opponent["vx"]
+            opp_px, opp_py, opp_vx = self._predict_opponent(opponent, k)
             dx = self._progress_delta(p_pert_x, opp_px)
             dy_current = ego_py_t - opp_py
             ot_mag = max((s1 - abs(dy_current)) * math.exp(-s2 * dx * dx), 0.0)
@@ -503,6 +495,33 @@ class AlphaRacerReferencePolicy(BasePolicy):
                 p_bl += (opp_py - p_pert_y) * speed_factor * proximity
 
         return p_ot, p_bl
+
+    def _predict_opponent(self, opponent, k: int) -> tuple:
+        """Predict one opponent at horizon step ``k``.
+
+        The paper assumes constant longitudinal velocity and lateral position.
+        Explicit plans, when supplied by another planner, take precedence.
+        """
+        opponent_vx = float(opponent.get("vx", 0.0))
+        plan = opponent.get("plan")
+        plan_idx = None
+        if plan is not None and len(plan):
+            row = plan[min(k, len(plan) - 1)]
+            opponent_px = float(row[0])
+        elif "px_plan" in opponent and len(opponent["px_plan"]):
+            plan_idx = min(k, len(opponent["px_plan"]) - 1)
+            opponent_px = float(opponent["px_plan"][plan_idx])
+        else:
+            opponent_px = float(opponent["px"]) + k * self.mpc.dt * opponent_vx
+
+        opponent_py = float(opponent["py"])
+        opponent_vx_at_k = opponent_vx
+        if plan is None and plan_idx is not None:
+            if "py_plan" in opponent and len(opponent["py_plan"]):
+                opponent_py = float(opponent["py_plan"][min(plan_idx, len(opponent["py_plan"]) - 1)])
+            if "vx_plan" in opponent and len(opponent["vx_plan"]):
+                opponent_vx_at_k = float(opponent["vx_plan"][min(plan_idx, len(opponent["vx_plan"]) - 1)])
+        return opponent_px, opponent_py, opponent_vx_at_k
 
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         """
@@ -519,8 +538,9 @@ class AlphaRacerReferencePolicy(BasePolicy):
         
         # Select the nearest leading and trailing opponents (j^*, j_*)
         selected_opponents = self._closest_opponents(current_s, opponents)
-        raceline_s = self._nearest_raceline_s(state)
-        self.last_raceline_s = raceline_s
+        raceline_s = self._nearest_raceline_s(state)  # project to raceline
+        self.last_raceline_s = raceline_s  # cache for visualization
+        # project to centerline and get py/e for competitive offsets
         _, ego_py_t = self.track.project(
             state.x,
             state.y,
@@ -529,11 +549,14 @@ class AlphaRacerReferencePolicy(BasePolicy):
             psi_hint=state.psi,
             max_heading_error=math.pi / 2.0,
         )
-        source_s = raceline_s + self._raceline_lookahead_distance(state)
-        center_hint = current_s
+        source_raceline_s = raceline_s + self._raceline_lookahead_distance(state)
+        centerline_s_hint = current_s
         for k in range(horizon + 1):
-            frenet = self._raceline_frenet_point(source_s, center_hint=center_hint)
-            center_hint = frenet["track_s"]
+            frenet = self._raceline_frenet_point(
+                source_raceline_s,
+                centerline_s_hint=centerline_s_hint,
+            )
+            centerline_s_hint = frenet["track_s"]
             raceline_speed_k = max(frenet["speed"], 0.0)
             p_pert_x = frenet["track_s"]
             p_pert_y = frenet["lateral_e"]
@@ -566,13 +589,13 @@ class AlphaRacerReferencePolicy(BasePolicy):
             ref[6, k] = -math.sin(psi_center)
             ref[7, k] = math.cos(psi_center)
 
-            source_s += zeta * raceline_speed_k * self.mpc.dt
+            source_raceline_s += zeta * raceline_speed_k * self.mpc.dt
         self.last_ref_world_horizon = ref_world
         self.last_raceline_world_horizon = raceline_world
         return ref
 
 
-class ParameterizedAlphaRacerPolicy(AlphaRacerReferencePolicy, MPCPolicy):
+class ParameterizedAlphaRacerPolicy(RefTrajPolicy, MPCPolicy):
     """MPC-backed alpha-RACER policy with parameterized reference generation."""
 
 
@@ -585,7 +608,7 @@ class StaticAlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
     """
 
 
-class SelfPlayRLPolicy(AlphaRacerReferencePolicy):
+class SelfPlayRLPolicy(RefTrajPolicy):
     """
     Direct-action self-play RL baseline compatible with alpha-RACER's RL branch.
 
@@ -1526,61 +1549,12 @@ class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
             [
                 float(np.clip(2.0 * lookahead_factor, 1e-6, None)),
                 float(np.clip(speed_factor * speed_factor, 0.1, 3.0)),
-                float(np.clip(sf1, 0.0, self.mpc.track_half_width)),
+                float(max(sf1, 0.0)),
                 float(max(sf2, 1e-3)),
                 float(np.clip(blocking, 0.0, 5.0)),
             ],
             dtype=float,
         )
-
-    def _competitive_offsets(
-        self,
-        p_pert_x: float,
-        p_pert_y: float,
-        v_pert_x: float,
-        ego_py_t: float,
-        opponents,
-        k: int,
-    ) -> tuple:
-        """Paper alpha-RACER overtaking and blocking shift equations."""
-        sf1, sf2, _lookahead_factor, _speed_factor, blocking = self.original_params
-        t = k * self.mpc.dt
-        overtaking_shift = 0.0
-        blocking_shift = 0.0
-        for opponent in opponents:
-            opponent_vx = float(opponent.get("vx", 0.0))
-            opponent_py = float(opponent["py"])
-            plan = opponent.get("plan")
-            if plan is not None and len(plan):
-                opponent_px = float(plan[min(k, len(plan) - 1)][0])
-            else:
-                opponent_px = float(opponent["px"]) + opponent_vx * t
-
-            delta_x = self._progress_delta(p_pert_x, opponent_px)
-            lateral_gap = abs(ego_py_t - opponent_py)
-            magnitude = max(
-                (sf1 - lateral_gap) * math.exp(-sf2 * delta_x * delta_x),
-                0.0,
-            )
-            if ego_py_t > opponent_py:
-                overtaking_shift += magnitude
-            elif ego_py_t < opponent_py:
-                overtaking_shift -= magnitude
-
-            # The paper activates blocking for a faster trailing opponent.
-            # Writing the speed difference as v_opp-v_pert keeps the gain
-            # non-negative, as in the official executable implementation.
-            is_trailing = float(opponent.get("delta", 0.0)) < 0.0
-            speed_gap = opponent_vx - v_pert_x
-            ego_still_ahead = delta_x >= 0.0
-            if is_trailing and speed_gap > 0.0 and ego_still_ahead:
-                block_gain = 1.0 - math.exp(-blocking * speed_gap)
-                proximity = math.exp(-sf2 * delta_x * delta_x)
-                blocking_shift += (
-                    (opponent_py - p_pert_y) * block_gain * proximity
-                )
-
-        return overtaking_shift, blocking_shift
 
     def _wrap_delta(self, s_a, s_b):
         return self._progress_delta(float(s_a), float(s_b))
@@ -1994,7 +1968,7 @@ class _StrictIBRSolver:
         }
 
 
-class IteratedBestResponsePolicy(AlphaRacerReferencePolicy):
+class IteratedBestResponsePolicy(RefTrajPolicy):
     """
     IBR baseline policy in alpha-RACER paper (multi_car_comp_blocking.py).
     https://arxiv.org/abs/1801.02302 
