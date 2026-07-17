@@ -6,7 +6,7 @@ import numpy as np
 
 from config import params
 from plotting import compute_lap_stats
-from track import load_centerline_csv, load_raceline_csv
+from track import Track, load_centerline_csv, load_raceline_csv
 
 
 def _scalar_string(value, default):
@@ -105,6 +105,16 @@ def _mode_color(mode):
         "custom": "0.35",
         "fixed": "0.35",
     }.get(mode_key, "black")
+
+
+def _track_boundaries(waypoints, half_width):
+    """Sample the left and right edges of the closed centerline track."""
+    track = Track(waypoints)
+    sample_count = min(4000, max(500, len(waypoints) * 4))
+    progress = np.linspace(0.0, track.total_length, sample_count, endpoint=True)
+    left = np.asarray([track.frenet_to_world(s, half_width) for s in progress])
+    right = np.asarray([track.frenet_to_world(s, -half_width) for s in progress])
+    return left, right
 
 
 def load_trace(path):
@@ -226,6 +236,16 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
 
     frames = np.arange(0, len(time), max(1, stride))
     fig, ax = plt.subplots(figsize=(9, 8))
+    track_left, track_right = _track_boundaries(waypoints, track_half_width)
+    track_area, = ax.fill(
+        np.r_[track_left[:, 0], track_right[::-1, 0]],
+        np.r_[track_left[:, 1], track_right[::-1, 1]],
+        color="0.88",
+        edgecolor="0.55",
+        linewidth=0.8,
+        zorder=0,
+        label="Track area",
+    )
     track_line, = ax.plot(waypoints[:, 0], waypoints[:, 1], "k--", alpha=0.5, label="Track")
     raceline_line, = ax.plot(raceline.x, raceline.y, "m--", alpha=0.65, label="Raceline")
     full_traj, = ax.plot(x, y, color="0.75", linewidth=0.8, label="Full trajectory")
@@ -390,6 +410,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     legend_handles = [
         *opponent_points,
         car_point,
+        track_area,
         track_line,
         raceline_line,
         full_traj,
@@ -405,8 +426,10 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     ax.grid(alpha=0.2)
 
     margin = 1.0
-    ax.set_xlim(np.nanmin(waypoints[:, 0]) - margin, np.nanmax(waypoints[:, 0]) + margin)
-    ax.set_ylim(np.nanmin(waypoints[:, 1]) - margin, np.nanmax(waypoints[:, 1]) + margin)
+    boundary_x = np.r_[track_left[:, 0], track_right[:, 0]]
+    boundary_y = np.r_[track_left[:, 1], track_right[:, 1]]
+    ax.set_xlim(np.nanmin(boundary_x) - margin, np.nanmax(boundary_x) + margin)
+    ax.set_ylim(np.nanmin(boundary_y) - margin, np.nanmax(boundary_y) + margin)
 
     def update(frame_idx):
         i = int(frames[frame_idx])

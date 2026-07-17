@@ -6,13 +6,14 @@ from plotting import plot_simulation_results
 from policies import (
     AlphaRacerPolicy,
     CenterLinePolicy,
-    IBRBaselinePolicy,
+    IteratedBestResponsePolicy,
     LLMAlphaRacerPolicy,
     RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
     StaticAlphaRacerPolicy,
     plan_alpharacer_joint_params,
     plan_ibr_joint_actions,
+    progress_delta,
 )
 from state import CarState
 from track import Track, configure_track, load_centerline_csv, load_raceline_csv
@@ -22,13 +23,6 @@ try:
     from tqdm.auto import tqdm
 except ImportError:
     tqdm = None
-
-
-def progress_delta(s_a, s_b, total_length):
-    return np.arctan2(
-        np.sin((s_a - s_b) * 2.0 * np.pi / total_length),
-        np.cos((s_a - s_b) * 2.0 * np.pi / total_length),
-    ) * total_length / (2.0 * np.pi)
 
 
 def project_vehicle_state(track, state, s_hint, search_radius, max_heading_error):
@@ -147,6 +141,7 @@ def create_policy(
     llm_model_name=None,
     llm_temperature=None,
     llm_update_interval_steps=None,
+    llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
@@ -167,13 +162,8 @@ def create_policy(
             mpc,
             car_idx=car_idx,
             policy_name=policy_type,
-            params=np.asarray(
-                params.ALPHARACER_PARAMS if alpharacer_params is None else alpharacer_params,
-                dtype=float,
-            ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
-            ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
     if policy_type == "llm_alpharacer":
         return LLMAlphaRacerPolicy(
@@ -199,6 +189,11 @@ def create_policy(
             ),
             history_length=params.LLM_HISTORY_LENGTH,
             output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode,
+            safeguard_enabled=(
+                params.LLM_SAFEGUARD_ENABLED
+                if llm_safeguard_enabled is None
+                else llm_safeguard_enabled
+            ),
         )
     if policy_type == "rule_based_safeguard":
         return RuleBasedSafeguardPolicy(
@@ -268,21 +263,14 @@ def create_policy(
             steer_bounds=params.SELF_PLAY_RL_STEER_BOUNDS,
         )
     if policy_type == "ibr":
-        return IBRBaselinePolicy(
+        return IteratedBestResponsePolicy(
             track,
             mpc,
             car_idx=car_idx,
             policy_name=policy_type,
-            q=params.IBR_PARAMS[0],
-            zeta=params.IBR_PARAMS[1],
-            s1=params.IBR_PARAMS[2],
-            s2=params.IBR_PARAMS[3],
-            s3=params.IBR_PARAMS[4],
             iterations=params.IBR_ITERATIONS,
-            gamma=params.IBR_GAMMA,
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
-            ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
 
@@ -386,6 +374,7 @@ def run_simulation(
     llm_temperature=None,
     llm_temperatures=None,
     llm_update_interval_steps=None,
+    llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
@@ -482,6 +471,7 @@ def run_simulation(
                 llm_model_name=resolved_llm_model_names[car_idx],
                 llm_temperature=resolved_llm_temperatures[car_idx],
                 llm_update_interval_steps=llm_update_interval_steps,
+                llm_safeguard_enabled=llm_safeguard_enabled,
                 self_play_rl_model_path=self_play_rl_model_path,
                 self_play_rl_backend=self_play_rl_backend,
                 self_play_rl_strict_load=self_play_rl_strict_load,

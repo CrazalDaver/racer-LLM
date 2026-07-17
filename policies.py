@@ -20,8 +20,39 @@ from state import CarAction, CarState
 from track import RaceLine, Track
 
 
+def progress_delta(s_a: float, s_b: float, total_length: float) -> float:
+    """Signed shortest progress from ``s_b`` to ``s_a`` on a closed track."""
+    return math.atan2(
+        math.sin((s_a - s_b) * 2.0 * math.pi / total_length),
+        math.cos((s_a - s_b) * 2.0 * math.pi / total_length),
+    ) * total_length / (2.0 * math.pi)
+
+
+def angle_delta(angle_a: float, angle_b: float) -> float:
+    """Return the wrapped signed angle from ``angle_b`` to ``angle_a``."""
+    return math.atan2(math.sin(angle_a - angle_b), math.cos(angle_a - angle_b))
+
+
+def track_heading_error(track: Track, psi: float, s: float, reference_minus_heading: bool = True) -> float:
+    """Wrapped heading error relative to the centerline at progress ``s``."""
+    _, _, ref_psi = track.interpolate(s)
+    if reference_minus_heading:
+        return angle_delta(ref_psi, psi)
+    return angle_delta(psi, ref_psi)
+
+
+def track_curvature_at(track: Track, s: float, ds: float = 0.25) -> float:
+    """Estimate centerline curvature with a centered heading difference."""
+    _, _, psi_prev = track.interpolate(s - ds)
+    _, _, psi_next = track.interpolate(s + ds)
+    return angle_delta(psi_next, psi_prev) / (2.0 * ds)
+
+
 class BasePolicy(abc.ABC):
-    """Common interface and observable state shared by every driving policy."""
+    """
+    Common interface and observable state shared by every driving policy.
+    get_action: Return the control action selected by this policy (throttle, steering).
+    """
 
     def __init__(self, track: Track, mpc, car_idx=None, policy_name=None):
         self.track = track
@@ -29,6 +60,7 @@ class BasePolicy(abc.ABC):
         self.car_idx = car_idx
         self.policy_name = policy_name
         car_label = "car?" if car_idx is None else f"car{car_idx}"
+        # for logging and warning messages, include the policy name if provided
         self.warning_label = car_label if policy_name is None else f"{car_label}:{policy_name}"
 
         self.last_u = np.zeros(2, dtype=float)
@@ -321,13 +353,10 @@ class CenterLinePolicy(MPCPolicy):
         return ref
 
 
-class RefTrajPolicy(BasePolicy):
+class RefTrajPolicy(MPCPolicy):
     """
-    Shared alpha-RACER reference-trajectory logic parameterized by
-    theta=(q, zeta, s1, s2, s3).
-
-    This class deliberately does not choose an action. Direct-action policies
-    and MPC-backed policies can both reuse its track and interaction helpers.
+    MPC policy that tracks the alpha-RACER reference trajectory parameterized
+    by theta=(q, zeta, s1, s2, s3).
     """
 
     def __init__(
@@ -419,27 +448,6 @@ class RefTrajPolicy(BasePolicy):
             "world_y": point["y_m"],
         }
 
-    def _progress_delta(self, s_a: float, s_b: float) -> float:
-        # Compute the signed shortest distance along the track from s_b to s_a, handling wraparound.
-        return math.atan2(
-            math.sin((s_a - s_b) * 2.0 * math.pi / self.track.total_length),
-            math.cos((s_a - s_b) * 2.0 * math.pi / self.track.total_length),
-        ) * self.track.total_length / (2.0 * math.pi)
-
-    def _angle_delta(self, angle_a: float, angle_b: float) -> float:
-        return math.atan2(math.sin(angle_a - angle_b), math.cos(angle_a - angle_b))
-
-    def _track_heading_error(self, psi: float, s: float, reference_minus_heading: bool = True) -> float:
-        _, _, ref_psi = self.track.interpolate(s)
-        if reference_minus_heading:
-            return self._angle_delta(ref_psi, psi)
-        return self._angle_delta(psi, ref_psi)
-
-    def _track_curvature_at(self, s: float, ds: float = 0.25) -> float:
-        _, _, psi_prev = self.track.interpolate(s - ds)
-        _, _, psi_next = self.track.interpolate(s + ds)
-        return self._angle_delta(psi_next, psi_prev) / (2.0 * ds)
-
     def _sign(self, value: float) -> float:
         if value > 0.0:
             return 1.0
@@ -453,7 +461,7 @@ class RefTrajPolicy(BasePolicy):
 
         enriched = []
         for opponent in opponents:
-            delta = self._progress_delta(opponent["px"], current_s) # Positive delta means ahead
+            delta = progress_delta(opponent["px"], current_s, self.track.total_length) # Positive delta means ahead
             enriched.append({**opponent, "delta": delta})
 
         front = [op for op in enriched if op["delta"] > 0.0]
@@ -481,7 +489,7 @@ class RefTrajPolicy(BasePolicy):
 
         for opponent in opponents:
             opp_px, opp_py, opp_vx = self._predict_opponent(opponent, k)
-            dx = self._progress_delta(p_pert_x, opp_px)
+            dx = progress_delta(p_pert_x, opp_px, self.track.total_length)
             dy_current = ego_py_t - opp_py
             ot_mag = max((s1 - abs(dy_current)) * math.exp(-s2 * dx * dx), 0.0)
             p_ot += self._sign(dy_current) * ot_mag
@@ -595,11 +603,7 @@ class RefTrajPolicy(BasePolicy):
         return ref
 
 
-class ParameterizedAlphaRacerPolicy(RefTrajPolicy, MPCPolicy):
-    """MPC-backed alpha-RACER policy with parameterized reference generation."""
-
-
-class StaticAlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
+class StaticAlphaRacerPolicy(RefTrajPolicy):
     """
     Fixed-parameter controller from the alpha-RACER policy class.
 
@@ -608,7 +612,7 @@ class StaticAlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
     """
 
 
-class SelfPlayRLPolicy(RefTrajPolicy):
+class SelfPlayRLPolicy(BasePolicy):
     """
     Direct-action self-play RL baseline compatible with alpha-RACER's RL branch.
 
@@ -621,7 +625,12 @@ class SelfPlayRLPolicy(RefTrajPolicy):
 
     def __init__(
         self,
-        *args,
+        track,
+        mpc,
+        raceline: RaceLine = None,
+        max_speed=5.0,
+        car_idx=None,
+        policy_name=None,
         model=None,
         model_path=None,
         backend="auto",
@@ -635,9 +644,12 @@ class SelfPlayRLPolicy(RefTrajPolicy):
         action_scale=None,
         action_bias=None,
         fallback_gain=(0.4, 1.5),
-        **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
+        self.raceline = raceline
+        self.max_speed = float(max_speed)
+        self.last_raceline_s = None
+        self.last_raceline_idx = None
         self.current_mode = "self_play_rl"
         self.backend = str(backend or "auto").strip().lower()
         self.strict_load = bool(strict_load)
@@ -875,7 +887,7 @@ class SelfPlayRLPolicy(RefTrajPolicy):
             return None
         return min(
             opponents,
-            key=lambda opponent: abs(self._progress_delta(float(opponent["px"]), float(current_s))),
+            key=lambda opponent: abs(progress_delta(float(opponent["px"]), float(current_s), self.track.total_length)),
         )
 
     def _build_original_observation(self, state: CarState, current_s: float, opponents):
@@ -900,8 +912,9 @@ class SelfPlayRLPolicy(RefTrajPolicy):
                 "psi": state.psi,
             }
 
-        own_heading_error = self._track_heading_error(state.psi, current_s, reference_minus_heading=False)
-        opp_heading_error = self._track_heading_error(
+        own_heading_error = track_heading_error(self.track, state.psi, current_s, reference_minus_heading=False)
+        opp_heading_error = track_heading_error(
+            self.track,
             float(opponent.get("psi", state.psi)),
             float(opponent["px"]),
             reference_minus_heading=False,
@@ -911,7 +924,7 @@ class SelfPlayRLPolicy(RefTrajPolicy):
         opp_lookahead_s = float(opponent["px"]) + max(float(opponent.get("vx", 0.0)), 0.0) * lookahead_time
         observation = np.asarray(
             [
-                self._progress_delta(float(opponent["px"]), current_s), # opponent minus ego, as upstream
+                progress_delta(float(opponent["px"]), current_s, self.track.total_length), # opponent minus ego, as upstream
                 current_e,                                              # self lateral error
                 float(opponent.get("py", 0.0)),                         # self lateral position
                 own_heading_error,                                      # self heading error
@@ -922,10 +935,10 @@ class SelfPlayRLPolicy(RefTrajPolicy):
                 float(opponent.get("vx", 0.0)),                         # opponent longitudinal velocity
                 float(opponent.get("vy", 0.0)),                         # opponent lateral velocity
                 float(opponent.get("omega", 0.0)),                      # opponent angular velocity
-                self._track_curvature_at(current_s),                    # self track curvature
-                self._track_curvature_at(float(opponent["px"])),        # opponent track curvature
-                self._track_curvature_at(own_lookahead_s),              # self lookahead track curvature
-                self._track_curvature_at(opp_lookahead_s),              # opponent lookahead track curvature
+                track_curvature_at(self.track, current_s),                    # self track curvature
+                track_curvature_at(self.track, float(opponent["px"])),        # opponent track curvature
+                track_curvature_at(self.track, own_lookahead_s),              # self lookahead track curvature
+                track_curvature_at(self.track, opp_lookahead_s),              # opponent lookahead track curvature
             ],
             dtype=float,
         )
@@ -933,7 +946,12 @@ class SelfPlayRLPolicy(RefTrajPolicy):
         return observation
 
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
-        self.last_ref_traj = super().get_reference_trajectory(state, current_s, opponents=opponents)
+        if self.raceline is not None:
+            self.last_raceline_idx = self.raceline.nearest_index(state.x, state.y)
+            self.last_raceline_s = float(self.raceline.s[self.last_raceline_idx])
+        self.last_ref_traj = None
+        self.last_ref_world_horizon = None
+        self.last_raceline_world_horizon = None
         observation = self._build_original_observation(state, current_s, opponents or [])
         self.last_observation = observation.copy()
         raw_action = self._predict_model(observation)
@@ -952,7 +970,7 @@ class SelfPlayRLPolicy(RefTrajPolicy):
         return action
 
 
-class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
+class LLMAlphaRacerPolicy(RefTrajPolicy):
     """
     alpha-RACER policy whose five parameters are supplied by a local LLM.
 
@@ -970,6 +988,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         update_interval_steps=1,  # Only call the LLM every N steps to reduce latency and instability.
         history_length=5,
         output_mode="auto", # "mode" for discrete mode selection, "params" for direct parameter output, "auto" to infer from model name.
+        safeguard_enabled=True,
         param_bounds=None,
         **kwargs,
     ):
@@ -981,6 +1000,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         self.update_interval_steps = max(1, int(update_interval_steps))
         self.history_length = max(0, int(history_length))
         self.output_mode = self._resolve_output_mode(output_mode, model_name)
+        self.safeguard_enabled = bool(safeguard_enabled)
         if self.output_mode not in {"mode", "params"}:
             raise ValueError(f"Unknown LLM output mode: {output_mode}")
         self.llm_decision_history = []
@@ -1068,7 +1088,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         )
         opponent_lines = []
         for idx, opponent in enumerate(opponents):
-            delta_s = self._progress_delta(opponent["px"], current_s)
+            delta_s = progress_delta(opponent["px"], current_s, self.track.total_length)
             relation = "ahead" if delta_s > 0.0 else "behind" if delta_s < 0.0 else "alongside"
             speed_relation = "slower" if opponent["vx"] < state.vx else "faster" if opponent["vx"] > state.vx else "same_speed"
             lateral_gap = opponent["py"] - current_py
@@ -1258,7 +1278,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         nearest_lateral_gap = None
         nearest_front_lateral_gap = None
         for opponent in opponents:
-            delta_s = self._progress_delta(opponent["px"], current_s)
+            delta_s = progress_delta(opponent["px"], current_s, self.track.total_length)
             if nearest_delta is None or abs(delta_s) < abs(nearest_delta):
                 nearest_delta = delta_s
                 nearest_lateral_gap = abs(current_py - opponent["py"])
@@ -1343,9 +1363,9 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         try:
             raw_params = self._query_llm(prompt)
             self.params = self._sanitize_params(raw_params)
-            # Prompt-only experiment: keep the guard implementation available, but do not
-            # override the LLM mode here. Re-enable this line if prompt rules are not robust.
-            self._apply_mode_guard(state, current_s, opponents=opponents)
+            # Optionally validate/correct the discrete mode against the current race context.
+            if self.safeguard_enabled:
+                self._apply_mode_guard(state, current_s, opponents=opponents)
             self.last_llm_params = self.params.copy()
             self.last_llm_error = None
             self._record_llm_decision()
@@ -1363,11 +1383,7 @@ class LLMParameterPolicy(ParameterizedAlphaRacerPolicy):
         return super().get_reference_trajectory(state, current_s, opponents=opponents)
 
 
-class LLMAlphaRacerPolicy(LLMParameterPolicy):
-    """Backward-compatible name for LLMParameterPolicy."""
-
-
-class RuleBasedSafeguardPolicy(LLMParameterPolicy):
+class RuleBasedSafeguardPolicy(LLMAlphaRacerPolicy):
     """Deterministic ablation of the safeguarded discrete-mode LLM policy.
 
     It observes the same Frenet interaction state, selects one of the exact
@@ -1400,9 +1416,9 @@ class RuleBasedSafeguardPolicy(LLMParameterPolicy):
             and context["nearest_front_lateral_gap"] < 0.25
         )
 
-        heading_error = abs(self._track_heading_error(state.psi, current_s))
+        heading_error = abs(track_heading_error(self.track, state.psi, current_s))
         lookahead_s = current_s + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon
-        lookahead_curvature = abs(self._track_curvature_at(lookahead_s))
+        lookahead_curvature = abs(track_curvature_at(self.track, lookahead_s))
         near_boundary = abs(context["current_py"]) >= 0.9 * self.mpc.track_half_width
 
         # Ordered decision tree: recovery and collision avoidance have highest
@@ -1435,7 +1451,7 @@ class RuleBasedSafeguardPolicy(LLMParameterPolicy):
 
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         self.update_params_from_rules(state, current_s, opponents=opponents)
-        return ParameterizedAlphaRacerPolicy.get_reference_trajectory(
+        return RefTrajPolicy.get_reference_trajectory(
             self, state, current_s, opponents=opponents
         )
 
@@ -1466,7 +1482,7 @@ class _LearnedAlphaPotentialFunction(nn.Module if nn is not None else object):
         return self.fc(x)
 
 
-class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
+class AlphaRacerPolicy(RefTrajPolicy):
     """
     alpha-RACER online policy that searches for parameters maximizing the
     learned alpha-potential function.
@@ -1557,7 +1573,7 @@ class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
         )
 
     def _wrap_delta(self, s_a, s_b):
-        return self._progress_delta(float(s_a), float(s_b))
+        return progress_delta(float(s_a), float(s_b), self.track.total_length)
 
     def _car_feature_block(self, car):
         s = float(car["px"])
@@ -1568,7 +1584,7 @@ class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
         omega = float(car.get("omega", getattr(state, "omega", 0.0)))
         return [
             float(car["py"]),
-            self._track_heading_error(psi, s),
+            track_heading_error(self.track, psi, s),
             vx,
             vy,
             omega,
@@ -1627,13 +1643,16 @@ class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
         # track curvature features for each car: 3 features
         for car in cars:
             s = float(car["px"])
-            features.append(self._track_curvature_at(s))
+            features.append(track_curvature_at(self.track, s))
         
         # lookahead curvature features for each car: 3 features
         for car in cars:
             s = float(car["px"])
             features.append(
-                self._track_curvature_at(s + max(float(car.get("vx", 0.0)), 0.0) * self.mpc.dt * self.mpc.horizon)
+                track_curvature_at(
+                    self.track,
+                    s + max(float(car.get("vx", 0.0)), 0.0) * self.mpc.dt * self.mpc.horizon,
+                )
             )
 
         # policy parameters for each car: 3 * 5 = 15 features
@@ -1721,18 +1740,6 @@ class AlphaRacerPolicy(ParameterizedAlphaRacerPolicy):
             self.original_params = self._select_original_params(state, current_s, opponents or [])
         self.params = self._map_original_params(self.original_params)
         return super().get_reference_trajectory(state, current_s, opponents=opponents)
-
-
-class PotentialFunctionPolicy(AlphaRacerPolicy):
-    """Compatibility alias for the learned-potential AlphaRacer policy."""
-
-
-class PotentialFunctionMinPolicy(AlphaRacerPolicy):
-    """Compatibility alias for users who call this a potential-min policy."""
-
-
-class WeightedAlphaRacerPolicy(AlphaRacerPolicy):
-    """Deprecated compatibility alias for AlphaRacerPolicy."""
 
 
 def plan_alpharacer_joint_params(policies, states, car_s, car_e):
@@ -1968,7 +1975,7 @@ class _StrictIBRSolver:
         }
 
 
-class IteratedBestResponsePolicy(RefTrajPolicy):
+class IteratedBestResponsePolicy(BasePolicy):
     """
     IBR baseline policy in alpha-RACER paper (multi_car_comp_blocking.py).
     https://arxiv.org/abs/1801.02302 
@@ -1979,20 +1986,24 @@ class IteratedBestResponsePolicy(RefTrajPolicy):
 
     def __init__(
         self,
-        *args,
-        q=1.0,
-        zeta=1.0,
-        s1=0.0,
-        s2=0.0,
-        s3=0.0,
+        track,
+        mpc,
+        raceline: RaceLine,
+        max_speed=5.0,
+        car_idx=None,
+        policy_name=None,
         iterations=3,  # N=3*2, total iterations
-        gamma=None,
         ibr_horizon=None,
         use_upstream_collision_expression=True,
         lateral_half_width=None,
-        **kwargs,
     ):
-        super().__init__(*args, params=np.array([q, zeta, s1, s2, s3]), **kwargs)
+        super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
+        if raceline is None:
+            raise ValueError("IteratedBestResponsePolicy requires a raceline")
+        self.raceline = raceline
+        self.max_speed = float(max_speed)
+        self.last_raceline_s = None
+        self.last_raceline_idx = None
         solver_horizon = self.mpc.horizon if ibr_horizon is None else int(ibr_horizon)
         if lateral_half_width is None:
             lateral_half_width = getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width)
@@ -2063,7 +2074,7 @@ class IteratedBestResponsePolicy(RefTrajPolicy):
         speed = max(float(state.vx), 0.0)
         for k in range(self.ibr_solver.horizon):
             s = current_s + k * self.mpc.dt * speed
-            curvature[k] = self._track_curvature_at(s, ds=0.5)
+            curvature[k] = track_curvature_at(self.track, s, ds=0.5)
         return curvature
 
     def _reference_speed(self, state, current_s):
@@ -2082,7 +2093,7 @@ class IteratedBestResponsePolicy(RefTrajPolicy):
             [
                 float(current_s),
                 float(current_e),
-                float(self._track_heading_error(state.psi, current_s, reference_minus_heading=False)),
+                float(track_heading_error(self.track, state.psi, current_s, reference_minus_heading=False)),
                 max(float(state.vx), 0.0),
             ],
             dtype=float,
@@ -2174,17 +2185,13 @@ class IteratedBestResponsePolicy(RefTrajPolicy):
         return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
 
 
-class IBRBaselinePolicy(IteratedBestResponsePolicy):
-    """Backward-compatible name for IteratedBestResponsePolicy."""
-
-
 def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
     best_idx = None
     best_abs_delta = np.inf
     for other_idx, _ in enumerate(states):
         if other_idx == car_idx:
             continue
-        delta = policy._progress_delta(car_s[other_idx], car_s[car_idx])
+        delta = progress_delta(car_s[other_idx], car_s[car_idx], policy.track.total_length)
         abs_delta = abs(delta)
         if abs_delta < best_abs_delta:
             best_idx = other_idx

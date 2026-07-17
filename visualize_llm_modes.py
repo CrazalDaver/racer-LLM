@@ -440,24 +440,14 @@ def plot_parameter_sweeps(
         for value, run in zip(values, runs):
             color = cmap(norm(float(value)))
             ax.plot(run["x"], run["y"], color=color, lw=2.0)
-        # The first opponent rollout provides context without mixing opponent
-        # behavior into the parameter colors. A white underlay keeps the dark
-        # blue path visible when it overlaps the raceline or an ego trajectory.
-        ax.plot(
-            runs[0]["opponent_x"],
-            runs[0]["opponent_y"],
-            color="white",
-            ls="--",
-            lw=4.0,
-            zorder=8,
-        )
+        # The first opponent rollout is sufficient when stationary; when moving,
+        # this gray line provides context without mixing it into the parameter colors.
         ax.plot(
             runs[0]["opponent_x"],
             runs[0]["opponent_y"],
             color="#0B3C8C",
             ls="--",
-            lw=2.4,
-            zorder=9,
+            lw=1.6,
         )
         ax.scatter(ego_start[0], ego_start[1], color="black", s=25, zorder=5)
         ax.scatter(
@@ -515,7 +505,6 @@ def parse_args():
     parser.add_argument(
         "--stationary-opponent",
         action="store_true",
-        default=True,
         help="freeze opponent at its raceline start instead of running its policy",
     )
     parser.add_argument("--horizon", type=int, default=params.MPC_HORIZON)
@@ -524,7 +513,6 @@ def parse_args():
     parser.add_argument(
         "--parameter-sweep",
         action="store_true",
-        default=False,
         help="plot one-at-a-time q/zeta/s1/s2/s3 trajectory sweeps instead of modes",
     )
     parser.add_argument("--sweep-points", type=int, default=5)

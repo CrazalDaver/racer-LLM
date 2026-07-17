@@ -122,6 +122,7 @@ def simulation_kwargs(
     llm_temperature=None,
     llm_temperatures=None,
     llm_update_interval_steps=None,
+    llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
@@ -138,6 +139,7 @@ def simulation_kwargs(
         "llm_temperature": llm_temperature,
         "llm_temperatures": llm_temperatures,
         "llm_update_interval_steps": llm_update_interval_steps,
+        "llm_safeguard_enabled": llm_safeguard_enabled,
         "self_play_rl_model_path": self_play_rl_model_path,
         "self_play_rl_backend": self_play_rl_backend,
         "self_play_rl_strict_load": self_play_rl_strict_load,
@@ -157,6 +159,7 @@ def _override_snapshot(
     llm_temperature=None,
     llm_temperatures=None,
     llm_update_interval_steps=None,
+    llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
@@ -175,6 +178,7 @@ def _override_snapshot(
         llm_temperature=llm_temperature,
         llm_temperatures=llm_temperatures,
         llm_update_interval_steps=llm_update_interval_steps,
+        llm_safeguard_enabled=llm_safeguard_enabled,
         self_play_rl_model_path=self_play_rl_model_path,
         self_play_rl_backend=self_play_rl_backend,
         self_play_rl_strict_load=self_play_rl_strict_load,
@@ -203,6 +207,8 @@ def _override_snapshot(
         snapshot["LLM_TEMPERATURES"] = [float(value) for value in overrides["llm_temperatures"]]
     if overrides["llm_update_interval_steps"] is not None:
         snapshot["LLM_UPDATE_INTERVAL_STEPS"] = int(overrides["llm_update_interval_steps"])
+    if overrides["llm_safeguard_enabled"] is not None:
+        snapshot["LLM_SAFEGUARD_ENABLED"] = bool(overrides["llm_safeguard_enabled"])
     if overrides["self_play_rl_model_path"] is not None:
         snapshot["SELF_PLAY_RL_MODEL_PATH"] = overrides["self_play_rl_model_path"]
     if overrides["self_play_rl_backend"] is not None:
@@ -234,6 +240,7 @@ def run_experiment(
     llm_temperature=None,
     llm_temperatures=None,
     llm_update_interval_steps=None,
+    llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
@@ -256,6 +263,7 @@ def run_experiment(
         llm_temperature=llm_temperature,
         llm_temperatures=llm_temperatures,
         llm_update_interval_steps=llm_update_interval_steps,
+        llm_safeguard_enabled=llm_safeguard_enabled,
         self_play_rl_model_path=self_play_rl_model_path,
         self_play_rl_backend=self_play_rl_backend,
         self_play_rl_strict_load=self_play_rl_strict_load,
@@ -363,6 +371,7 @@ def run_experiment_suite(
     llm_temperature=None,
     llm_temperatures=None,
     llm_update_interval_steps=None,
+    llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
     self_play_rl_strict_load=None,
@@ -407,6 +416,7 @@ def run_experiment_suite(
                 llm_temperature=llm_temperature,
                 llm_temperatures=llm_temperatures,
                 llm_update_interval_steps=llm_update_interval_steps,
+                llm_safeguard_enabled=llm_safeguard_enabled,
                 self_play_rl_model_path=self_play_rl_model_path,
                 self_play_rl_backend=self_play_rl_backend,
                 self_play_rl_strict_load=self_play_rl_strict_load,
@@ -578,6 +588,12 @@ def _add_sim_args(parser):
     group.add_argument("--llm-temperature", type=float, default=None)
     group.add_argument("--llm-temperatures", nargs="+", type=float, default=None)
     group.add_argument("--llm-update-interval-steps", type=int, default=None)
+    group.add_argument(
+        "--llm-safeguard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable validation/correction of LLM policy modes.",
+    )
     group.add_argument("--rl-model-path", default=None)
     group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
     group.add_argument("--rl-strict-load", action="store_true")
