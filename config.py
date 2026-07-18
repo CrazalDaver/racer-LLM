@@ -72,7 +72,7 @@ def make_vehicle_params(vehicle_model_type):
 class SimParams:
     DT = 0.02
     TOTAL_TIME = 50.0
-    v0 = 0.0,
+    v0 = 0.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
     RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
     TRACK_SCALE = 2.0

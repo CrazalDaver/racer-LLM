@@ -1,3 +1,5 @@
+#!/Users/lee/racer-LLM/.venv/bin/python
+# PYTHON_ARGCOMPLETE_OK
 import argparse
 import contextlib
 import json
@@ -6,24 +8,45 @@ import re
 import sys
 from pathlib import Path
 
-import numpy as np
-
-from animate_trace import make_animation
-from config import params
-from simulation import run_simulation
-
 try:
-    from tqdm.auto import tqdm
-except ImportError:
-    tqdm = None
+    import argcomplete
+except ImportError:  # Tab completion is optional; normal execution still works without it.
+    argcomplete = None
+
+_COMPLETING = bool(os.environ.get("_ARGCOMPLETE"))
+if not _COMPLETING:
+    import numpy as np
+
+    from animate_trace import make_animation
+    from config import params
+    from simulation import run_simulation
+
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        tqdm = None
 
 
 def _jsonable(value):
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _jsonable(value.tolist())
     if isinstance(value, np.generic):
-        return value.item()
+        return _jsonable(value.item())
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        # JSON has no portable NaN/Infinity representation.
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
     return value
+
+
+def _npz_contents(data):
+    """Convert every array in an open NpzFile to JSON-compatible values."""
+    return {name: _jsonable(data[name]) for name in data.files}
 
 
 def params_snapshot():
@@ -429,7 +452,7 @@ def run_experiment_suite(
 
 def run_position_sweep(
     policy_names=("LLM", "IBR", "IBR"),
-    trials_per_position=3,
+    trials_per_position=1,
     ego_positions=(1, 2, 3),
     output_path="result/position_sweep_summary.json",
     show_progress=True,
@@ -509,6 +532,7 @@ def run_position_sweep(
                     )
 
                 with np.load(trace_path, allow_pickle=True) as data:
+                    trace_contents = _npz_contents(data)
                     car_px = np.asarray(data["car_px"], dtype=float)
                     final_progress = car_px[-1].copy()
                     winner_index = int(np.nanargmax(final_progress))
@@ -528,8 +552,9 @@ def run_position_sweep(
                         "winner": winner_role,
                         "winner_index": winner_index,
                         "winner_policy": policy_names[winner_index],
-                        "final_progress": [float(value) for value in final_progress],
+                        "final_progress": _jsonable(final_progress),
                         "start_ranks": start_ranks,
+                        "npz": trace_contents,
                     }
                 )
                 if progress_bar is not None:
@@ -548,7 +573,7 @@ def run_position_sweep(
         "trials": trial_records,
     }
     with output_path.open("w", encoding="utf-8") as file:
-        json.dump(summary, file, indent=2, sort_keys=True)
+        json.dump(summary, file, indent=2, sort_keys=True, allow_nan=False)
 
     print(f"Winner counts: {winner_counts}")
     print(f"Saved summary to {output_path}")
@@ -571,7 +596,7 @@ def _parse_start_order_cases(start_order_args):
 def _add_case_args(parser):
     group = parser.add_argument_group("experiment cases")
     group.add_argument("--policies", nargs="+", default=None)
-    group.add_argument("--ego-position", type=int, default=1)
+    group.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=None)
     group.add_argument("--start-order", action="append", default=None)
     group.add_argument("--name", default=None)
 
@@ -615,18 +640,30 @@ def parse_args():
     _add_case_args(parser)
     _add_sim_args(parser)
     _add_output_args(parser)
+    if argcomplete is not None:
+        argcomplete.autocomplete(parser)
     return parser.parse_args()
 
 if __name__ == "__main__":
+    args = parse_args()
     run_position_sweep(
-        # policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
-        policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
-        trials_per_position=3,  # total race = trials_per_position * len(ego_positions)
-        ego_positions=[1, 2, 3],
+        policy_names=args.policies or ["LLM", "alpharacer", "alpharacer"],
+        trials_per_position=1,  # total race = trials_per_position * len(ego_positions)
+        ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
         output_path="result/position_sweep_summary.json",
-        vehicle_model_type="kinematic",
-        # llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5],  # 
-        llm_output_mode="mode",
-        llm_update_interval_steps=50,
-        llm_temperature=1.0,
+        vehicle_model_type=args.vehicle_model or "kinematic",
+        static_policy_params=args.static_params,
+        alpharacer_params=args.alpha_params,
+        llm_policy_params=args.llm_params,
+        llm_output_mode=args.llm_output_mode or "mode",
+        llm_model_name=args.llm_model,
+        llm_model_names=args.llm_models,
+        llm_update_interval_steps=args.llm_update_interval_steps or 50,
+        llm_temperature=args.llm_temperature if args.llm_temperature is not None else 1.0,
+        llm_temperatures=args.llm_temperatures,
+        llm_safeguard_enabled=args.llm_safeguard if args.llm_safeguard is not None else False,
+        self_play_rl_model_path=args.rl_model_path,
+        self_play_rl_backend=args.rl_backend,
+        self_play_rl_strict_load=args.rl_strict_load or None,
+        self_play_rl_action_order=args.rl_action_order,
     )

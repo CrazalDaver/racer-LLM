@@ -135,6 +135,7 @@ def create_policy(
     mpc,
     raceline=None,
     car_idx=0,
+    static_policy_params=None,
     alpharacer_params=None,
     llm_policy_params=None,
     llm_output_mode=None,
@@ -162,8 +163,15 @@ def create_policy(
             mpc,
             car_idx=car_idx,
             policy_name=policy_type,
+            params=np.asarray(
+                params.STATIC_POLICY_PARAMS
+                if static_policy_params is None
+                else static_policy_params,
+                dtype=float,
+            ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
     if policy_type == "llm_alpharacer":
         return LLMAlphaRacerPolicy(
@@ -366,6 +374,7 @@ def run_simulation(
     num_cars=None,
     policy_names=None,
     vehicle_model_type=None,
+    static_policy_params=None,
     alpharacer_params=None,
     llm_policy_params=None,
     llm_output_mode=None,
@@ -465,6 +474,7 @@ def run_simulation(
                 mpc,
                 raceline=raceline,
                 car_idx=car_idx,
+                static_policy_params=static_policy_params,
                 alpharacer_params=alpharacer_params,
                 llm_policy_params=llm_policy_params,
                 llm_output_mode=llm_output_mode,
@@ -954,6 +964,6 @@ if __name__ == "__main__":
         policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:0.5b", None, None],
         # llm_model_names=["qwen2.5:0.5b", "qwen2.5:0.5b", "qwen2.5:0.5b"],
-        vehicle_model_type="kinematic", ego_position=1, llm_update_interval_steps=50, 
+        vehicle_model_type="dbm", ego_position=3, llm_update_interval_steps=50, 
         llm_temperature = 1.0, 
     )
