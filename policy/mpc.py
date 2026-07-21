@@ -31,6 +31,9 @@ class MPCPolicy(BasePolicy):
     ):
         super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
         self.last_u = np.array([0.0, self._neutral_steer_command()])
+        # Keep fallback actions separate from the last control produced by a
+        # successful solve, so recovery cannot contaminate the next MPC step.
+        self.last_feasible_u = self.last_u.copy()
         self.params = np.asarray(
             [1.0, 1.0, 0.0, 0.0, 0.0] if params is None else params,
             dtype=float,
@@ -60,9 +63,9 @@ class MPCPolicy(BasePolicy):
     def _neutral_steer_command(self) -> float:
         return np.clip(-self.mpc.p.Sb / self.mpc.p.Sa, -1.0, 1.0)
 
-    # simple failure recovery
+    # Conservative failure recovery: preserve the last feasible direction and
+    # brake. Only near a boundary do we slew gently toward the centerline.
     def _recovery_control(self, state: CarState, current_s: float) -> np.ndarray:
-        # 
         _, current_e = self.track.project(
             state.x,
             state.y,
@@ -71,11 +74,21 @@ class MPCPolicy(BasePolicy):
             psi_hint=state.psi,
             max_heading_error=math.pi / 2.0,
         )
-        _, _, track_psi = self.track.interpolate(current_s)
-        heading_error = math.atan2(math.sin(state.psi - track_psi), math.cos(state.psi - track_psi))
         half_width = max(getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width), 1e-6)
-        steer = np.clip(-1.8 * current_e / half_width - 0.7 * heading_error, -1.0, 1.0)
-        throttle = -0.2 if state.vx > 3.0 else 0.45
+        steer = float(self.last_u[1])
+        if abs(current_e) > 0.95 * half_width:
+            _, _, centerline_psi = self.track.interpolate(current_s)
+            heading_error = math.atan2(
+                math.sin(state.psi - centerline_psi),
+                math.cos(state.psi - centerline_psi),
+            )
+            center_steer = np.clip(
+                -0.25 * current_e / half_width - 0.20 * heading_error,
+                -0.25,
+                0.25,
+            )
+            steer = np.clip(center_steer, steer - 0.05, steer + 0.05)
+        throttle = -0.5 if state.vx > 1.0 else 0.0
         return np.array([throttle, steer], dtype=float)
 
     def _format_mpc_time(self, sim_time) -> str:
@@ -216,7 +229,7 @@ class MPCPolicy(BasePolicy):
             _, u_first = self.mpc.solve(
                 state_arr,
                 ref_traj,
-                self.last_u,
+                self.last_feasible_u,
                 q_weight=self.get_q_weight(),
                 opponents=opponents,
                 current_s=current_s,
@@ -245,6 +258,8 @@ class MPCPolicy(BasePolicy):
                 self.mpc.last_heading_loss = np.nan
         else:
             self._report_mpc_recovery(sim_time=sim_time)
+            # Update this state only after a genuinely successful solve.
+            self.last_feasible_u = np.clip(np.asarray(u_first, dtype=float), -1.0, 1.0)
 
         target_vel = np.clip(u_first[0], -1.0, 1.0)
         target_steer = np.clip(u_first[1], -1.0, 1.0)

@@ -322,7 +322,9 @@ class MPCController:
                     + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
                 )
 
-                # Enforce the MPC track boundary constraint (1f)
+                # Enforce the MPC track boundary constraint (1f). The supplied
+                # half-width is the center-safe track width, i.e. geometric
+                # track half-width minus vehicle half-width.
                 g_ineq.append(lateral_e - self.track_constraint_half_width)
                 g_ineq.append(-lateral_e - self.track_constraint_half_width)
 

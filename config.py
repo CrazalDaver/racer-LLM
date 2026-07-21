@@ -65,8 +65,13 @@ class SimParams:
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
     VEHICLE_HALF_LENGTH = 0.18
     VEHICLE_HALF_WIDTH = 0.12
-    MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH
-    REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH
+    # MPC constrains the vehicle center, so reserve one vehicle half-width at
+    # each track edge: |e_center| <= track_half_width - vehicle_half_width.
+    MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH - VEHICLE_HALF_WIDTH
+    # Keep references slightly inside the hard MPC boundary to leave tracking
+    # and numerical feasibility margin instead of targeting the constraint.
+    REF_BOUNDARY_MARGIN = 0.03
+    REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH - REF_BOUNDARY_MARGIN
     # Smooth collision exclusion used by the continuous NLP solver:
     #
     #     (delta_s / a)^p + (delta_e / b)^p >= 1,
