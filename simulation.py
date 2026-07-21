@@ -1,9 +1,11 @@
+import argparse
+
 import numpy as np
 
 from config import make_vehicle_params, params
 from mpc_controller import MPCController
 from plotting import plot_simulation_results
-from policies import (
+from policy import (
     AlphaRacerPolicy,
     CenterLinePolicy,
     IteratedBestResponsePolicy,
@@ -11,7 +13,7 @@ from policies import (
     RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
     StaticAlphaRacerPolicy,
-    plan_alpharacer_joint_params,
+    plan_alpharacer_policy_params,
     plan_ibr_joint_actions,
     progress_delta,
 )
@@ -326,15 +328,23 @@ def save_simulation_trace(trace, track, params):
         mpc_solver_status=np.asarray(trace["mpc_solver_status"]),
         policy_params=np.asarray(trace["policy_params"]),
         policy_mode=np.asarray(trace["policy_mode"]),
+        policy_reason=np.asarray(trace.get("policy_reason", []), dtype=str),
         policy_names=np.asarray(trace.get("policy_names", [])),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
+        llm_safeguard_enabled=np.asarray(trace.get("llm_safeguard_enabled", False), dtype=bool),
+        car_llm_safeguard_enabled=np.asarray(
+            trace.get("car_llm_safeguard_enabled", []), dtype=bool
+        ),
         llm_raw_call_indices=np.asarray(trace.get("llm_raw_call_indices", []), dtype=int),
         llm_raw_prompts=np.asarray(trace.get("llm_raw_prompts", []), dtype=str),
         llm_raw_responses=np.asarray(trace.get("llm_raw_responses", []), dtype=str),
         llm_raw_errors=np.asarray(trace.get("llm_raw_errors", []), dtype=str),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
+        car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
+        car_policy_requested_mode=np.asarray(trace.get("car_policy_requested_mode", []), dtype=str),
+        car_safeguard_override=np.asarray(trace.get("car_safeguard_override", []), dtype=str),
         car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
@@ -553,8 +563,12 @@ def run_simulation(
         "mpc_solver_status": [],
         "policy_params": [],
         "policy_mode": [],
+        "policy_reason": [],
         "car_policy_params": [],
         "car_policy_mode": [],
+        "car_policy_reason": [],
+        "car_policy_requested_mode": [],
+        "car_safeguard_override": [],
         "car_offroad": [],
         "policy_names": resolved_policy_names,
         "llm_model_names": [
@@ -577,6 +591,10 @@ def run_simulation(
             else np.nan
             for idx in range(num_cars)
         ],
+        "llm_safeguard_enabled": bool(getattr(policies[ego_idx], "safeguard_enabled", False)),
+        "car_llm_safeguard_enabled": [
+            bool(getattr(policy, "safeguard_enabled", False)) for policy in policies
+        ],
         "ego_index": ego_idx,
         "ego_position": ego_position,
         "start_ranks": start_ranks,
@@ -593,6 +611,7 @@ def run_simulation(
     if any(name == "llm_alpharacer" for name in resolved_policy_names):
         print(f"LLM models by car: {trace['llm_model_names']}")
         print(f"LLM temperatures by car: {trace['llm_temperatures']}")
+        print(f"LLM safeguards by car: {trace['car_llm_safeguard_enabled']}")
     progress_iter = range(total_steps)
     progress_bar = None
     if tqdm is not None:
@@ -632,7 +651,7 @@ def run_simulation(
             car_e.append(e_before)
 
         actions = []
-        plan_alpharacer_joint_params(policies, states, car_s, car_e)
+        plan_alpharacer_policy_params(policies, states, car_s, car_e)
         plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=step * params.DT)
         for car_idx, state in enumerate(states):
             opponents = [
@@ -721,10 +740,18 @@ def run_simulation(
         trace["mpc_solver_status"].append(ego_mpc.last_solver_status)
         trace["policy_params"].append(getattr(ego_policy, "params", np.full(5, np.nan)).copy())
         trace["policy_mode"].append(getattr(ego_policy, "current_mode", "fixed"))
+        trace["policy_reason"].append(getattr(ego_policy, "last_llm_reason", ""))
         trace["car_policy_params"].append(
             [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
         )
         trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
+        trace["car_policy_reason"].append([getattr(policy, "last_llm_reason", "") for policy in policies])
+        trace["car_policy_requested_mode"].append(
+            [getattr(policy, "last_llm_requested_mode", "") for policy in policies]
+        )
+        trace["car_safeguard_override"].append(
+            [getattr(policy, "last_safeguard_override", "") for policy in policies]
+        )
         trace["car_offroad"].append([abs(error) > offroad_half_width for error in car_e])
 
         if (step + 1) % 100 == 0 and ego_policy.last_ref_traj is not None:
@@ -911,6 +938,15 @@ def run_simulation(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the default racer simulation scenario.")
+    parser.add_argument(
+        "--llm-safeguard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable validation/correction of LLM policy modes.",
+    )
+    cli_args = parser.parse_args()
+
     # Options: "centerline", "alpharacer" (potential), "static_alpharacer",
     # "ibr", or "llm_alpharacer". "weighted_alpharacer" aliases "alpharacer".
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
@@ -962,8 +998,9 @@ if __name__ == "__main__":
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
         policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
-        llm_model_names=["qwen2.5:0.5b", None, None],
+        llm_model_names=["qwen2.5:7b", None, None],
         # llm_model_names=["qwen2.5:0.5b", "qwen2.5:0.5b", "qwen2.5:0.5b"],
-        vehicle_model_type="dbm", ego_position=3, llm_update_interval_steps=50, 
-        llm_temperature = 1.0, 
+        vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
+        llm_temperature = 0.0, 
+        llm_safeguard_enabled=False,
     )
