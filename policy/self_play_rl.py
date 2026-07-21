@@ -358,6 +358,8 @@ class SelfPlayRLPolicy(BasePolicy):
         self.last_u = np.array([action.throttle, action.steer])
         self.mpc.last_solver_success = True
         self.mpc.last_solver_status = f"direct_{self.model_kind}"
+        self.mpc.last_recovery_active = False
+        self.mpc.last_recovery_reason = ""
         self.mpc.last_loss = np.nan
         self.mpc.last_track_loss = np.nan
         self.mpc.last_action_loss = np.nan
@@ -366,5 +368,4 @@ class SelfPlayRLPolicy(BasePolicy):
         self.mpc.last_control_plan = np.repeat(self.last_u.reshape(2, 1), self.mpc.horizon, axis=1)
         self.mpc.last_state_plan = None
         return action
-
 

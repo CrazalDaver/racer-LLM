@@ -98,7 +98,7 @@ def _params_snapshot():
     return {
         "VELOCITY_TRACK_WEIGHT": params.VELOCITY_TRACK_WEIGHT,
         "MPC_HORIZON": params.MPC_HORIZON,
-        "ALPHARACER_PARAMS": params.ALPHARACER_PARAMS.copy(),
+        "STATIC_POLICY_PARAMS": params.STATIC_POLICY_PARAMS.copy(),
         "TOTAL_TIME": params.TOTAL_TIME,
         "TRACE_OUTPUT": params.TRACE_OUTPUT,
         "NUM_CARS": params.NUM_CARS,
@@ -129,9 +129,9 @@ def run_grid_search(args):
             params.TOTAL_TIME = float(args.total_time)
             params.TRACE_OUTPUT = str(trace_path)
             params.NUM_CARS = int(args.num_cars)
-            alpha_params = params.ALPHARACER_PARAMS.copy()
+            alpha_params = params.STATIC_POLICY_PARAMS.copy()
             alpha_params[0] = float(q_value)
-            params.ALPHARACER_PARAMS = alpha_params
+            params.STATIC_POLICY_PARAMS = alpha_params
 
             print(
                 f"[{run_idx}/{len(combinations)}] "

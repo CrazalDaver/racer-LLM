@@ -210,6 +210,8 @@ class MPCPolicy(BasePolicy):
         ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
         self.last_ref_traj = ref_traj
         state_arr = state.to_array()
+        self.mpc.last_recovery_active = False
+        self.mpc.last_recovery_reason = ""
         try:
             _, u_first = self.mpc.solve(
                 state_arr,
@@ -222,7 +224,10 @@ class MPCPolicy(BasePolicy):
         except Exception as e:
             self._report_mpc_failure(e, state, sim_time=sim_time)
             u_first = self._recovery_control(state, current_s)
-            self.mpc.last_solver_status = "MPC_recovery"
+            # Keep last_solver_status as the original IPOPT return status.
+            # Recovery is recorded separately so diagnostics retain the cause.
+            self.mpc.last_recovery_active = True
+            self.mpc.last_recovery_reason = "solver_failure"
             try:
                 self.mpc.evaluate_fallback_loss(
                     state_arr,

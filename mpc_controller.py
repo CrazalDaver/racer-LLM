@@ -23,7 +23,7 @@ class MPCController:
         Q,
         R,
         max_vel_rate,
-        max_steer_rate,
+        max_steer_delta,
         db_params,
         track_width,
         track_boundary_slack=0.0,
@@ -42,7 +42,7 @@ class MPCController:
         self.Q = Q[:2, :2] if Q.shape[0] > 2 else Q
         self.R = R
         self.max_vel_rate = max_vel_rate
-        self.max_steer_rate = max_steer_rate
+        self.max_steer_delta = max_steer_delta
         self.p = db_params
         self.track_half_width = track_width / 2.0
         if track_constraint_half_width is None:
@@ -69,6 +69,8 @@ class MPCController:
         self.last_heading_loss = np.nan
         self.last_solver_success = True
         self.last_solver_status = "not_run"
+        self.last_recovery_active = False
+        self.last_recovery_reason = ""
         self.last_state_plan = None
         self.last_control_plan = None
         self.last_opponent_s_plan = None
@@ -353,8 +355,8 @@ class MPCController:
             action_cost += du.T @ self.R @ du
 
             # Control rate constraints (1d)-(1e)
-            g_ineq.append(du[1] - self.max_steer_rate)
-            g_ineq.append(-du[1] - self.max_steer_rate)
+            g_ineq.append(du[1] - self.max_steer_delta)
+            g_ineq.append(-du[1] - self.max_steer_delta)
 
         cost = track_cost + action_cost + velocity_cost + heading_cost
         self.g = cs.vertcat(*g_eq, *g_ineq)
@@ -430,7 +432,13 @@ class MPCController:
         lbg = np.zeros(self.n_total)
         ubg = np.zeros(self.n_total)
         lbg[self.n_eq:] = -np.inf
-        sol = self.solver(x0=x_init, lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p_val)
+        try:
+            sol = self.solver(x0=x_init, lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p_val)
+        except Exception as exc:
+            stats = self.solver.stats()
+            self.last_solver_success = False
+            self.last_solver_status = stats.get("return_status", type(exc).__name__)
+            raise RuntimeError(self.last_solver_status) from exc
         stats = self.solver.stats()
         self.last_solver_success = bool(stats.get("success", False))
         self.last_solver_status = stats.get("return_status", "unknown")

@@ -78,6 +78,7 @@ class AlphaRacerPolicy(MPCPolicy):
         search_iters=6,
         opt_style="grad",
         gradient_rate=1e-4,
+        initial_original_params=None,
         opponent_default_original_params=None,
         **kwargs,
     ):
@@ -101,13 +102,17 @@ class AlphaRacerPolicy(MPCPolicy):
         if self.opt_style not in {"grad", "linear"}:
             raise ValueError(f"Unknown AlphaRacer optimization style: {opt_style}")
         self.gradient_rate = float(gradient_rate)
-        self.original_params = np.asarray([0.3, 0.2, 0.25, 0.95, 0.0], dtype=float)
+        if initial_original_params is None:
+            initial_original_params = [0.3, 0.2, 0.25, 0.95, 0.0]
+        self.original_params = np.asarray(initial_original_params, dtype=float).copy()
+        if self.original_params.shape != (5,):
+            raise ValueError("initial_original_params must contain exactly five values")
         self.opponent_default_original_params = np.asarray(
-            [0.3, 0.2, 0.25, 0.95, 0.0]
+            self.original_params
             if opponent_default_original_params is None
             else opponent_default_original_params,
             dtype=float,
-        )
+        ).copy()
         self.current_mode = "potential"
         self.params = self._map_original_params(self.original_params)
         self.joint_original_params = np.repeat(
@@ -319,6 +324,5 @@ def plan_alpharacer_policy_params(policies, states, car_s, car_e):
         policy.original_params = joint[idx].copy()
         policy.params = policy._map_original_params(policy.original_params)
         policy._joint_plan_ready = True
-
 
 

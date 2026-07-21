@@ -117,6 +117,23 @@ def _track_boundaries(waypoints, half_width):
     return left, right
 
 
+def _vehicle_corners(x, y, psi, half_length, half_width):
+    """Return the four world-frame corners of an oriented vehicle box."""
+    local = np.asarray(
+        [
+            [half_length, half_width],
+            [half_length, -half_width],
+            [-half_length, -half_width],
+            [-half_length, half_width],
+        ],
+        dtype=float,
+    )
+    cos_psi = np.cos(psi)
+    sin_psi = np.sin(psi)
+    rotation = np.asarray([[cos_psi, -sin_psi], [sin_psi, cos_psi]])
+    return local @ rotation.T + np.asarray([x, y])
+
+
 def load_trace(path):
     data = np.load(path, allow_pickle=True)
     track_csv = _scalar_string(data["track_csv"], params.TRACK_CSV) if "track_csv" in data.files else params.TRACK_CSV
@@ -154,7 +171,15 @@ def _save_animation(animation, save_path, interval, dpi):
     print(f"Saved animation to {output}")
 
 
-def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, show_ref_debug=False):
+def make_animation(
+    trace_path,
+    stride=1,
+    interval=30,
+    save_path=None,
+    dpi=100,
+    show_ref_debug=False,
+    vehicle_style="box",
+):
     import matplotlib
 
     if save_path:
@@ -162,8 +187,12 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
 
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
+    from matplotlib.patches import Polygon
 
     data, track_csv, raceline_csv = load_trace(trace_path)
+    vehicle_style = str(vehicle_style).strip().lower()
+    if vehicle_style not in {"point", "box"}:
+        raise ValueError("vehicle_style must be 'point' or 'box'")
     track_scale = (
         float(np.asarray(data["track_scale"]).item())
         if "track_scale" in data.files
@@ -177,6 +206,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     y = data["y"]
     car_x = data["car_x"] if "car_x" in data.files else None
     car_y = data["car_y"] if "car_y" in data.files else None
+    car_psi = data["car_psi"] if "car_psi" in data.files else None
     car_px = data["car_px"] if "car_px" in data.files else None
     ref_x = data["ref_x"]
     ref_y = data["ref_y"]
@@ -211,6 +241,16 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     car_offroad = data["car_offroad"] if "car_offroad" in data.files else None
     collision = data["collision"] if "collision" in data.files else np.zeros_like(offroad, dtype=bool)
     car_count = car_x.shape[1] if car_x is not None and car_x.ndim == 2 else 1
+    vehicle_half_length = (
+        float(np.asarray(data["vehicle_half_length"]).item())
+        if "vehicle_half_length" in data.files
+        else getattr(params, "VEHICLE_HALF_LENGTH", 0.18)
+    )
+    vehicle_half_width = (
+        float(np.asarray(data["vehicle_half_width"]).item())
+        if "vehicle_half_width" in data.files
+        else getattr(params, "VEHICLE_HALF_WIDTH", 0.12)
+    )
     policy_labels = _policy_labels(data, car_count)
     policy_names = _string_array(data["policy_names"]) if "policy_names" in data.files else []
     llm_model_names = _string_array(data["llm_model_names"]) if "llm_model_names" in data.files else []
@@ -270,7 +310,12 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
                 "o",
                 color=color,
                 markersize=5,
-                label=f"{_car_role(car_idx)}{policy_labels[car_idx]}",
+                visible=vehicle_style == "point",
+                label=(
+                    f"{_car_role(car_idx)}{policy_labels[car_idx]}"
+                    if vehicle_style == "point"
+                    else "_nolegend_"
+                ),
             )
             opponent_trails.append(opponent_trail)
             opponent_points.append(opponent_point)
@@ -313,7 +358,34 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
         visible=show_ref_debug,
         label="ref_traj[0]" if show_ref_debug else "_nolegend_",
     )
-    car_point, = ax.plot([], [], "o", color=car_colors[0], markersize=6, label=f"{_car_role(0)}{policy_labels[0]}")
+    car_point, = ax.plot(
+        [],
+        [],
+        "o",
+        color=car_colors[0],
+        markersize=6,
+        visible=vehicle_style == "point",
+        label=f"{_car_role(0)}{policy_labels[0]}" if vehicle_style == "point" else "_nolegend_",
+    )
+    vehicle_boxes = []
+    for car_idx in range(car_count):
+        box = Polygon(
+            np.zeros((4, 2)),
+            closed=True,
+            facecolor=car_colors[car_idx],
+            edgecolor="black",
+            linewidth=0.8,
+            alpha=0.75,
+            zorder=3.0,
+            visible=vehicle_style == "box",
+            label=(
+                f"{_car_role(car_idx)}{policy_labels[car_idx]}"
+                if vehicle_style == "box"
+                else "_nolegend_"
+            ),
+        )
+        ax.add_patch(box)
+        vehicle_boxes.append(box)
     offroad_points, = ax.plot(
         [],
         [],
@@ -408,8 +480,8 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
     ax.set_aspect("equal", adjustable="box")
     ax.set_title("Racer trace animation")
     legend_handles = [
-        *opponent_points,
-        car_point,
+        *(opponent_points if vehicle_style == "point" else vehicle_boxes[1:]),
+        car_point if vehicle_style == "point" else vehicle_boxes[0],
         track_area,
         track_line,
         raceline_line,
@@ -439,6 +511,25 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
                 opponent_trails[local_idx].set_data(car_x[: i + 1, car_idx], car_y[: i + 1, car_idx])
                 opponent_points[local_idx].set_data([car_x[i, car_idx]], [car_y[i, car_idx]])
         car_point.set_data([x[i]], [y[i]])
+        if car_x is not None and car_y is not None and car_psi is not None:
+            for car_idx, box in enumerate(vehicle_boxes):
+                box.set_xy(
+                    _vehicle_corners(
+                        car_x[i, car_idx],
+                        car_y[i, car_idx],
+                        car_psi[i, car_idx],
+                        vehicle_half_length,
+                        vehicle_half_width,
+                    )
+                )
+                box.set_visible(vehicle_style == "box")
+        else:
+            vehicle_boxes[0].set_xy(
+                _vehicle_corners(x[i], y[i], data["psi"][i], vehicle_half_length, vehicle_half_width)
+            )
+            vehicle_boxes[0].set_visible(vehicle_style == "box")
+            for box in vehicle_boxes[1:]:
+                box.set_visible(False)
         if show_ref_debug:
             ref_point.set_data([ref_x[i]], [ref_y[i]])
             car_ref_line.set_data([x[i], ref_x[i]], [y[i], ref_y[i]])
@@ -507,6 +598,7 @@ def make_animation(trace_path, stride=1, interval=30, save_path=None, dpi=100, s
             *opponent_trails,
             *opponent_points,
             car_point,
+            *vehicle_boxes,
             offroad_points,
             horizon_line,
             raceline_points,
@@ -548,6 +640,12 @@ def main():
         action="store_true",
         help="Show ref_traj[0], ref_traj horizon points, raceline source points, and the car-to-ref line.",
     )
+    parser.add_argument(
+        "--vehicle-style",
+        choices=["point", "box"],
+        default="box",
+        help="Draw cars as the original point markers or oriented vehicle boxes.",
+    )
     args = parser.parse_args()
     make_animation(
         args.trace,
@@ -556,6 +654,7 @@ def main():
         save_path=args.save,
         dpi=args.dpi,
         show_ref_debug=args.show_ref_debug,
+        vehicle_style=args.vehicle_style,
     )
 
 

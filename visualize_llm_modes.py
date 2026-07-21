@@ -106,7 +106,7 @@ def make_mpc(track, vehicle_params, horizon):
         Q=params.Q,
         R=params.R,
         max_vel_rate=params.MAX_VEL_RATE,
-        max_steer_rate=params.MAX_STEER_RATE,
+        max_steer_delta=params.MPC_MAX_STEER_DELTA,
         db_params=vehicle_params,
         track_width=params.TRACK_WIDTH,
         track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
@@ -136,7 +136,7 @@ def simulate_mode(
         ego_mpc,
         raceline=raceline,
         car_idx=0,
-        alpharacer_params=(
+        static_policy_params=(
             MODE_PRESETS[mode] if ego_params is None else np.asarray(ego_params, dtype=float)
         ),
     )
@@ -148,7 +148,7 @@ def simulate_mode(
         opponent_mpc,
         raceline=raceline,
         car_idx=1,
-        alpharacer_params=OPPONENT_PARAMS,
+        static_policy_params=OPPONENT_PARAMS,
     )
     opponent_policy.current_mode = "raceline_baseline"
     opponent_policy.log_fn = lambda _message: None

@@ -368,6 +368,8 @@ class IteratedBestResponsePolicy(BasePolicy):
         self.last_u = np.array([self._ibr_cached_action.throttle, self._ibr_cached_action.steer])
         self.mpc.last_solver_success = True
         self.mpc.last_solver_status = "Solve_Succeeded"
+        self.mpc.last_recovery_active = False
+        self.mpc.last_recovery_reason = ""
         self.mpc.last_control_plan = result["control_plan"]
 
         if result["state_plan"] is not None:

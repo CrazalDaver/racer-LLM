@@ -15,8 +15,8 @@ class DynamicParams:
         self.K_RFY: float = 20.
         self.K_FFY: float = 20.
         self.Iz: float = 0.1
-        self.Ta: float = 5.5
-        self.Tb: float = -1.
+        self.Ta: float = 5.5    # throttle gain
+        self.Tb: float = -1.    # velocity-dependent term
         self.Sa: float = 0.36
         self.Sb: float = 0.03
         self.mu: float = 3.0
@@ -25,23 +25,8 @@ class DynamicParams:
         self.Bf: float = 60.0
         self.Br: float = 60.0
         self.hcom: float = 0.0
-        self.fr: float = 0.1
+        self.fr: float = 0.1    # friction
         self.delay: int = 4
-        # self.LF = 0.11
-        # self.LR = 0.23
-        # self.MASS = 4.65 # kg
-        # self.Iz = 0.1
-        # self.Ta = 8.0    # throttle gain
-        # self.Tb = -1.0   # velocity-dependent term
-        # self.Sa = 0.60   # 
-        # self.Sb = 0.0
-        # self.mu = 3.0
-        # self.Cf = 1.0
-        # self.Cr = 1.0
-        # self.Bf = 60.0
-        # self.Br = 60.0
-        # self.hcom = 0.0
-        # self.fr = 0.1    # friction
         self.ros_kinematic = False
 
         if model_type in {"kinematic", "kinetic", "kinetics"}:
@@ -78,19 +63,35 @@ class SimParams:
     TRACK_SCALE = 2.0
     TRACK_HALF_WIDTH = 0.44
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
+    VEHICLE_HALF_LENGTH = 0.18
+    VEHICLE_HALF_WIDTH = 0.12
     MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH
     REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH
-    # Minimum separations used by the paper's MPC collision-avoidance
-    # constraints (1g)-(1h).  They approximate the 1/10-scale car footprint.
-    MPC_MIN_LONGITUDINAL_SEPARATION = 0.36
-    MPC_MIN_LATERAL_SEPARATION = 0.20
+    # Smooth collision exclusion used by the continuous NLP solver:
+    #
+    #     (delta_s / a)^p + (delta_e / b)^p >= 1,
+    #
+    # where delta_s and delta_e are the longitudinal and lateral separations,
+    # and p=4 gives a rounded-rectangle (superellipse).  The paper's literal
+    # constraints |delta_s| >= 0.36 AND |delta_e| >= 0.24 would incorrectly
+    # prohibit ordinary following and side-by-side racing; collision-free
+    # rectangle separation is an OR condition and is awkward for IPOPT.
+    #
+    # For two axis-aligned cars with combined half-extents ds=0.36 m and
+    # de=0.24 m, multiplying both axes by 2**(1/p) makes the p-superellipse
+    # contain the complete rectangular overlap region.  With p=4 this gives
+    # a ~= 0.428 m and b ~= 0.285 m.  These are MPC centre-to-centre safety
+    # separations; track-boundary vehicle-width margins are intentionally not
+    # included here.
+    MPC_MIN_LONGITUDINAL_SEPARATION = 0.428
+    MPC_MIN_LATERAL_SEPARATION = 0.285
     MPC_MAX_CONSTRAINED_OPPONENTS = 2  # nearest car ahead and nearest car behind
     MPC_COLLISION_SUPERELLIPSE_EXPONENT = 4
     OFFROAD_TOLERANCE = 0.05
     OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
     MPC_DT = 0.1
 
-    MPC_HORIZON = 8
+    MPC_HORIZON = 10
 
     Q = np.diag([1.0, 1.0])
     R = np.diag([1.0, 1.0]) #* 1e-6
@@ -100,7 +101,7 @@ class SimParams:
 
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0
-    MAX_STEER_RATE = 4.0
+    MPC_MAX_STEER_DELTA = 0.4  # max normalized steering-command change per MPC step
     MAX_RACELINE_SPEED = 5.0
     PROJECTION_SEARCH_RADIUS = 1.0
     PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
@@ -108,7 +109,6 @@ class SimParams:
     VEHICLE_MODEL = "kinematic"
     NUM_CARS = 1
     CAR_START_GAP = 6.0
-    UNSAFE_DISTANCE = 0.4
     EARLY_COLLISION_STOP = False # stop early if cars collide immediately after launch
     EARLY_COLLISION_WINDOW_STEPS = 150 # only apply early collision stop during the first N simulation steps
     EARLY_COLLISION_CONSECUTIVE_STEPS = 3 # require this many consecutive collision steps before stopping
@@ -121,7 +121,10 @@ class SimParams:
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     LLM_SAFEGUARD_ENABLED = True # validate/correct discrete LLM modes against the current race context
     STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 0.5, 0.5])  # q, zeta, s1, s2, s3
-    ALPHARACER_PARAMS = STATIC_POLICY_PARAMS  # backward-compatible name
+    # Upstream optimizer coordinates: sf1, sf2, lookahead_factor,
+    # speed_factor, blocking. AlphaRacerPolicy maps these to q, zeta, s1,
+    # s2, s3 and then updates them online with the learned potential model.
+    ALPHARACER_INITIAL_ORIGINAL_PARAMS = np.array([0.3, 0.2, 0.25, 0.95, 0.0])
     POTENTIAL_FUNCTION_WEIGHT_PATH = "alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth"
     POTENTIAL_FUNCTION_OPT_STYLE = "grad"  # Paper/default upstream online optimizer.
     POTENTIAL_FUNCTION_GRADIENT_RATE = 1e-4

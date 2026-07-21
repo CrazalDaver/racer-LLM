@@ -82,7 +82,7 @@ def _policy_params_for_name(policy_names, snapshot):
         "decision_tree",
     }:
         return snapshot["LLM_POLICY_PARAMS"]
-    return snapshot.get("STATIC_POLICY_PARAMS", snapshot["ALPHARACER_PARAMS"])
+    return snapshot["STATIC_POLICY_PARAMS"]
 
 
 def _format_param(value):
@@ -215,7 +215,6 @@ def _override_snapshot(
     if fixed_params is not None:
         fixed_params = [float(value) for value in fixed_params]
         snapshot["STATIC_POLICY_PARAMS"] = fixed_params
-        snapshot["ALPHARACER_PARAMS"] = fixed_params
     if overrides["llm_policy_params"] is not None:
         snapshot["LLM_POLICY_PARAMS"] = [float(value) for value in overrides["llm_policy_params"]]
     if overrides["llm_output_mode"] is not None:

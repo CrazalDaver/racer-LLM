@@ -160,6 +160,9 @@ def create_policy(
             policy_name=policy_type,
         )
     if policy_type == "static_alpharacer":
+        # alpharacer_params is accepted here only as a legacy name for fixed
+        # executable q, zeta, s1, s2, s3 parameters.
+        fixed_params = static_policy_params if static_policy_params is not None else alpharacer_params
         return StaticAlphaRacerPolicy(
             track,
             mpc,
@@ -167,8 +170,8 @@ def create_policy(
             policy_name=policy_type,
             params=np.asarray(
                 params.STATIC_POLICY_PARAMS
-                if static_policy_params is None
-                else static_policy_params,
+                if fixed_params is None
+                else fixed_params,
                 dtype=float,
             ).copy(),
             raceline=raceline,
@@ -231,10 +234,6 @@ def create_policy(
             mpc,
             car_idx=car_idx,
             policy_name=policy_type,
-            params=np.asarray(
-                params.ALPHARACER_PARAMS if alpharacer_params is None else alpharacer_params,
-                dtype=float,
-            ).copy(),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
             ref_lateral_clip=params.REF_LATERAL_CLIP,
@@ -243,6 +242,7 @@ def create_policy(
             search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS,
             opt_style=params.POTENTIAL_FUNCTION_OPT_STYLE,
             gradient_rate=params.POTENTIAL_FUNCTION_GRADIENT_RATE,
+            initial_original_params=params.ALPHARACER_INITIAL_ORIGINAL_PARAMS,
         )
     if policy_type == "self_play_rl":
         return SelfPlayRLPolicy(
@@ -251,7 +251,7 @@ def create_policy(
             car_idx=car_idx,
             policy_name=policy_type,
             params=np.asarray(
-                params.ALPHARACER_PARAMS if alpharacer_params is None else alpharacer_params,
+                params.STATIC_POLICY_PARAMS if alpharacer_params is None else alpharacer_params,
                 dtype=float,
             ).copy(),
             raceline=raceline,
@@ -300,9 +300,23 @@ def save_simulation_trace(trace, track, params):
         omega=np.asarray(trace["omega"]),
         car_x=np.asarray(trace["car_x"]),
         car_y=np.asarray(trace["car_y"]),
+        car_psi=np.asarray(trace["car_psi"]),
         car_vx=np.asarray(trace["car_vx"]),
+        car_vy=np.asarray(trace["car_vy"]),
+        car_omega=np.asarray(trace["car_omega"]),
         car_px=np.asarray(trace["car_px"]),
         car_py=np.asarray(trace["car_py"]),
+        car_throttle=np.asarray(trace["car_throttle"]),
+        car_steer=np.asarray(trace["car_steer"]),
+        car_mpc_loss=np.asarray(trace["car_mpc_loss"]),
+        car_mpc_track_loss=np.asarray(trace["car_mpc_track_loss"]),
+        car_mpc_action_loss=np.asarray(trace["car_mpc_action_loss"]),
+        car_mpc_velocity_loss=np.asarray(trace["car_mpc_velocity_loss"]),
+        car_mpc_heading_loss=np.asarray(trace["car_mpc_heading_loss"]),
+        car_mpc_solver_success=np.asarray(trace["car_mpc_solver_success"]),
+        car_mpc_solver_status=np.asarray(trace["car_mpc_solver_status"]),
+        car_mpc_recovery_active=np.asarray(trace["car_mpc_recovery_active"]),
+        car_mpc_recovery_reason=np.asarray(trace["car_mpc_recovery_reason"]),
         collision=np.asarray(trace["collision"]),
         px=np.asarray(trace["px"]),
         py=np.asarray(trace["py"]),
@@ -326,6 +340,8 @@ def save_simulation_trace(trace, track, params):
         mpc_heading_loss=np.asarray(trace["mpc_heading_loss"]),
         mpc_solver_success=np.asarray(trace["mpc_solver_success"]),
         mpc_solver_status=np.asarray(trace["mpc_solver_status"]),
+        mpc_recovery_active=np.asarray(trace["mpc_recovery_active"]),
+        mpc_recovery_reason=np.asarray(trace["mpc_recovery_reason"]),
         policy_params=np.asarray(trace["policy_params"]),
         policy_mode=np.asarray(trace["policy_mode"]),
         policy_reason=np.asarray(trace.get("policy_reason", []), dtype=str),
@@ -354,6 +370,8 @@ def save_simulation_trace(trace, track, params):
         track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),
         track_width=np.asarray(params.TRACK_WIDTH),
         track_half_width=np.asarray(getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)),
+        vehicle_half_length=np.asarray(params.VEHICLE_HALF_LENGTH),
+        vehicle_half_width=np.asarray(params.VEHICLE_HALF_WIDTH),
         mpc_constraint_half_width=np.asarray(
             getattr(params, "MPC_CONSTRAINT_HALF_WIDTH", getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0))
         ),
@@ -463,7 +481,7 @@ def run_simulation(
             Q=params.Q,
             R=params.R,
             max_vel_rate=params.MAX_VEL_RATE,
-            max_steer_rate=params.MAX_STEER_RATE,
+            max_steer_delta=params.MPC_MAX_STEER_DELTA,
             db_params=vehicle_params,
             track_width=params.TRACK_WIDTH,
             track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
@@ -535,9 +553,23 @@ def run_simulation(
         "omega": [],
         "car_x": [],
         "car_y": [],
+        "car_psi": [],
         "car_vx": [],
+        "car_vy": [],
+        "car_omega": [],
         "car_px": [],
         "car_py": [],
+        "car_throttle": [],
+        "car_steer": [],
+        "car_mpc_loss": [],
+        "car_mpc_track_loss": [],
+        "car_mpc_action_loss": [],
+        "car_mpc_velocity_loss": [],
+        "car_mpc_heading_loss": [],
+        "car_mpc_solver_success": [],
+        "car_mpc_solver_status": [],
+        "car_mpc_recovery_active": [],
+        "car_mpc_recovery_reason": [],
         "collision": [],
         "px": [],
         "py": [],
@@ -561,6 +593,8 @@ def run_simulation(
         "mpc_heading_loss": [],
         "mpc_solver_success": [],
         "mpc_solver_status": [],
+        "mpc_recovery_active": [],
+        "mpc_recovery_reason": [],
         "policy_params": [],
         "policy_mode": [],
         "policy_reason": [],
@@ -715,9 +749,23 @@ def run_simulation(
         trace["omega"].append(ego_state.omega)
         trace["car_x"].append([state.x for state in states])
         trace["car_y"].append([state.y for state in states])
+        trace["car_psi"].append([state.psi for state in states])
         trace["car_vx"].append([state.vx for state in states])
+        trace["car_vy"].append([state.vy for state in states])
+        trace["car_omega"].append([state.omega for state in states])
         trace["car_px"].append(car_s)
         trace["car_py"].append(car_e)
+        trace["car_throttle"].append([action.throttle for action in actions])
+        trace["car_steer"].append([action.steer for action in actions])
+        trace["car_mpc_loss"].append([mpc.last_loss for mpc in mpcs])
+        trace["car_mpc_track_loss"].append([mpc.last_track_loss for mpc in mpcs])
+        trace["car_mpc_action_loss"].append([mpc.last_action_loss for mpc in mpcs])
+        trace["car_mpc_velocity_loss"].append([mpc.last_velocity_loss for mpc in mpcs])
+        trace["car_mpc_heading_loss"].append([mpc.last_heading_loss for mpc in mpcs])
+        trace["car_mpc_solver_success"].append([mpc.last_solver_success for mpc in mpcs])
+        trace["car_mpc_solver_status"].append([mpc.last_solver_status for mpc in mpcs])
+        trace["car_mpc_recovery_active"].append([mpc.last_recovery_active for mpc in mpcs])
+        trace["car_mpc_recovery_reason"].append([mpc.last_recovery_reason for mpc in mpcs])
         trace["px"].append(car_s[ego_idx])
         trace["py"].append(car_e[ego_idx])
         trace["ref_x"].append(ref_fx)
@@ -738,6 +786,8 @@ def run_simulation(
         trace["mpc_heading_loss"].append(ego_mpc.last_heading_loss)
         trace["mpc_solver_success"].append(ego_mpc.last_solver_success)
         trace["mpc_solver_status"].append(ego_mpc.last_solver_status)
+        trace["mpc_recovery_active"].append(ego_mpc.last_recovery_active)
+        trace["mpc_recovery_reason"].append(ego_mpc.last_recovery_reason)
         trace["policy_params"].append(getattr(ego_policy, "params", np.full(5, np.nan)).copy())
         trace["policy_mode"].append(getattr(ego_policy, "current_mode", "fixed"))
         trace["policy_reason"].append(getattr(ego_policy, "last_llm_reason", ""))
@@ -773,14 +823,36 @@ def run_simulation(
             )
             states[car_idx] = CarState.from_array(next_state_arr)
 
+        # Project the updated positions before collision detection so the
+        # simulator uses the same Frenet-frame superellipse as the MPC.
+        next_s = []
+        next_e = []
+        for car_idx, state in enumerate(states):
+            s, e = project_vehicle_state(
+                track,
+                state,
+                progress_s[car_idx],
+                params.PROJECTION_SEARCH_RADIUS,
+                params.PROJECTION_MAX_HEADING_ERROR,
+            )
+            progress_s[car_idx] = s
+            next_s.append(s)
+            next_e.append(e)
+
         collision_scales = np.ones(num_cars)
         for i in range(num_cars):
             for j in range(i + 1, num_cars):
-                distance = np.hypot(states[i].x - states[j].x, states[i].y - states[j].y)
-                if distance > params.UNSAFE_DISTANCE:
+                delta_ij = progress_delta(next_s[i], next_s[j], track.total_length)
+                delta_e = next_e[i] - next_e[j]
+                collision_metric = (
+                    (delta_ij / params.MPC_MIN_LONGITUDINAL_SEPARATION)
+                    ** params.MPC_COLLISION_SUPERELLIPSE_EXPONENT
+                    + (delta_e / params.MPC_MIN_LATERAL_SEPARATION)
+                    ** params.MPC_COLLISION_SUPERELLIPSE_EXPONENT
+                )
+                if collision_metric > 1.0:
                     continue
 
-                delta_ij = progress_delta(car_s[i], car_s[j], track.total_length)
                 if delta_ij > 0.0:
                     front_idx, rear_idx = i, j
                 elif delta_ij < 0.0:
@@ -802,20 +874,8 @@ def run_simulation(
         elif step < params.EARLY_COLLISION_WINDOW_STEPS:
             early_collision_count = 0
 
-        next_s = []
-        next_e = []
         for car_idx, state in enumerate(states):
-            s, e = project_vehicle_state(
-                track,
-                state,
-                progress_s[car_idx],
-                params.PROJECTION_SEARCH_RADIUS,
-                params.PROJECTION_MAX_HEADING_ERROR,
-            )
-            progress_s[car_idx] = s
-            next_s.append(s)
-            next_e.append(e)
-
+            e = next_e[car_idx]
             if abs(e) > offroad_half_width:
                 overshoot = abs(e) - offroad_half_width
                 factor = np.exp(-params.OFFROAD_STRENGTH * overshoot)
@@ -952,48 +1012,6 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
-    # # baseline simulation with AlphaRacer policy and Dynamic Bicycle Model
-    # run_simulation(
-    #     policy_type="static_alpharacer", v0=5, vehicle_model_type="kinematic",
-    #     alpharacer_params=[1.0, 1.0, 0.0, 0.0, 0.0], velocity_track_weight=0.0, horizon=8,
-    #     ) # most basic settings.
-    
-    # run_simulation(
-    #     policy_type="static_alpharacer",
-    #     v0=0,
-    #     vehicle_model_type="dbm",
-    #     alpharacer_params=[1.0, 1.0, 0.0, 0.0, 0.0],
-    #     velocity_track_weight=2.0,
-    #     horizon=8,
-    # ) # with dynamic bicycle model.
-
-    # multiple cars with different policies
-    # run_simulation(
-    #     policy_names=["static_alpharacer", "centerline", "centerline"], vehicle_model_type="kinematic",
-    #     alpharacer_params=[1.0, 1.0, 1.3, 0.3, 0.3], velocity_track_weight=2.0, horizon=8,
-    #     ego_position=3,
-    # )
-
-    # simulation of multiple cars
-    # run_simulation(
-    #     # run_simulation treats policy_names[0] as the traced ego car.
-    #     # ego_position only changes that ego car's starting rank.
-    #     # ego, oppo 1, oppo 2
-    #     policy_names=["LLM", "IBR", "IBR"], vehicle_model_type="kinematic",
-    #     llm_policy_params=[1.0, 1.0, 1.5, 0.5, 0.5], velocity_track_weight=2.0, horizon=8,
-    #     v0=0.0, llm_output_mode="mode", llm_update_interval_steps=10,
-    #     ego_position=3,
-    # )
-
-    # LLM vs baseline IBR 
-    # run_simulation(
-    #     policy_names=["LLM", "IBR", "IBR"],  # ego, oppo1, oppo2
-    #     llm_model_names=["qwen2.5:0.5b", None, None],
-    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50,
-    #     llm_temperature = 1.0,
-    # )
- 
-    # LLM vs alphaRacer opponents
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
