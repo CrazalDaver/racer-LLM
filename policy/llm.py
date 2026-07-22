@@ -1,11 +1,13 @@
 import json
 import math
+from pathlib import Path
 import re
 import urllib.error
 import urllib.request
 
 import numpy as np
 
+from config import params as sim_params
 from state import CarState
 
 from .mpc import MPCPolicy
@@ -31,6 +33,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         output_mode="auto", # "mode" for discrete mode selection, "params" for direct parameter output, "auto" to infer from model name.
         safeguard_enabled=False,  # If True, apply deterministic mode-guarding rules to the LLM output.
         param_bounds=None,
+        system_prompt_path=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -47,26 +50,21 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.llm_decision_history = []
         self.llm_raw_io_history = []
         self._last_raw_llm_response = ""
+        self._last_llm_done_reason = ""
+        self._last_llm_eval_count = -1
         self._llm_call_count = 0
         self.last_llm_reason = "not_called"
+        self.last_llm_basis = "not_called"
         self.last_llm_requested_mode = "stable"
         self.last_safeguard_override = ""
-        self.param_bounds = param_bounds if param_bounds is not None else {
-            "q": (0.05, 20.0),
-            "zeta": (0.1, 3.0),
-            "s1": (0.0, self.mpc.track_half_width),
-            "s2": (0.001, 5.0),
-            "s3": (0.0, 5.0),
-        }
+        self.param_bounds = (
+            param_bounds if param_bounds is not None else sim_params.LLM_PARAMETER_BOUNDS.copy()
+        )
         self.last_llm_params = self.params.copy()
         self.last_llm_error = None
         self._warned_llm_error = False
         self.mode_presets = {
-            "stable": np.asarray([1.3, 1.0, 0.05, 1.0, 0.0], dtype=float),
-            "push": np.asarray([1.8, 1.25, 0.05, 1.0, 0.0], dtype=float),
-            "overtake": np.asarray([1.0, 1.35, 1.75, 0.1, 0.0], dtype=float),
-            "block": np.asarray([1.6, 0.90, 0.05, 0.45, 2.0], dtype=float),
-            "recover": np.asarray([3.0, 0.70, 0.0, 1.5, 0.0], dtype=float),
+            name: values.copy() for name, values in sim_params.LLM_MODE_PRESETS.items()
         }
         self.mode_aliases = {
             "normal": "stable",
@@ -84,6 +82,14 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "fallback": "recover",
         }
         self.current_mode = "stable"
+        self.last_llm_assessment = {}
+        self.last_required_assessment = {}
+        self.last_assessment_consistent = True
+        if system_prompt_path is None:
+            filename = "params_system.txt" if self.output_mode == "params" else "mode_system.txt"
+            system_prompt_path = Path(__file__).with_name("prompts") / filename
+        self.system_prompt_path = Path(system_prompt_path)
+        self.system_prompt = self.system_prompt_path.read_text(encoding="utf-8").strip()
 
     def _resolve_output_mode(self, output_mode, model_name) -> str:
         mode = str(output_mode).strip().lower().replace("-", "_")
@@ -94,19 +100,173 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             return "params"
         return "mode"
 
-    def _history_text(self) -> str:
-        if not self.llm_decision_history:
-            return "none"
-        lines = []
+    @staticmethod
+    def _rounded(value, digits=3):
+        if value is None or not np.isfinite(value):
+            return None
+        return round(float(value), digits)
+
+    def _decision_history_payload(self) -> dict:
+        modes = []
         for item in self.llm_decision_history[-self.history_length:]:
-            params = item["params"]
-            lines.append(
-                f"call={item['call']}, requested={item['requested_mode']}, "
-                f"executed={item['mode']}, reason={item['reason']}, "
-                f"q={params[0]:.3f}, zeta={params[1]:.3f}, "
-                f"s1={params[2]:.3f}, s2={params[3]:.3f}, s3={params[4]:.3f}"
-            )
-        return "\n".join(lines)
+            entry = {
+                "mode": item["mode"],
+            }
+            if self.output_mode == "params":
+                entry["params"] = {
+                    name: self._rounded(value)
+                    for name, value in zip(("q", "zeta", "s1", "s2", "s3"), item["params"])
+                }
+            modes.append(entry)
+        return {
+            "usage": "continuity_only",
+            "contains_scene_evidence": False,
+            "oldest_to_newest": modes,
+        }
+
+    def _opponent_feature(self, state, current_py, current_s, opponent, fallback_id) -> dict:
+        delta_s = float(progress_delta(opponent["px"], current_s, self.track.total_length))
+        delta_e = float(opponent.get("py", 0.0) - current_py)
+        relation = "ahead" if delta_s > 0.05 else "behind" if delta_s < -0.05 else "alongside"
+        ego_speed = max(float(state.vx), 0.0)
+        opponent_speed = max(float(opponent.get("vx", 0.0)), 0.0)
+        if relation == "ahead":
+            closing_speed = ego_speed - opponent_speed
+        elif relation == "behind":
+            closing_speed = opponent_speed - ego_speed
+        else:
+            closing_speed = abs(ego_speed - opponent_speed)
+        ttc = abs(delta_s) / closing_speed if closing_speed > 0.05 else None
+
+        abs_delta_s = abs(delta_s)
+        min_longitudinal = float(getattr(self.mpc, "min_longitudinal_separation", 0.36))
+        if abs_delta_s < min_longitudinal:
+            gap_band = "overlap"
+        elif abs_delta_s < 0.8:
+            gap_band = "critical"
+        elif abs_delta_s < 2.5:
+            gap_band = "close"
+        elif abs_delta_s < 4.0:
+            gap_band = "nearby"
+        else:
+            gap_band = "far"
+
+        lateral_limit = float(self.ref_lateral_clip)
+        min_lateral = float(getattr(self.mpc, "min_lateral_separation", 0.24))
+        opponent_py = float(opponent.get("py", 0.0))
+        left_pass_possible = lateral_limit - opponent_py >= min_lateral
+        right_pass_possible = opponent_py + lateral_limit >= min_lateral
+        if left_pass_possible and right_pass_possible:
+            pass_space = "both"
+        elif left_pass_possible:
+            pass_space = "left"
+        elif right_pass_possible:
+            pass_space = "right"
+        else:
+            pass_space = "none"
+
+        speed_delta = ego_speed - opponent_speed
+        speed_relation = "slower" if speed_delta > 0.1 else "faster" if speed_delta < -0.1 else "similar"
+        return {
+            "id": int(opponent.get("car_idx", fallback_id)),
+            "relation": relation,
+            "delta_s": self._rounded(delta_s),
+            "delta_e": self._rounded(delta_e),
+            "distance_band": gap_band,
+            "same_lane": abs(delta_e) < min_lateral,
+            "speed": self._rounded(opponent_speed),
+            "speed_relation_to_ego": speed_relation,
+            "closing_speed": self._rounded(max(closing_speed, 0.0)),
+            "ttc": self._rounded(ttc),
+            "pass_space": pass_space,
+        }
+
+    def _scene_features(self, state: CarState, current_s: float, opponents=None) -> dict:
+        _, current_py = self.track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=8.0,
+            psi_hint=state.psi,
+            max_heading_error=math.pi / 2.0,
+        )
+        lateral_limit = float(getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width))
+        opponents_payload = [
+            self._opponent_feature(state, current_py, current_s, opponent, idx)
+            for idx, opponent in enumerate(opponents or [])
+        ]
+        opponents_payload.sort(key=lambda item: abs(item["delta_s"]))
+        nearest_front = next((item for item in opponents_payload if item["relation"] == "ahead"), None)
+        nearest_rear = next((item for item in opponents_payload if item["relation"] == "behind"), None)
+
+        def interaction_risk(item):
+            if item is None:
+                return "clear"
+            if item["distance_band"] == "overlap" and item["same_lane"]:
+                return "overlap"
+            if item["ttc"] is not None and item["ttc"] < 1.0 and item["same_lane"]:
+                return "critical"
+            if item["closing_speed"] > 0.1 and item["distance_band"] != "far" and item["same_lane"]:
+                return "closing"
+            return "far"
+
+        boundary_ratio = abs(float(current_py)) / max(lateral_limit, 1e-6)
+        boundary_risk = "outside" if boundary_ratio > 1.0 else "near" if boundary_ratio >= 0.95 else "low"
+        if not self.mpc.last_solver_success or self.mpc.last_recovery_active:
+            mpc_health = "failure"
+        elif np.isfinite(self.mpc.last_loss):
+            mpc_health = "ok"
+        else:
+            mpc_health = "not_run"
+
+        held_updates = 0
+        for item in reversed(self.llm_decision_history):
+            if item["mode"] != self.current_mode:
+                break
+            held_updates += 1
+
+        return {
+            "ego": {
+                "progress": self._rounded(current_s),
+                "speed": self._rounded(max(float(state.vx), 0.0)),
+                "lateral_offset": self._rounded(current_py),
+                "heading_error": self._rounded(track_heading_error(self.track, state.psi, current_s)),
+                "left_boundary_space": self._rounded(lateral_limit - current_py),
+                "right_boundary_space": self._rounded(lateral_limit + current_py),
+                "boundary_risk": boundary_risk,
+                "lookahead_curvature": self._rounded(
+                    track_curvature_at(self.track, current_s + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon)
+                ),
+                "mpc_health": mpc_health,
+                "mpc_status": str(self.mpc.last_solver_status),
+            },
+            "interaction": {
+                "front_risk": interaction_risk(nearest_front),
+                "rear_risk": interaction_risk(nearest_rear),
+                "nearest_front": nearest_front,
+                "nearest_rear": nearest_rear,
+                "opponents_by_distance": opponents_payload,
+            },
+            "limits": {
+                "vehicle_center_half_width": self._rounded(lateral_limit),
+                "reference_half_width": self._rounded(self.ref_lateral_clip),
+                "close_front_distance": 2.5,
+                "overtake_distance": 4.0,
+                "push_max_abs_curvature": 0.15,
+                "critical_ttc": 1.0,
+            },
+            "decision_state": {
+                "previous_mode": self.current_mode,
+                "held_updates": held_updates,
+                "recent_decisions": self._decision_history_payload(),
+            },
+            "required_assessment": {
+                "front_risk": interaction_risk(nearest_front),
+                "rear_risk": interaction_risk(nearest_rear),
+                "boundary_risk": boundary_risk,
+                "mpc_health": mpc_health,
+            },
+        }
 
     def _record_llm_decision(self):
         if self.history_length <= 0:
@@ -125,118 +285,19 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self.llm_decision_history = self.llm_decision_history[-self.history_length:]
 
     def _prompt(self, state: CarState, current_s: float, opponents=None) -> str:
-        opponents = opponents or []
-        _, current_py = self.track.project(
-            state.x,
-            state.y,
-            s_hint=current_s,
-            search_radius=8.0,
-            psi_hint=state.psi,
-            max_heading_error=math.pi / 2.0,
-        )
-        opponent_lines = []
-        for idx, opponent in enumerate(opponents):
-            delta_s = progress_delta(opponent["px"], current_s, self.track.total_length)
-            relation = "ahead" if delta_s > 0.0 else "behind" if delta_s < 0.0 else "alongside"
-            speed_relation = "slower" if opponent["vx"] < state.vx else "faster" if opponent["vx"] > state.vx else "same_speed"
-            lateral_gap = opponent["py"] - current_py
-            opponent_lines.append(
-                f"{idx}: delta_px={delta_s:.3f}, relation={relation}, "
-                f"speed_relation={speed_relation}, py={opponent['py']:.3f}, "
-                f"lateral_gap={lateral_gap:.3f}, vx={opponent['vx']:.3f}"
-            )
-        opponent_text = "\n".join(opponent_lines) if opponent_lines else "none"
-        preset_lines = "\n".join(  # list available modes and their parameters
-            f"- {name}: q={values[0]:.2f}, zeta={values[1]:.2f}, "
-            f"s1={values[2]:.2f}, s2={values[3]:.2f}, s3={values[4]:.2f}"
-            for name, values in self.mode_presets.items()
-        )
+        # Generate a JSON payload of the current scene and race context
+        payload = self._scene_features(state, current_s, opponents=opponents)
+        self.last_required_assessment = payload["required_assessment"].copy()
         if self.output_mode == "params":
-            history_text = self._history_text()
-            common_context = (
-                "The underlying parameter meaning is Q=qI track loss weight; zeta scales raceline speed integration; "
-                "s1/s2 tune overtaking lateral offset and longitudinal decay; s3 tunes blocking.\n"
-                f"Allowed ranges: q {self.param_bounds['q']}, zeta {self.param_bounds['zeta']}, "
-                f"s1 {self.param_bounds['s1']}, s2 {self.param_bounds['s2']}, s3 {self.param_bounds['s3']}.\n"
-                f"Current car: px={current_s:.3f}, py={current_py:.3f}, "
-                f"x={state.x:.3f}, y={state.y:.3f}, psi={state.psi:.3f}, "
-                f"vx={state.vx:.3f}, vy={state.vy:.3f}, omega={state.omega:.3f}.\n"
-                f"Opponents in Frenet frame relative to ego:\n{opponent_text}\n"
-                f"Previous mode: {self.current_mode}.\n"
-                f"Previous parameters: q={self.params[0]:.3f}, zeta={self.params[1]:.3f}, "
-                f"s1={self.params[2]:.3f}, s2={self.params[3]:.3f}, s3={self.params[4]:.3f}.\n"
-                f"Recent LLM outputs, oldest to newest:\n{history_text}\n"
-            )
-            return (
-                "You choose alpha-RACER MPC policy parameters directly. Return only valid JSON with exactly these keys: "
-                "{\"q\":1.2,\"zeta\":1.0,\"s1\":0.2,\"s2\":0.8,\"s3\":0.2,"
-                "\"reason\":\"clear track, maintain pace\"}. Do not include a mode key. "
-                "Keep reason under 12 words and base it only on the supplied state.\n"
-                f"{common_context}"
-                "Parameter guidance: increase q for tighter tracking/recovery only after off-track, collision, or repeated stall; "
-                "do not treat low vx at race start as a recovery condition; reduce zeta when approaching hard turns or unstable; "
-                "increase s1 only when lateral interaction is useful, and avoid very large s1 because the usable lane width is narrow; "
-                "increase s2 for more local/short-range interaction; increase s3 only when blocking a faster rear car is useful.\n"
-                "For overtaking a close slower front car, prefer cautious zeta below 1.0 and enough lateral offset instead of high zeta, "
-                "otherwise ego can rear-end the front car before it is laterally separated. "
-                "Use push-style parameters only when the nearest front opponent is absent or has delta_px above 4.0 m, and no opponent is near-overlap. "
-                "When any opponent has abs(delta_px) below 0.8 m and abs(lateral_gap) below 0.6 m, do not use push-style parameters with high zeta and near-zero lateral interaction. "
-                "In that near-overlap case, use overtaking-style parameters if ego is still moving and there is room to pass, or stable/recovery-style parameters if the situation is uncertain. "
-                "For blocking, use moderate s3 and avoid forcing large defensive offsets unless a faster rear car is clearly threatening. "
-                "If speed is very low while another car is very close, use high q, low zeta, and near-zero interaction to recover.\n"
-                "Use recent LLM outputs to avoid oscillation. If the recent output was overtaking and the same slow front car is still close, "
-                "keep overtaking-style parameters unless the car is off-track, collided, or already clear of that car.\n"
-                "JSON example: {\"q\":1.2,\"zeta\":1.0,\"s1\":0.2,\"s2\":0.8,\"s3\":0.2,"
-                "\"reason\":\"clear track, maintain pace\"}"
-            )
-        
-        # mode version
-        history_text = self._history_text()
-        return (
-            "You choose one alpha-RACER MPC behavior mode. Return only valid JSON like "
-            "{\"mode\":\"stable\",\"reason\":\"close front car, hold position\"}. "
-            "Do not invent modes. Keep reason under 12 words and base it only on the supplied state.\n"
-            "Available modes:\n"
-            f"{preset_lines}\n"
-            "Mode meanings: stable follows the raceline with almost no lateral interaction; push tracks harder on clear road; "
-            "overtake creates a local lateral offset around a slower front car while avoiding rear-end contact; "
-            "block defends against a faster rear car by moving toward the rear car's lane; "
-            "recover uses tight tracking and low speed integration to leave contact or off-track states.\n"
-            "Hard mode validity rules: never output push unless every push condition below is true. "
-            "Push conditions: nearest front opponent is absent or has delta_px above 4.0 m; no opponent is near-overlap; abs(py) is below 0.45. "
-            "If any push condition is false, output stable, overtake, block, or recover, but not push. "
-            "Choose overtake when an opponent is ahead, close, and slower than ego. Close means positive delta_px below 2.5 m. "
-            "Also choose overtake to continue an active pass when an opponent is near-overlap: abs(delta_px) below 0.8 m and abs(lateral_gap) below 0.6 m. "
-            "If a car is near-overlap, push is unsafe even when relation is not ahead; choose overtake if ego is still moving and a pass is forming, otherwise choose stable. "
-            "If the slower front car is extremely close, delta_px below 0.6 m, and abs(lateral_gap) below 0.25 m, avoid push and avoid a hard high-speed overtake; choose stable or recover to prevent rear-end contact. "
-            "Overtake is valid when there is a slower front opponent with positive delta_px below 3.0 m, or when the same opponent is near-overlap during a pass. "
-            "If no opponent is ahead/close/slower and no opponent is near-overlap, do not output overtake. "
-            "If a slower front opponent has positive delta_px below 2.5 m, overtake has priority over push. "
-            "Push is allowed only when the nearest front opponent is absent or has delta_px above 4.0 m, no opponent is near-overlap, and ego is not near the lane boundary. "
-            "Push is invalid when any opponent is ahead with positive delta_px below 4.0 m or any opponent is near-overlap. "
-            "If recent outputs include overtake and the same opponent is still ahead or near-overlap, keep overtake until ego is clearly past it. "
-            "Clearly past means that opponent's delta_px is negative with enough longitudinal separation and the track ahead is clear. "
-            "After ego is clearly past the opponent, use push on clear track or stable if uncertain. "
-            "Block is valid only when an opponent has relation=behind and speed_relation=faster; use it cautiously, not as the default response to any rear car. "
-            "Do not choose recover just because py is offset during an overtake; choose recover when |py| is large, after contact, after off-track behavior, "
-            "or when speed is very low and any opponent is still very close. "
-            "Use push only on clear track; otherwise use stable.\n"
-            "The underlying parameter meaning is Q=qI track loss weight; zeta scales raceline speed integration; "
-            "s1/s2 tune overtaking lateral offset and longitudinal decay; s3 tunes blocking.\n"
-            f"Allowed ranges: q {self.param_bounds['q']}, zeta {self.param_bounds['zeta']}, "
-            f"s1 {self.param_bounds['s1']}, s2 {self.param_bounds['s2']}, s3 {self.param_bounds['s3']}.\n"
-            f"Current car: px={current_s:.3f}, py={current_py:.3f}, "
-            f"x={state.x:.3f}, y={state.y:.3f}, psi={state.psi:.3f}, "
-            f"vx={state.vx:.3f}, vy={state.vy:.3f}, omega={state.omega:.3f}.\n"
-            f"Opponents in Frenet frame relative to ego:\n{opponent_text}\n"
-            f"Previous mode: {self.current_mode}.\n"
-            f"Previous parameters: q={self.params[0]:.3f}, zeta={self.params[1]:.3f}, "
-            f"s1={self.params[2]:.3f}, s2={self.params[3]:.3f}, s3={self.params[4]:.3f}.\n"
-            f"Recent LLM outputs, oldest to newest:\n{history_text}\n"
-            "Use recent LLM outputs to avoid oscillation. "
-            "Do not continue overtake from history after the close front opponent is gone.\n"
-            "JSON example: {\"mode\":\"stable\",\"reason\":\"clear track, low interaction risk\"}"
-        )
+            payload["parameter_bounds"] = {
+                name: {"min": float(bounds[0]), "max": float(bounds[1])}
+                for name, bounds in self.param_bounds.items()
+            }
+            payload["current_parameters"] = {
+                name: self._rounded(value)
+                for name, value in zip(("q", "zeta", "s1", "s2", "s3"), self.params)
+            }
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
 
     def _extract_json(self, text: str) -> dict:
         try:
@@ -247,14 +308,52 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 raise
             return json.loads(match.group(0))
 
+    def _output_schema(self) -> dict:
+        properties = {
+            "basis": {
+                "type": "string",
+                "enum": [
+                    "mpc_failure",
+                    "outside_boundary",
+                    "critical_front",
+                    "slower_front_pass",
+                    "faster_rear",
+                    "clear_track",
+                    "uncertain",
+                ],
+            },
+            "reason": {"type": "string", "maxLength": 120},
+        }
+        required = ["basis", "reason"]
+        if self.output_mode == "mode":
+            properties["mode"] = {
+                "type": "string",
+                "enum": list(self.mode_presets),
+            }
+            required.insert(1, "mode")
+        else:
+            for name in ("q", "zeta", "s1", "s2", "s3"):
+                lo, hi = self.param_bounds[name]
+                properties[name] = {"type": "number", "minimum": float(lo), "maximum": float(hi)}
+                required.append(name)
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
     def _query_llm(self, prompt: str) -> dict:
         self._last_raw_llm_response = ""
+        self._last_llm_done_reason = ""
+        self._last_llm_eval_count = -1
         payload = {
             "model": self.model_name,
+            "system": self.system_prompt,  # local file that describes tasks definition and mode explanation
             "prompt": prompt,
-            "format": "json",
+            "format": self._output_schema(),
             "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": 64},
+            "options": {"temperature": self.temperature, "num_predict": 192},
         }
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -268,6 +367,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             # print(raw)
         body = json.loads(raw)
         self._last_raw_llm_response = str(body.get("response", ""))
+        self._last_llm_done_reason = str(body.get("done_reason", ""))
+        self._last_llm_eval_count = int(body.get("eval_count") or -1)
         return self._extract_json(self._last_raw_llm_response)
 
     def _record_llm_raw_io(self, prompt: str, error=None):
@@ -277,6 +378,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "prompt": prompt,
                 "response": self._last_raw_llm_response,
                 "error": "" if error is None else str(error),
+                "done_reason": self._last_llm_done_reason,
+                "eval_count": self._last_llm_eval_count,
             }
         )
         self.llm_raw_io_history = self.llm_raw_io_history[-5:]
@@ -315,6 +418,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         if not reason:
             reason = "not provided"
         return reason[:160]
+
+    def _sanitize_basis(self, raw_params: dict) -> str:
+        return str(raw_params.get("basis", "uncertain"))[:40]
 
     def _mode_context(self, state: CarState, current_s: float, opponents=None) -> dict:
         # Compute context information for mode guarding, including nearest opponent distances and relative speeds.
@@ -424,6 +530,12 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         try:
             raw_params = self._query_llm(prompt)
             self.last_llm_reason = self._sanitize_reason(raw_params)
+            self.last_llm_basis = self._sanitize_basis(raw_params)
+            # Assessment is computed by code and saved directly; asking the
+            # model to copy it only lengthens responses and creates a second
+            # source of truth.
+            self.last_llm_assessment = self.last_required_assessment.copy()
+            self.last_assessment_consistent = True
             self.params = self._sanitize_params(raw_params)
             self.last_llm_requested_mode = self.current_mode
             self.last_safeguard_override = ""
@@ -438,6 +550,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self._record_llm_raw_io(prompt, error=exc)
             self.last_llm_error = str(exc)
             self.last_llm_reason = f"error: {exc}"[:160]
+            self.last_llm_basis = "error"
+            self.last_assessment_consistent = False
             self.params = self.last_llm_params.copy()
             if not self._warned_llm_error:
                 self._log(f"LLM policy failed once, reusing last parameters: {exc}")
@@ -521,4 +635,3 @@ class RuleBasedSafeguardPolicy(LLMAlphaRacerPolicy):
         return MPCPolicy.get_reference_trajectory(
             self, state, current_s, opponents=opponents
         )
-

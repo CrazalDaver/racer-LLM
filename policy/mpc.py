@@ -63,6 +63,16 @@ class MPCPolicy(BasePolicy):
     def _neutral_steer_command(self) -> float:
         return np.clip(-self.mpc.p.Sb / self.mpc.p.Sa, -1.0, 1.0)
 
+    @staticmethod
+    def _recovery_throttle(vx: float) -> float:
+        """Simple, interpretable three-level fallback speed control."""
+        vx = max(float(vx), 0.0)
+        if vx > 2.0:
+            return -0.3  # Brake when failure occurs at racing speed.
+        if vx > 0.5:
+            return 0.0   # Coast down toward a controllable crawl speed.
+        return 0.3       # Keep enough drive to avoid a zero-speed deadlock.
+
     # Conservative failure recovery: preserve the last feasible direction and
     # brake. Only near a boundary do we slew gently toward the centerline.
     def _recovery_control(self, state: CarState, current_s: float) -> np.ndarray:
@@ -88,7 +98,7 @@ class MPCPolicy(BasePolicy):
                 0.25,
             )
             steer = np.clip(center_steer, steer - 0.05, steer + 0.05)
-        throttle = -0.5 if state.vx > 1.0 else 0.0
+        throttle = self._recovery_throttle(state.vx)
         return np.array([throttle, steer], dtype=float)
 
     def _format_mpc_time(self, sim_time) -> str:

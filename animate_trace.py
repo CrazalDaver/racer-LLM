@@ -156,6 +156,7 @@ def _save_animation(animation, save_path, interval, dpi):
     if suffix == ".gif":
         writer = PillowWriter(fps=fps)
     elif suffix == ".mp4":
+
         writer = FFMpegWriter(fps=fps)
     else:
         writer = None

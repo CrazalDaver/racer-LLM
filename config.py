@@ -125,6 +125,26 @@ class SimParams:
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     LLM_SAFEGUARD_ENABLED = True # validate/correct discrete LLM modes against the current race context
+    # Official alpha-RACER sampling bounds mapped to this project's
+    # [q, zeta, s1, s2, s3] parameterization.
+    LLM_PARAMETER_BOUNDS = {
+        "q": (0.30, 1.00),
+        "zeta": (0.85**2, 1.10**2),
+        "s1": (0.10, 0.50),
+        "s2": (0.10, 0.50),
+        "s3": (0.00, 1.00),
+    }
+    # Previous hand-tuned presets:
+    # stable=[1.3,1.0,0.05,1.0,0.0], push=[1.8,1.25,0.05,1.0,0.0]
+    # overtake=[1.0,1.35,1.75,0.1,0.0], block=[1.6,0.9,0.05,0.45,2.0]
+    # recover=[3.0,0.7,0.0,1.5,0.0]
+    LLM_MODE_PRESETS = {
+        "stable": np.array([0.75, 1.00, 0.00, 0.00, 0.00]),
+        "push": np.array([0.85, 1.20, 0.00, 0.00, 0.00]),
+        "overtake": np.array([0.80, 1.35, 0.45, 0.10, 0.00]),
+        "block": np.array([0.75, 0.95, 0.00, 0.30, 0.70]),
+        "recover": np.array([3.00, 0.75, 0.00, 0.00, 0.00]),
+    }
     STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 0.5, 0.5])  # q, zeta, s1, s2, s3
     # Upstream optimizer coordinates: sf1, sf2, lookahead_factor,
     # speed_factor, blocking. AlphaRacerPolicy maps these to q, zeta, s1,

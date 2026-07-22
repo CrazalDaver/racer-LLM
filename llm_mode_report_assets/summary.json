@@ -1,0 +1,128 @@
+{
+  "parameter_order": [
+    "q",
+    "zeta",
+    "s1",
+    "s2",
+    "s3"
+  ],
+  "parameter_bounds": {
+    "q": [
+      0.3,
+      1.0
+    ],
+    "zeta": [
+      0.7224999999999999,
+      1.2100000000000002
+    ],
+    "s1": [
+      0.1,
+      0.5
+    ],
+    "s2": [
+      0.1,
+      0.5
+    ],
+    "s3": [
+      0.0,
+      1.0
+    ]
+  },
+  "modes": {
+    "stable": {
+      "params": [
+        0.75,
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "metrics": {
+        "final_progress": 5.608438197112434,
+        "final_gap": 3.799182009992336,
+        "minimum_abs_gap": 1.607983678873751,
+        "maximum_abs_lateral_error": 0.3309718352233799,
+        "mpc_failure_rate": 0.052980132450331126,
+        "recovery_rate": 0.052980132450331126
+      },
+      "trace": "/Users/lee/racer-LLM/llm_mode_report_assets/stable.npz",
+      "gif": "/Users/lee/racer-LLM/llm_mode_report_assets/stable.gif"
+    },
+    "push": {
+      "params": [
+        0.85,
+        1.2,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "metrics": {
+        "final_progress": 7.433584016135924,
+        "final_gap": 0.9043491789233544,
+        "minimum_abs_gap": 0.9043491789233544,
+        "maximum_abs_lateral_error": 0.3438334963139403,
+        "mpc_failure_rate": 0.052980132450331126,
+        "recovery_rate": 0.052980132450331126
+      },
+      "trace": "/Users/lee/racer-LLM/llm_mode_report_assets/push.npz",
+      "gif": "/Users/lee/racer-LLM/llm_mode_report_assets/push.gif"
+    },
+    "overtake": {
+      "params": [
+        0.8,
+        1.35,
+        0.45,
+        0.1,
+        0.0
+      ],
+      "metrics": {
+        "final_progress": 5.477537230207943,
+        "final_gap": -0.3802104819213384,
+        "minimum_abs_gap": 0.009903679449195126,
+        "maximum_abs_lateral_error": 0.44664302699810654,
+        "mpc_failure_rate": 0.44370860927152317,
+        "recovery_rate": 0.44370860927152317
+      },
+      "trace": "/Users/lee/racer-LLM/llm_mode_report_assets/overtake.npz",
+      "gif": "/Users/lee/racer-LLM/llm_mode_report_assets/overtake.gif"
+    },
+    "block": {
+      "params": [
+        0.75,
+        0.95,
+        0.0,
+        0.3,
+        0.7
+      ],
+      "metrics": {
+        "final_progress": 5.327031506855221,
+        "final_gap": 4.080588700176407,
+        "minimum_abs_gap": 1.6498715862369122,
+        "maximum_abs_lateral_error": 0.32785499616757857,
+        "mpc_failure_rate": 0.033112582781456956,
+        "recovery_rate": 0.033112582781456956
+      },
+      "trace": "/Users/lee/racer-LLM/llm_mode_report_assets/block.npz",
+      "gif": "/Users/lee/racer-LLM/llm_mode_report_assets/block.gif"
+    },
+    "recover": {
+      "params": [
+        3.0,
+        0.75,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "metrics": {
+        "final_progress": 3.9228190307735105,
+        "final_gap": 5.484801176338962,
+        "minimum_abs_gap": 1.868672151912584,
+        "maximum_abs_lateral_error": 0.32630515392301673,
+        "mpc_failure_rate": 0.052980132450331126,
+        "recovery_rate": 0.052980132450331126
+      },
+      "trace": "/Users/lee/racer-LLM/llm_mode_report_assets/recover.npz",
+      "gif": "/Users/lee/racer-LLM/llm_mode_report_assets/recover.gif"
+    }
+  }
+}

@@ -8,6 +8,12 @@ def wrap_angle(angle):
 
 
 class DynamicBicycleModel:
+    """
+    Dynamic Bicycle Model(DBM) with 6 states: [x, y, psi, vx, vy, omega]
+    where x, y are the global position, psi is the heading angle, vx and vy are
+    the longitudinal and lateral velocities, and omega is the yaw rate.
+    """
+
     def __init__(self, dt, db_params):
         self.dt = dt
         self.p = db_params

@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import numpy as np
 
@@ -345,6 +346,10 @@ def save_simulation_trace(trace, track, params):
         policy_params=np.asarray(trace["policy_params"]),
         policy_mode=np.asarray(trace["policy_mode"]),
         policy_reason=np.asarray(trace.get("policy_reason", []), dtype=str),
+        policy_basis=np.asarray(trace.get("policy_basis", []), dtype=str),
+        policy_assessment=np.asarray(trace.get("policy_assessment", []), dtype=str),
+        policy_required_assessment=np.asarray(trace.get("policy_required_assessment", []), dtype=str),
+        policy_assessment_consistent=np.asarray(trace.get("policy_assessment_consistent", []), dtype=bool),
         policy_names=np.asarray(trace.get("policy_names", [])),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
@@ -356,9 +361,19 @@ def save_simulation_trace(trace, track, params):
         llm_raw_prompts=np.asarray(trace.get("llm_raw_prompts", []), dtype=str),
         llm_raw_responses=np.asarray(trace.get("llm_raw_responses", []), dtype=str),
         llm_raw_errors=np.asarray(trace.get("llm_raw_errors", []), dtype=str),
+        llm_raw_done_reasons=np.asarray(trace.get("llm_raw_done_reasons", []), dtype=str),
+        llm_raw_eval_counts=np.asarray(trace.get("llm_raw_eval_counts", []), dtype=int),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
+        car_policy_basis=np.asarray(trace.get("car_policy_basis", []), dtype=str),
+        car_policy_assessment=np.asarray(trace.get("car_policy_assessment", []), dtype=str),
+        car_policy_required_assessment=np.asarray(
+            trace.get("car_policy_required_assessment", []), dtype=str
+        ),
+        car_policy_assessment_consistent=np.asarray(
+            trace.get("car_policy_assessment_consistent", []), dtype=bool
+        ),
         car_policy_requested_mode=np.asarray(trace.get("car_policy_requested_mode", []), dtype=str),
         car_safeguard_override=np.asarray(trace.get("car_safeguard_override", []), dtype=str),
         car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
@@ -598,9 +613,17 @@ def run_simulation(
         "policy_params": [],
         "policy_mode": [],
         "policy_reason": [],
+        "policy_basis": [],
+        "policy_assessment": [],
+        "policy_required_assessment": [],
+        "policy_assessment_consistent": [],
         "car_policy_params": [],
         "car_policy_mode": [],
         "car_policy_reason": [],
+        "car_policy_basis": [],
+        "car_policy_assessment": [],
+        "car_policy_required_assessment": [],
+        "car_policy_assessment_consistent": [],
         "car_policy_requested_mode": [],
         "car_safeguard_override": [],
         "car_offroad": [],
@@ -690,6 +713,7 @@ def run_simulation(
         for car_idx, state in enumerate(states):
             opponents = [
                 {
+                    "car_idx": j,
                     "px": car_s[j],
                     "py": car_e[j],
                     "vx": max(states[j].vx, 0.0),
@@ -791,11 +815,31 @@ def run_simulation(
         trace["policy_params"].append(getattr(ego_policy, "params", np.full(5, np.nan)).copy())
         trace["policy_mode"].append(getattr(ego_policy, "current_mode", "fixed"))
         trace["policy_reason"].append(getattr(ego_policy, "last_llm_reason", ""))
+        trace["policy_basis"].append(getattr(ego_policy, "last_llm_basis", ""))
+        trace["policy_assessment"].append(
+            json.dumps(getattr(ego_policy, "last_llm_assessment", {}), sort_keys=True)
+        )
+        trace["policy_required_assessment"].append(
+            json.dumps(getattr(ego_policy, "last_required_assessment", {}), sort_keys=True)
+        )
+        trace["policy_assessment_consistent"].append(
+            getattr(ego_policy, "last_assessment_consistent", True)
+        )
         trace["car_policy_params"].append(
             [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
         )
         trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
         trace["car_policy_reason"].append([getattr(policy, "last_llm_reason", "") for policy in policies])
+        trace["car_policy_basis"].append([getattr(policy, "last_llm_basis", "") for policy in policies])
+        trace["car_policy_assessment"].append(
+            [json.dumps(getattr(policy, "last_llm_assessment", {}), sort_keys=True) for policy in policies]
+        )
+        trace["car_policy_required_assessment"].append(
+            [json.dumps(getattr(policy, "last_required_assessment", {}), sort_keys=True) for policy in policies]
+        )
+        trace["car_policy_assessment_consistent"].append(
+            [getattr(policy, "last_assessment_consistent", True) for policy in policies]
+        )
         trace["car_policy_requested_mode"].append(
             [getattr(policy, "last_llm_requested_mode", "") for policy in policies]
         )
@@ -958,6 +1002,14 @@ def run_simulation(
         [""] * (5 - len(history)) + [item["error"] for item in history]
         for history in raw_histories
     ]
+    trace["llm_raw_done_reasons"] = [
+        [""] * (5 - len(history)) + [item.get("done_reason", "") for item in history]
+        for history in raw_histories
+    ]
+    trace["llm_raw_eval_counts"] = [
+        [-1] * (5 - len(history)) + [item.get("eval_count", -1) for item in history]
+        for history in raw_histories
+    ]
 
     if save_trace:
         save_simulation_trace(trace, track, params)
@@ -1019,6 +1071,6 @@ if __name__ == "__main__":
         llm_model_names=["qwen2.5:7b", None, None],
         # llm_model_names=["qwen2.5:0.5b", "qwen2.5:0.5b", "qwen2.5:0.5b"],
         vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
-        llm_temperature = 0.0, 
+        llm_temperature = 0.0,
         llm_safeguard_enabled=False,
     )

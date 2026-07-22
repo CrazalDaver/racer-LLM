@@ -11,10 +11,19 @@ Example:
 """
 
 import argparse
+import base64
+import html
+import json
 from pathlib import Path
 
+import matplotlib
+
+# The script primarily generates files and may run without a GUI session.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.patches import Polygon
 from matplotlib.colors import Normalize
 
 from config import make_vehicle_params, params
@@ -24,15 +33,15 @@ from state import CarState
 from track import Track, configure_track, load_centerline_csv, load_raceline_csv
 
 
-# Keep this table next to the experiment so the plotted comparison is explicit.
-MODE_PRESETS = {
-    "stable": np.array([1.3, 1.00, 0.05, 1.00, 0.0]),
-    "push": np.array([1.8, 1.25, 0.05, 1.00, 0.0]),
-    # "overtake": np.array([1.0, 1.0, 0.3, 0.3, 0.0]),
-    "overtake": np.array([1.0, 1.35, 1.75, 0.1, 0.0]),
-    "block": np.array([1.6, 0.90, 0.05, 0.45, 2.0]),
-    "recover": np.array([3.0, 0.70, 0.00, 1.50, 0.0]),
-}
+# Previous hand-tuned values (kept as comments for comparison):
+# stable   = [1.3, 1.00, 0.05, 1.00, 0.0]
+# push     = [1.8, 1.25, 0.05, 1.00, 0.0]
+# overtake = [1.0, 1.35, 1.75, 0.10, 0.0]
+# block    = [1.6, 0.90, 0.05, 0.45, 2.0]
+# recover  = [3.0, 0.70, 0.00, 1.50, 0.0]
+# Active values come from config so this visualization and the executable LLM
+# policy cannot silently diverge.
+MODE_PRESETS = params.LLM_MODE_PRESETS
 
 OPPONENT_PARAMS = np.array([1.0, 1.0, 0.0, 1.0, 0.0])
 
@@ -47,13 +56,7 @@ MODE_COLORS = {
 # Official alpha-RACER sampling bounds mapped to this project's
 # [q, zeta, s1, s2, s3] representation:
 # q=2*lookahead_factor and zeta=speed_factor**2.
-PARAMETER_SWEEP_RANGES = {
-    "q": (0.30, 1.00),
-    "zeta": (0.85**2, 1.10**2),
-    "s1": (0.10, 0.50),
-    "s2": (0.10, 0.50),
-    "s3": (0.00, 1.00),
-}
+PARAMETER_SWEEP_RANGES = params.LLM_PARAMETER_BOUNDS
 PARAMETER_NAMES = tuple(PARAMETER_SWEEP_RANGES)
 PARAMETER_BASELINE = np.array([
     np.mean(PARAMETER_SWEEP_RANGES[name]) for name in PARAMETER_NAMES
@@ -74,29 +77,9 @@ def choose_curve_s(track):
     return float(samples[np.argmax(curvatures)])
 
 
-def raceline_pose_at_track_s(track, raceline, target_s):
-    """Return the raceline sample whose projected track progress is nearest target_s."""
-    best = None
-    for x, y, psi in zip(raceline.x, raceline.y, raceline.psi):
-        try:
-            sample_s, sample_e = track.project(
-                x,
-                y,
-                s_hint=target_s,
-                search_radius=3.0,
-                psi_hint=psi,
-                max_heading_error=np.pi / 2.0,
-                allow_global_fallback=False,
-            )
-        except ValueError:
-            continue
-        error = abs(progress_delta(sample_s, target_s, track.total_length))
-        if best is None or error < best[0]:
-            best = (error, float(x), float(y), float(psi), float(sample_s), float(sample_e))
-    if best is None:
-        raise ValueError(f"Could not locate raceline near track s={target_s:.3f}")
-    _, x, y, psi, sample_s, sample_e = best
-    return x, y, psi, sample_s, sample_e
+def centerline_pose_at_track_s(track, target_s):
+    x, y, psi = track.interpolate(target_s)
+    return float(x), float(y), float(psi), float(target_s), 0.0
 
 
 def make_mpc(track, vehicle_params, horizon):
@@ -171,8 +154,9 @@ def simulate_mode(
     )
 
     history = {key: [] for key in (
-        "time", "x", "y", "s", "e", "vx",
-        "opponent_x", "opponent_y", "opponent_s", "opponent_e", "opponent_vx",
+        "time", "x", "y", "psi", "s", "e", "vx", "throttle", "steer",
+        "mpc_success", "mpc_status", "mpc_recovery", "ref_horizon_x", "ref_horizon_y",
+        "opponent_x", "opponent_y", "opponent_psi", "opponent_s", "opponent_e", "opponent_vx",
     )}
     progress_s = ego_s0
     opponent_progress_s = opponent_s0
@@ -191,21 +175,8 @@ def simulate_mode(
             params.PROJECTION_SEARCH_RADIUS,
             params.PROJECTION_MAX_HEADING_ERROR,
         )
-        history["time"].append(step * params.DT)
-        history["x"].append(state.x)
-        history["y"].append(state.y)
-        history["s"].append(progress_s)
-        history["e"].append(lateral_e)
-        history["vx"].append(state.vx)
-        history["opponent_x"].append(opponent_state.x)
-        history["opponent_y"].append(opponent_state.y)
-        history["opponent_s"].append(opponent_progress_s)
-        history["opponent_e"].append(opponent_e)
-        history["opponent_vx"].append(opponent_state.vx)
-        if step == int(round(duration / params.DT)):
-            break
-
         opponent_for_ego = [{
+            "car_idx": 1,
             "px": opponent_progress_s,
             "py": opponent_e,
             "vx": max(opponent_state.vx, 0.0),
@@ -215,6 +186,7 @@ def simulate_mode(
             "state": opponent_state,
         }]
         ego_for_opponent = [{
+            "car_idx": 0,
             "px": progress_s,
             "py": lateral_e,
             "vx": max(state.vx, 0.0),
@@ -226,6 +198,37 @@ def simulate_mode(
         action = policy.get_action(
             state, progress_s, opponents=opponent_for_ego, sim_time=step * params.DT
         )
+        ref_world = policy.last_ref_world_horizon
+        if ref_world is None:
+            ref_x = np.full(horizon + 1, np.nan)
+            ref_y = np.full(horizon + 1, np.nan)
+        else:
+            ref_x = np.asarray(ref_world[0], dtype=float).copy()
+            ref_y = np.asarray(ref_world[1], dtype=float).copy()
+
+        history["time"].append(step * params.DT)
+        history["x"].append(state.x)
+        history["y"].append(state.y)
+        history["psi"].append(state.psi)
+        history["s"].append(progress_s)
+        history["e"].append(lateral_e)
+        history["vx"].append(state.vx)
+        history["throttle"].append(action.throttle)
+        history["steer"].append(action.steer)
+        history["mpc_success"].append(ego_mpc.last_solver_success)
+        history["mpc_status"].append(ego_mpc.last_solver_status)
+        history["mpc_recovery"].append(ego_mpc.last_recovery_active)
+        history["ref_horizon_x"].append(ref_x)
+        history["ref_horizon_y"].append(ref_y)
+        history["opponent_x"].append(opponent_state.x)
+        history["opponent_y"].append(opponent_state.y)
+        history["opponent_psi"].append(opponent_state.psi)
+        history["opponent_s"].append(opponent_progress_s)
+        history["opponent_e"].append(opponent_e)
+        history["opponent_vx"].append(opponent_state.vx)
+        if step == int(round(duration / params.DT)):
+            break
+
         state = CarState.from_array(
             ego_model.step(state.to_array(), action.throttle, action.steer)
         )
@@ -350,6 +353,177 @@ def plot_results(track, raceline, results, ego_start, opponent_start, duration, 
         plt.show()
     else:
         plt.close(fig)
+
+
+def _car_corners(x, y, psi):
+    half_length = float(params.VEHICLE_HALF_LENGTH)
+    half_width = float(params.VEHICLE_HALF_WIDTH)
+    local = np.array([
+        [half_length, half_width],
+        [half_length, -half_width],
+        [-half_length, -half_width],
+        [-half_length, half_width],
+    ])
+    rotation = np.array([
+        [np.cos(psi), -np.sin(psi)],
+        [np.sin(psi), np.cos(psi)],
+    ])
+    return local @ rotation.T + np.array([x, y])
+
+
+def save_mode_animation(track, raceline, mode, run, output_path, stride=3, interval=50, dpi=90):
+    """Save one mode rollout GIF with the instantaneous MPC reference horizon."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    view_start = min(float(run["s"].min()), float(run["opponent_s"].min())) - 0.7
+    view_end = max(float(run["s"].max()), float(run["opponent_s"].max())) + 0.7
+    _, center, left, right = _sample_track_band(
+        track, view_start, view_end, params.TRACK_HALF_WIDTH, count=600
+    )
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    ax.fill(
+        np.r_[left[:, 0], right[::-1, 0]],
+        np.r_[left[:, 1], right[::-1, 1]],
+        color="0.93",
+        zorder=0,
+    )
+    ax.plot(left[:, 0], left[:, 1], "k-", lw=1)
+    ax.plot(right[:, 0], right[:, 1], "k-", lw=1)
+    ax.plot(center[:, 0], center[:, 1], color="0.65", ls=":", lw=1, label="centerline")
+    ax.plot(raceline.x, raceline.y, color="0.45", ls="--", lw=1.2, label="raceline")
+    ego_path, = ax.plot([], [], color=MODE_COLORS[mode], lw=1.8, label="ego path")
+    opponent_path, = ax.plot([], [], color="#0B3C8C", lw=1.4, alpha=0.8, label="opponent path")
+    ref_line, = ax.plot([], [], color="magenta", marker=".", ms=4, lw=1.8, label="MPC ref horizon")
+    ego_car = Polygon(_car_corners(run["x"][0], run["y"][0], run["psi"][0]),
+                      closed=True, color=MODE_COLORS[mode], zorder=6, label="ego")
+    opponent_car = Polygon(
+        _car_corners(run["opponent_x"][0], run["opponent_y"][0], run["opponent_psi"][0]),
+        closed=True, color="#0B3C8C", zorder=5, label="opponent",
+    )
+    ax.add_patch(ego_car)
+    ax.add_patch(opponent_car)
+    status_text = ax.text(
+        0.98, 0.98, "", transform=ax.transAxes, va="top", ha="right",
+        fontsize=9, bbox={"facecolor": "white", "alpha": 0.82, "edgecolor": "0.8"},
+    )
+    map_x = np.r_[left[:, 0], right[:, 0]]
+    map_y = np.r_[left[:, 1], right[:, 1]]
+    ax.set_xlim(map_x.min() - 0.2, map_x.max() + 0.2)
+    ax.set_ylim(map_y.min() - 0.2, map_y.max() + 0.2)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title(f"{mode}: params={MODE_PRESETS[mode].tolist()}")
+    ax.legend(loc="lower right", fontsize=8)
+    frames = np.arange(0, len(run["time"]), max(1, int(stride)))
+    if frames[-1] != len(run["time"]) - 1:
+        frames = np.r_[frames, len(run["time"]) - 1]
+
+    def update(frame):
+        ego_path.set_data(run["x"][: frame + 1], run["y"][: frame + 1])
+        opponent_path.set_data(run["opponent_x"][: frame + 1], run["opponent_y"][: frame + 1])
+        ref_line.set_data(run["ref_horizon_x"][frame], run["ref_horizon_y"][frame])
+        ego_car.set_xy(_car_corners(run["x"][frame], run["y"][frame], run["psi"][frame]))
+        opponent_car.set_xy(_car_corners(
+            run["opponent_x"][frame], run["opponent_y"][frame], run["opponent_psi"][frame]
+        ))
+        gap = progress_delta(run["opponent_s"][frame], run["s"][frame], track.total_length)
+        status_text.set_text(
+            f"t={run['time'][frame]:.2f} s  gap={gap:+.2f} m\n"
+            f"ego v={run['vx'][frame]:.2f} m/s  e={run['e'][frame]:+.3f} m\n"
+            f"u=({run['throttle'][frame]:+.2f}, {run['steer'][frame]:+.2f})  "
+            f"MPC={run['mpc_status'][frame]}"
+        )
+        return ego_path, opponent_path, ref_line, ego_car, opponent_car, status_text
+
+    animation = FuncAnimation(fig, update, frames=frames, interval=interval, blit=False)
+    animation.save(output_path, writer=PillowWriter(fps=max(1, round(1000 / interval))), dpi=dpi)
+    plt.close(fig)
+    print(f"Saved {mode} GIF to {output_path}")
+
+
+def _mode_metrics(track, run):
+    gaps = np.array([
+        progress_delta(opponent_s, ego_s, track.total_length)
+        for opponent_s, ego_s in zip(run["opponent_s"], run["s"])
+    ])
+    return {
+        "final_progress": float(run["s"][-1] - run["s"][0]),
+        "final_gap": float(gaps[-1]),
+        "minimum_abs_gap": float(np.min(np.abs(gaps))),
+        "maximum_abs_lateral_error": float(np.max(np.abs(run["e"]))),
+        "mpc_failure_rate": float(np.mean(~run["mpc_success"].astype(bool))),
+        "recovery_rate": float(np.mean(run["mpc_recovery"].astype(bool))),
+    }
+
+
+def save_mode_report(track, raceline, results, summary_png, output_dir, report_path, animation_stride=3):
+    """Save per-mode NPZ/GIF files, a JSON index, and a self-contained HTML report."""
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    summary = {
+        "parameter_order": list(PARAMETER_NAMES),
+        "parameter_bounds": {name: list(bounds) for name, bounds in PARAMETER_SWEEP_RANGES.items()},
+        "modes": {},
+    }
+    for mode, run in results.items():
+        trace_path = output_dir / f"{mode}.npz"
+        gif_path = output_dir / f"{mode}.gif"
+        np.savez(
+            trace_path,
+            **run,
+            mode=np.asarray(mode),
+            params=np.asarray(MODE_PRESETS[mode]),
+            track_half_width=np.asarray(params.TRACK_HALF_WIDTH),
+            mpc_constraint_half_width=np.asarray(params.MPC_CONSTRAINT_HALF_WIDTH),
+            ref_lateral_clip=np.asarray(params.REF_LATERAL_CLIP),
+            vehicle_half_length=np.asarray(params.VEHICLE_HALF_LENGTH),
+            vehicle_half_width=np.asarray(params.VEHICLE_HALF_WIDTH),
+        )
+        save_mode_animation(
+            track, raceline, mode, run, gif_path, stride=animation_stride
+        )
+        metrics = _mode_metrics(track, run)
+        summary["modes"][mode] = {
+            "params": MODE_PRESETS[mode].tolist(),
+            "metrics": metrics,
+            "trace": str(trace_path),
+            "gif": str(gif_path),
+        }
+        rows.append((mode, gif_path, metrics))
+
+    json_path = output_dir / "summary.json"
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_uri = "data:image/png;base64," + base64.b64encode(Path(summary_png).read_bytes()).decode("ascii")
+    cards = []
+    for mode, gif_path, metrics in rows:
+        gif_uri = "data:image/gif;base64," + base64.b64encode(gif_path.read_bytes()).decode("ascii")
+        metric_rows = "".join(
+            f"<tr><th>{html.escape(name.replace('_', ' '))}</th><td>{value:.4f}</td></tr>"
+            for name, value in metrics.items()
+        )
+        cards.append(f"""
+        <section><h2>{html.escape(mode)} — {html.escape(str(MODE_PRESETS[mode].tolist()))}</h2>
+        <div class="grid"><img src="{gif_uri}" alt="{html.escape(mode)} animation">
+        <table>{metric_rows}</table></div></section>""")
+    document = f"""<!doctype html><html><head><meta charset="utf-8">
+    <title>LLM mode preset comparison</title><style>
+    body{{font-family:Arial,sans-serif;background:#f3f5f7;color:#202124;margin:0;padding:24px}}
+    main{{max-width:1500px;margin:auto}} section{{background:white;margin:20px 0;padding:18px;border-radius:10px}}
+    img{{width:100%;border:1px solid #ddd;border-radius:6px}} .grid{{display:grid;grid-template-columns:3fr 1fr;gap:18px;align-items:start}}
+    table{{width:100%;border-collapse:collapse}} th,td{{padding:7px;border-bottom:1px solid #ddd;text-align:left}}
+    code{{background:#eee;padding:2px 5px}} @media(max-width:850px){{.grid{{grid-template-columns:1fr}}}}
+    </style></head><body><main><h1>LLM mode preset comparison</h1>
+    <p>Intermediate traces: <code>{html.escape(str(output_dir))}</code>; summary JSON: <code>{html.escape(str(json_path))}</code></p>
+    <section><h2>Combined static summary</h2><img src="{summary_uri}" alt="Combined mode summary"></section>
+    {''.join(cards)}</main></body></html>"""
+    report_path = Path(report_path).resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(document, encoding="utf-8")
+    print(f"Saved mode report to {report_path}")
+    return report_path
 
 
 def plot_parameter_sweeps(
@@ -510,6 +684,13 @@ def parse_args():
     parser.add_argument("--horizon", type=int, default=params.MPC_HORIZON)
     parser.add_argument("--curve-s", type=float, default=None, help="opponent progress; default finds a sharp curve")
     parser.add_argument("--save", default="llm_modes_comparison.png")
+    parser.add_argument("--report", default="llm_modes_report.html")
+    parser.add_argument("--output-dir", default="llm_mode_report_assets")
+    parser.add_argument("--animation-stride", type=int, default=3)
+    parser.add_argument(
+        "--no-report", action="store_true",
+        help="skip per-mode NPZ/GIF files and the self-contained HTML report",
+    )
     parser.add_argument(
         "--parameter-sweep",
         action="store_true",
@@ -530,12 +711,15 @@ def main():
     raceline = load_raceline_csv(params.RACELINE_CSV, scale=params.TRACK_SCALE)
     opponent_s = choose_curve_s(track) if args.curve_s is None else args.curve_s
     ego_s0 = opponent_s - args.gap
-    ego_start = raceline_pose_at_track_s(track, raceline, ego_s0)
-    opponent_start = raceline_pose_at_track_s(track, raceline, opponent_s)
+    # A common centerline start isolates interaction-mode effects. Starting on
+    # different sides of a clipped raceline can make the cars already separated
+    # laterally and therefore fails to exercise the overtake preset.
+    ego_start = centerline_pose_at_track_s(track, ego_s0)
+    opponent_start = centerline_pose_at_track_s(track, opponent_s)
     print(
         f"Scenario: track={args.track}, ego_s={ego_start[3]:.3f}, "
         f"opponent_s={opponent_start[3]:.3f}, ego_e={ego_start[4]:+.3f}, "
-        f"opponent_e={opponent_start[4]:+.3f}, both_on_raceline=True, gap={args.gap:.2f} m, "
+        f"opponent_e={opponent_start[4]:+.3f}, both_on_centerline=True, gap={args.gap:.2f} m, "
         f"opponent_motion={'stationary' if args.stationary_opponent else 'moving'}, "
         f"opponent_v0={0.0 if args.stationary_opponent else args.opponent_v0:.2f}, "
         f"opponent_params={OPPONENT_PARAMS.tolist()}, "
@@ -573,6 +757,16 @@ def main():
         track, raceline, results, ego_start, opponent_start, args.duration,
         save_path=args.save, show=not args.no_show,
     )
+    if not args.no_report:
+        save_mode_report(
+            track,
+            raceline,
+            results,
+            summary_png=args.save,
+            output_dir=args.output_dir,
+            report_path=args.report,
+            animation_stride=args.animation_stride,
+        )
 
 
 if __name__ == "__main__":
