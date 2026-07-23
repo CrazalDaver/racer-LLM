@@ -55,7 +55,8 @@ def make_vehicle_params(vehicle_model_type):
 
 
 class SimParams:
-    DT = 0.02
+    # DT = 0.02
+    DT = 0.1
     TOTAL_TIME = 50.0
     v0 = 0.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
@@ -65,6 +66,10 @@ class SimParams:
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
     VEHICLE_HALF_LENGTH = 0.18
     VEHICLE_HALF_WIDTH = 0.12
+    # Upstream numerical simulator applies continuous, asymmetric speed loss
+    # based on oriented-rectangle overlap; the rear car is penalized more.
+    COLLISION_FRONT_DECAY = 5.0
+    COLLISION_REAR_DECAY = 20.0
     # MPC constrains the vehicle center, so reserve one vehicle half-width at
     # each track edge: |e_center| <= track_half_width - vehicle_half_width.
     MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH - VEHICLE_HALF_WIDTH
@@ -121,10 +126,17 @@ class SimParams:
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.2
-    LLM_UPDATE_INTERVAL_STEPS = 50 # how often to update the LLM policy in terms of MPC steps
+    LLM_UPDATE_INTERVAL_STEPS = 10 # how often to update the LLM policy in terms of MPC steps
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     LLM_SAFEGUARD_ENABLED = True # validate/correct discrete LLM modes against the current race context
+    # LLM scene classification uses a small buffer around the MPC collision
+    # envelope so millimetre-scale threshold crossings do not imply clear road.
+    LLM_CRITICAL_DISTANCE = 1.0
+    LLM_CLOSE_DISTANCE = 2.5
+    LLM_OVERTAKE_DISTANCE = 4.0
+    LLM_SAME_LANE_MARGIN = 0.05
+    LLM_PUSH_MAX_ABS_CURVATURE = 0.15
     # Official alpha-RACER sampling bounds mapped to this project's
     # [q, zeta, s1, s2, s3] parameterization.
     LLM_PARAMETER_BOUNDS = {
@@ -137,13 +149,11 @@ class SimParams:
     # Previous hand-tuned presets:
     # stable=[1.3,1.0,0.05,1.0,0.0], push=[1.8,1.25,0.05,1.0,0.0]
     # overtake=[1.0,1.35,1.75,0.1,0.0], block=[1.6,0.9,0.05,0.45,2.0]
-    # recover=[3.0,0.7,0.0,1.5,0.0]
     LLM_MODE_PRESETS = {
         "stable": np.array([0.75, 1.00, 0.00, 0.00, 0.00]),
         "push": np.array([0.85, 1.20, 0.00, 0.00, 0.00]),
         "overtake": np.array([0.80, 1.35, 0.45, 0.10, 0.00]),
         "block": np.array([0.75, 0.95, 0.00, 0.30, 0.70]),
-        "recover": np.array([3.00, 0.75, 0.00, 0.00, 0.00]),
     }
     STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 0.5, 0.5])  # q, zeta, s1, s2, s3
     # Upstream optimizer coordinates: sf1, sf2, lookahead_factor,

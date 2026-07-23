@@ -300,14 +300,13 @@ def plot_simulation_results(
     policy_names = [name.lower() for name in _string_list(policy_names)]
     policy_mode_history = _string_list(policy_mode_history)
     policy_params_history = _as_optional_array(policy_params_history)
-    uses_llm = any("llm" in name for name in policy_names) or any(mode in {"stable", "push", "overtake", "block", "recover", "custom"} for mode in policy_mode_history)
+    uses_llm = any("llm" in name for name in policy_names) or any(mode in {"stable", "push", "overtake", "block", "custom"} for mode in policy_mode_history)
     if uses_llm and policy_mode_history:
         mode_colors = {
             "stable": "tab:blue",
             "push": "tab:green",
             "overtake": "tab:orange",
             "block": "tab:red",
-            "recover": "tab:purple",
             "custom": "tab:gray",
             "fixed": "0.65",
         }

@@ -78,8 +78,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "blocking": "block",
             "defend": "block",
             "defensive": "block",
-            "reset": "recover",
-            "fallback": "recover",
         }
         self.current_mode = "stable"
         self.last_llm_assessment = {}
@@ -142,11 +140,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         min_longitudinal = float(getattr(self.mpc, "min_longitudinal_separation", 0.36))
         if abs_delta_s < min_longitudinal:
             gap_band = "overlap"
-        elif abs_delta_s < 0.8:
+        elif abs_delta_s < sim_params.LLM_CRITICAL_DISTANCE:
             gap_band = "critical"
-        elif abs_delta_s < 2.5:
+        elif abs_delta_s < sim_params.LLM_CLOSE_DISTANCE:
             gap_band = "close"
-        elif abs_delta_s < 4.0:
+        elif abs_delta_s < sim_params.LLM_OVERTAKE_DISTANCE:
             gap_band = "nearby"
         else:
             gap_band = "far"
@@ -167,13 +165,16 @@ class LLMAlphaRacerPolicy(MPCPolicy):
 
         speed_delta = ego_speed - opponent_speed
         speed_relation = "slower" if speed_delta > 0.1 else "faster" if speed_delta < -0.1 else "similar"
+        same_lane_limit = min_lateral + sim_params.LLM_SAME_LANE_MARGIN
         return {
             "id": int(opponent.get("car_idx", fallback_id)),
             "relation": relation,
             "delta_s": self._rounded(delta_s),
             "delta_e": self._rounded(delta_e),
+            "longitudinal_clearance": self._rounded(abs_delta_s - min_longitudinal),
+            "lateral_clearance": self._rounded(abs(delta_e) - min_lateral),
             "distance_band": gap_band,
-            "same_lane": abs(delta_e) < min_lateral,
+            "same_lane": abs(delta_e) < same_lane_limit,
             "speed": self._rounded(opponent_speed),
             "speed_relation_to_ego": speed_relation,
             "closing_speed": self._rounded(max(closing_speed, 0.0)),
@@ -204,11 +205,24 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 return "clear"
             if item["distance_band"] == "overlap" and item["same_lane"]:
                 return "overlap"
-            if item["ttc"] is not None and item["ttc"] < 1.0 and item["same_lane"]:
+            # Spatial proximity remains critical even when the gap is steady
+            # or opening; closing speed and TTC are separate facts.
+            if item["distance_band"] == "critical" and item["same_lane"]:
                 return "critical"
-            if item["closing_speed"] > 0.1 and item["distance_band"] != "far" and item["same_lane"]:
+            if (
+                item["closing_speed"] > 0.1
+                and item["distance_band"] in {"close", "nearby"}
+                and item["same_lane"]
+            ):
                 return "closing"
+            if item["distance_band"] != "far":
+                return "close"
             return "far"
+
+        clear_ahead = (
+            nearest_front is None
+            or nearest_front["delta_s"] > sim_params.LLM_OVERTAKE_DISTANCE
+        )
 
         boundary_ratio = abs(float(current_py)) / max(lateral_limit, 1e-6)
         boundary_risk = "outside" if boundary_ratio > 1.0 else "near" if boundary_ratio >= 0.95 else "low"
@@ -243,6 +257,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "interaction": {
                 "front_risk": interaction_risk(nearest_front),
                 "rear_risk": interaction_risk(nearest_rear),
+                "clear_ahead": clear_ahead,
                 "nearest_front": nearest_front,
                 "nearest_rear": nearest_rear,
                 "opponents_by_distance": opponents_payload,
@@ -250,9 +265,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "limits": {
                 "vehicle_center_half_width": self._rounded(lateral_limit),
                 "reference_half_width": self._rounded(self.ref_lateral_clip),
-                "close_front_distance": 2.5,
-                "overtake_distance": 4.0,
-                "push_max_abs_curvature": 0.15,
+                "same_lane_margin": self._rounded(sim_params.LLM_SAME_LANE_MARGIN),
+                "critical_distance": self._rounded(sim_params.LLM_CRITICAL_DISTANCE),
+                "close_front_distance": self._rounded(sim_params.LLM_CLOSE_DISTANCE),
+                "overtake_distance": self._rounded(sim_params.LLM_OVERTAKE_DISTANCE),
+                "push_max_abs_curvature": self._rounded(sim_params.LLM_PUSH_MAX_ABS_CURVATURE),
                 "critical_ttc": 1.0,
             },
             "decision_state": {
@@ -263,6 +280,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "required_assessment": {
                 "front_risk": interaction_risk(nearest_front),
                 "rear_risk": interaction_risk(nearest_rear),
+                "clear_ahead": clear_ahead,
                 "boundary_risk": boundary_risk,
                 "mpc_health": mpc_health,
             },
@@ -452,11 +470,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                     nearest_front_delta = delta_s
                     nearest_front_lateral_gap = abs(current_py - opponent["py"])
                 if opponent["vx"] < state.vx:
-                    slow_front = slow_front or delta_s < 3.0
-                    close_slow_front = close_slow_front or delta_s < 2.5
-                    immediate_slow_front = immediate_slow_front or delta_s < 0.8
+                    slow_front = slow_front or delta_s < sim_params.LLM_OVERTAKE_DISTANCE
+                    close_slow_front = close_slow_front or delta_s < sim_params.LLM_CLOSE_DISTANCE
+                    immediate_slow_front = immediate_slow_front or delta_s < sim_params.LLM_CRITICAL_DISTANCE
             elif delta_s < 0.0 and opponent["vx"] > state.vx:
-                faster_rear = faster_rear or abs(delta_s) < 3.0
+                faster_rear = faster_rear or abs(delta_s) < sim_params.LLM_OVERTAKE_DISTANCE
                 if nearest_rear_delta is None or abs(delta_s) < abs(nearest_rear_delta):
                     nearest_rear_delta = delta_s
         return {
@@ -480,31 +498,29 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         context = self._mode_context(state, current_s, opponents)
         guarded_mode = self.current_mode
         
-        near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < 0.7 # near contact threshold
+        near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < sim_params.LLM_CRITICAL_DISTANCE
         near_overlap = (
             context["nearest_delta"] is not None
-            and abs(context["nearest_delta"]) < 0.8
+            and abs(context["nearest_delta"]) < sim_params.LLM_CRITICAL_DISTANCE
             and context["nearest_lateral_gap"] is not None
-            and context["nearest_lateral_gap"] < 0.6
+            and context["nearest_lateral_gap"] < self.mpc.min_lateral_separation + sim_params.LLM_SAME_LANE_MARGIN
         )
-        front_clear_for_push = context["nearest_front_delta"] is None or context["nearest_front_delta"] > 4.0
+        front_clear_for_push = context["nearest_front_delta"] is None or context["nearest_front_delta"] > sim_params.LLM_OVERTAKE_DISTANCE
         push_allowed = front_clear_for_push and not near_overlap and abs(context["current_py"]) < 0.45
         tiny_front_gap = (
             context["nearest_front_delta"] is not None
-            and context["nearest_front_delta"] < 0.6
+            and context["nearest_front_delta"] < self.mpc.min_longitudinal_separation
             and context["nearest_front_lateral_gap"] is not None
-            and context["nearest_front_lateral_gap"] < 0.25
+            and context["nearest_front_lateral_gap"] < self.mpc.min_lateral_separation + sim_params.LLM_SAME_LANE_MARGIN
         )
 
         if state.vx < 0.35 and near_contact:
-            guarded_mode = "recover"
+            guarded_mode = "stable"
         elif tiny_front_gap:
             if guarded_mode in {"push", "overtake", "block"}:
-                guarded_mode = "recover" if state.vx < 0.8 else "stable"
+                guarded_mode = "stable"
         elif context["close_slow_front"]:
             if guarded_mode in {"push", "stable", "block"}:
-                guarded_mode = "overtake"
-            elif guarded_mode == "recover" and abs(context["current_py"]) < 0.8 and state.vx > 0.5:
                 guarded_mode = "overtake"
         elif guarded_mode == "push" and not push_allowed:
             guarded_mode = "stable"
@@ -568,7 +584,7 @@ class RuleBasedSafeguardPolicy(LLMAlphaRacerPolicy):
     """Deterministic ablation of the safeguarded discrete-mode LLM policy.
 
     It observes the same Frenet interaction state, selects one of the exact
-    same five mode presets, and then passes the choice through the same mode
+    same four mode presets, and then passes the choice through the same mode
     guard.  No language model or network request is used.
     """
 
@@ -583,18 +599,18 @@ class RuleBasedSafeguardPolicy(LLMAlphaRacerPolicy):
         context = self._mode_context(state, current_s, opponents)
         nearest_delta = context["nearest_delta"]
         nearest_lateral_gap = context["nearest_lateral_gap"]
-        near_contact = nearest_delta is not None and abs(nearest_delta) < 0.7
+        near_contact = nearest_delta is not None and abs(nearest_delta) < sim_params.LLM_CRITICAL_DISTANCE
         near_overlap = (
             nearest_delta is not None
-            and abs(nearest_delta) < 0.8
+            and abs(nearest_delta) < sim_params.LLM_CRITICAL_DISTANCE
             and nearest_lateral_gap is not None
-            and nearest_lateral_gap < 0.6
+            and nearest_lateral_gap < self.mpc.min_lateral_separation + sim_params.LLM_SAME_LANE_MARGIN
         )
         tiny_front_gap = (
             context["nearest_front_delta"] is not None
-            and context["nearest_front_delta"] < 0.6
+            and context["nearest_front_delta"] < self.mpc.min_longitudinal_separation
             and context["nearest_front_lateral_gap"] is not None
-            and context["nearest_front_lateral_gap"] < 0.25
+            and context["nearest_front_lateral_gap"] < self.mpc.min_lateral_separation + sim_params.LLM_SAME_LANE_MARGIN
         )
 
         heading_error = abs(track_heading_error(self.track, state.psi, current_s))
@@ -602,20 +618,20 @@ class RuleBasedSafeguardPolicy(LLMAlphaRacerPolicy):
         lookahead_curvature = abs(track_curvature_at(self.track, lookahead_s))
         near_boundary = abs(context["current_py"]) >= 0.9 * self.mpc.track_half_width
 
-        # Ordered decision tree: recovery and collision avoidance have highest
-        # priority, followed by passing, defending, and clear-road pace.
+        # Ordered decision tree: unsafe/uncertain states fall back to stable,
+        # followed by passing, defending, and clear-road pace.
         if near_boundary or heading_error > 0.8 or (state.vx < 0.35 and near_contact):
-            return "recover"
+            return "stable"
         if tiny_front_gap:
-            return "recover" if state.vx < 0.8 else "stable"
+            return "stable"
         if context["close_slow_front"]:
             return "overtake"
         if near_overlap:
             return "overtake" if context["slow_front"] and state.vx > 0.5 else "stable"
         if context["faster_rear"]:
             return "block"
-        front_clear = context["nearest_front_delta"] is None or context["nearest_front_delta"] > 4.0
-        if front_clear and state.vx > 1.0 and lookahead_curvature < 0.35:
+        front_clear = context["nearest_front_delta"] is None or context["nearest_front_delta"] > sim_params.LLM_OVERTAKE_DISTANCE
+        if front_clear and state.vx > 1.0 and lookahead_curvature < sim_params.LLM_PUSH_MAX_ABS_CURVATURE:
             return "push"
         return "stable"
 

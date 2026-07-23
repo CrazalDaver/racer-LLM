@@ -1,4 +1,4 @@
-"""Compare the five discrete LLM modes in one fixed short driving scenario.
+"""Compare the four discrete LLM modes in one fixed short driving scenario.
 
 The LLM in :mod:`policies` selects one of five parameter presets.  This script
 does not call an LLM; it freezes each preset in turn so that mode is the only
@@ -38,7 +38,6 @@ from track import Track, configure_track, load_centerline_csv, load_raceline_csv
 # push     = [1.8, 1.25, 0.05, 1.00, 0.0]
 # overtake = [1.0, 1.35, 1.75, 0.10, 0.0]
 # block    = [1.6, 0.90, 0.05, 0.45, 2.0]
-# recover  = [3.0, 0.70, 0.00, 1.50, 0.0]
 # Active values come from config so this visualization and the executable LLM
 # policy cannot silently diverge.
 MODE_PRESETS = params.LLM_MODE_PRESETS
@@ -50,7 +49,6 @@ MODE_COLORS = {
     "push": "tab:red",
     "overtake": "tab:orange",
     "block": "tab:purple",
-    "recover": "tab:green",
 }
 
 # Official alpha-RACER sampling bounds mapped to this project's

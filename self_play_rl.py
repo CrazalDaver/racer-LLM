@@ -31,6 +31,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 
+from collision import oriented_rectangle_overlap_cost
 from config import make_vehicle_params, params
 from state import CarState
 from track import Track, load_centerline_csv
@@ -73,7 +74,6 @@ class SelfPlayEnvConfig:
     initial_speed: float = 2.0
     start_gap: float = 3.0
     start_jitter: float = 0.15
-    unsafe_distance: float = 0.4
     track_half_width: float = 0.5
 
 
@@ -279,23 +279,32 @@ class SelfPlayRacingEnv(gym.Env):
             self.states[idx].psi = psi
 
         collisions = 0
+        collision_scales = np.ones(self.cfg.num_cars, dtype=float)
         for i in range(self.cfg.num_cars):
             for j in range(i + 1, self.cfg.num_cars):
-                distance = math.hypot(
-                    self.states[i].x - self.states[j].x,
-                    self.states[i].y - self.states[j].y,
+                overlap_cost = oriented_rectangle_overlap_cost(
+                    self.states[i],
+                    self.states[j],
+                    params.VEHICLE_HALF_LENGTH,
+                    params.VEHICLE_HALF_WIDTH,
                 )
-                if distance > self.cfg.unsafe_distance:
+                if overlap_cost <= 0.0:
                     continue
                 collisions += 1
                 if self.progress_s[i] >= self.progress_s[j]:
                     front, rear = i, j
                 else:
                     front, rear = j, i
-                # These are the collision dynamics stated in the paper; they
-                # shape reward indirectly through lost relative progress.
-                self.states[front].vx *= 0.5
-                self.states[rear].vx *= 1.0 / 3.0
+                collision_scales[front] *= math.exp(
+                    -params.COLLISION_FRONT_DECAY * overlap_cost
+                )
+                collision_scales[rear] *= math.exp(
+                    -params.COLLISION_REAR_DECAY * overlap_cost
+                )
+        for idx, scale in enumerate(collision_scales):
+            if scale < 1.0:
+                self.states[idx].vx *= scale
+                self.states[idx].vy *= scale
         return int(np.sum(offroad)), collisions
 
     def step(self, action):

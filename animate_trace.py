@@ -101,7 +101,6 @@ def _mode_color(mode):
         "push": "tab:blue",
         "overtake": "tab:green",
         "block": "red",
-        "recover": "tab:purple",
         "custom": "0.35",
         "fixed": "0.35",
     }.get(mode_key, "black")

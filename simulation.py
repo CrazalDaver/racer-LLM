@@ -3,6 +3,7 @@ import json
 
 import numpy as np
 
+from collision import oriented_rectangle_overlap_cost
 from config import make_vehicle_params, params
 from mpc_controller import MPCController
 from plotting import plot_simulation_results
@@ -319,6 +320,7 @@ def save_simulation_trace(trace, track, params):
         car_mpc_recovery_active=np.asarray(trace["car_mpc_recovery_active"]),
         car_mpc_recovery_reason=np.asarray(trace["car_mpc_recovery_reason"]),
         collision=np.asarray(trace["collision"]),
+        collision_overlap=np.asarray(trace.get("collision_overlap", []), dtype=float),
         px=np.asarray(trace["px"]),
         py=np.asarray(trace["py"]),
         ref_px=np.asarray(trace["ref_px"]),
@@ -586,6 +588,7 @@ def run_simulation(
         "car_mpc_recovery_active": [],
         "car_mpc_recovery_reason": [],
         "collision": [],
+        "collision_overlap": [],
         "px": [],
         "py": [],
         "ref_px": [],
@@ -801,6 +804,7 @@ def run_simulation(
         trace["ref_horizon_y"].append(ref_horizon_y)
         trace["offroad"].append(abs(car_e[ego_idx]) > offroad_half_width)
         trace["collision"].append(False)
+        trace["collision_overlap"].append(0.0)
         trace["throttle"].append(actions[ego_idx].throttle)
         trace["steer"].append(actions[ego_idx].steer)
         trace["mpc_loss"].append(ego_mpc.last_loss)
@@ -867,8 +871,10 @@ def run_simulation(
             )
             states[car_idx] = CarState.from_array(next_state_arr)
 
-        # Project the updated positions before collision detection so the
-        # simulator uses the same Frenet-frame superellipse as the MPC.
+        # Project updated positions for progress ordering and trace output.
+        # Physical contact itself follows the upstream simulator's oriented
+        # vehicle rectangles; the smooth Frenet superellipse remains an MPC-
+        # only constraint because IPOPT needs a differentiable expression.
         next_s = []
         next_e = []
         for car_idx, state in enumerate(states):
@@ -884,19 +890,20 @@ def run_simulation(
             next_e.append(e)
 
         collision_scales = np.ones(num_cars)
+        max_collision_overlap = 0.0
         for i in range(num_cars):
             for j in range(i + 1, num_cars):
-                delta_ij = progress_delta(next_s[i], next_s[j], track.total_length)
-                delta_e = next_e[i] - next_e[j]
-                collision_metric = (
-                    (delta_ij / params.MPC_MIN_LONGITUDINAL_SEPARATION)
-                    ** params.MPC_COLLISION_SUPERELLIPSE_EXPONENT
-                    + (delta_e / params.MPC_MIN_LATERAL_SEPARATION)
-                    ** params.MPC_COLLISION_SUPERELLIPSE_EXPONENT
+                overlap_cost = oriented_rectangle_overlap_cost(
+                    states[i],
+                    states[j],
+                    params.VEHICLE_HALF_LENGTH,
+                    params.VEHICLE_HALF_WIDTH,
                 )
-                if collision_metric > 1.0:
+                if overlap_cost <= 0.0:
                     continue
+                max_collision_overlap = max(max_collision_overlap, overlap_cost)
 
+                delta_ij = progress_delta(next_s[i], next_s[j], track.total_length)
                 if delta_ij > 0.0:
                     front_idx, rear_idx = i, j
                 elif delta_ij < 0.0:
@@ -904,14 +911,20 @@ def run_simulation(
                 else:
                     continue
 
-                collision_scales[front_idx] = min(collision_scales[front_idx], 0.5)
-                collision_scales[rear_idx] = min(collision_scales[rear_idx], 1.0 / 3.0)
+                collision_scales[front_idx] *= np.exp(
+                    -params.COLLISION_FRONT_DECAY * overlap_cost
+                )
+                collision_scales[rear_idx] *= np.exp(
+                    -params.COLLISION_REAR_DECAY * overlap_cost
+                )
 
         collision_happened = bool(np.any(collision_scales < 1.0))
         trace["collision"][-1] = collision_happened
+        trace["collision_overlap"][-1] = max_collision_overlap
         for car_idx, scale in enumerate(collision_scales):
             if scale < 1.0:
                 states[car_idx].vx *= scale
+                states[car_idx].vy *= scale
 
         if collision_happened and step < params.EARLY_COLLISION_WINDOW_STEPS:
             early_collision_count += 1
@@ -1059,7 +1072,7 @@ if __name__ == "__main__":
     )
     cli_args = parser.parse_args()
 
-    # Options: "centerline", "alpharacer" (potential), "static_alpharacer",
+    # Options: "centerline", "alpharacer" (trained potential), "static_alpharacer",
     # "ibr", or "llm_alpharacer". "weighted_alpharacer" aliases "alpharacer".
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
