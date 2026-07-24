@@ -36,6 +36,8 @@ class MPCController:
         min_lateral_separation=0.20,
         max_constrained_opponents=2,
         collision_superellipse_exponent=4,
+        enforce_track_boundary=True,
+        enforce_collision_avoidance=True,
     ):
         self.dt = dt
         self.horizon = horizon
@@ -58,6 +60,8 @@ class MPCController:
         self.min_lateral_separation = float(min_lateral_separation)
         self.max_constrained_opponents = max(0, int(max_constrained_opponents))
         self.collision_superellipse_exponent = int(collision_superellipse_exponent)
+        self.enforce_track_boundary = bool(enforce_track_boundary)
+        self.enforce_collision_avoidance = bool(enforce_collision_avoidance)
         if self.min_longitudinal_separation <= 0.0 or self.min_lateral_separation <= 0.0:
             raise ValueError("MPC collision separations must be positive")
         if self.collision_superellipse_exponent < 2 or self.collision_superellipse_exponent % 2:
@@ -317,16 +321,16 @@ class MPCController:
             # already be slightly outside the MPC boundary; constraining it
             # would make recovery problems immediately infeasible.
             if k >= 1:
-                lateral_e = (
-                    (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
-                    + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
-                )
+                if self.enforce_track_boundary:
+                    lateral_e = (
+                        (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
+                        + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
+                    )
 
-                # Enforce the MPC track boundary constraint (1f). The supplied
-                # half-width is the center-safe track width, i.e. geometric
-                # track half-width minus vehicle half-width.
-                g_ineq.append(lateral_e - self.track_constraint_half_width)
-                g_ineq.append(-lateral_e - self.track_constraint_half_width)
+                    # Enforce the MPC track boundary constraint (1f). The
+                    # supplied half-width is the center-safe track width.
+                    g_ineq.append(lateral_e - self.track_constraint_half_width)
+                    g_ineq.append(-lateral_e - self.track_constraint_half_width)
 
                 # Paper (1g)-(1h) describe separate minimum lateral and
                 # longitudinal separations. Enforcing both inequalities with
@@ -336,18 +340,19 @@ class MPCController:
                 # superellipse is the standard NLP representation of that
                 # rectangular exclusion region and approaches the two paper
                 # bounds more closely than a circular distance constraint.
-                for opponent_idx in range(self.max_constrained_opponents):
-                    delta_s = car_px - self.opponent_s[opponent_idx, k]
-                    delta_e = car_py - self.opponent_e[opponent_idx, k]
-                    collision_metric = (
-                        (delta_s / self.min_longitudinal_separation)
-                        ** self.collision_superellipse_exponent
-                        + (delta_e / self.min_lateral_separation)
-                        ** self.collision_superellipse_exponent
-                    )
-                    g_ineq.append(
-                        self.opponent_active[opponent_idx] * (1.0 - collision_metric)
-                    )
+                if self.enforce_collision_avoidance:
+                    for opponent_idx in range(self.max_constrained_opponents):
+                        delta_s = car_px - self.opponent_s[opponent_idx, k]
+                        delta_e = car_py - self.opponent_e[opponent_idx, k]
+                        collision_metric = (
+                            (delta_s / self.min_longitudinal_separation)
+                            ** self.collision_superellipse_exponent
+                            + (delta_e / self.min_lateral_separation)
+                            ** self.collision_superellipse_exponent
+                        )
+                        g_ineq.append(
+                            self.opponent_active[opponent_idx] * (1.0 - collision_metric)
+                        )
 
         for k in range(self.horizon):
             if k == 0:

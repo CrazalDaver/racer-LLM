@@ -4,7 +4,7 @@ import json
 import numpy as np
 
 from collision import oriented_rectangle_overlap_cost
-from config import make_vehicle_params, params
+from config import duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
 from plotting import plot_simulation_results
 from policy import (
@@ -19,7 +19,7 @@ from policy import (
     plan_ibr_joint_actions,
     progress_delta,
 )
-from state import CarState
+from state import CarAction, CarState
 from track import Track, configure_track, load_centerline_csv, load_raceline_csv
 from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
 
@@ -145,7 +145,7 @@ def create_policy(
     llm_output_mode=None,
     llm_model_name=None,
     llm_temperature=None,
-    llm_update_interval_steps=None,
+    llm_update_interval_seconds=None,
     llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -157,7 +157,7 @@ def create_policy(
         return CenterLinePolicy(
             track,
             mpc,
-            step_distance=params.DT * params.MAX_RACELINE_SPEED,
+            step_distance=params.MPC_DT * params.MAX_RACELINE_SPEED,
             car_idx=car_idx,
             policy_name=policy_type,
         )
@@ -197,11 +197,12 @@ def create_policy(
             base_url=params.LLM_BASE_URL,
             timeout=params.LLM_TIMEOUT,
             temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature,
-            update_interval_steps=(
-                params.LLM_UPDATE_INTERVAL_STEPS
-                if llm_update_interval_steps is None
-                else llm_update_interval_steps
+            update_interval_seconds=(
+                params.LLM_UPDATE_INTERVAL_SECONDS
+                if llm_update_interval_seconds is None
+                else llm_update_interval_seconds
             ),
+            decision_dt=params.CONTROL_DT,
             history_length=params.LLM_HISTORY_LENGTH,
             output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode,
             safeguard_enabled=(
@@ -223,11 +224,12 @@ def create_policy(
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
             ref_lateral_clip=params.REF_LATERAL_CLIP,
-            update_interval_steps=(
-                params.LLM_UPDATE_INTERVAL_STEPS
-                if llm_update_interval_steps is None
-                else llm_update_interval_steps
+            update_interval_seconds=(
+                params.LLM_UPDATE_INTERVAL_SECONDS
+                if llm_update_interval_seconds is None
+                else llm_update_interval_seconds
             ),
+            decision_dt=params.CONTROL_DT,
             history_length=params.LLM_HISTORY_LENGTH,
         )
     if policy_type == "alpharacer":
@@ -345,6 +347,7 @@ def save_simulation_trace(trace, track, params):
         mpc_solver_status=np.asarray(trace["mpc_solver_status"]),
         mpc_recovery_active=np.asarray(trace["mpc_recovery_active"]),
         mpc_recovery_reason=np.asarray(trace["mpc_recovery_reason"]),
+        control_update=np.asarray(trace.get("control_update", []), dtype=bool),
         policy_params=np.asarray(trace["policy_params"]),
         policy_mode=np.asarray(trace["policy_mode"]),
         policy_reason=np.asarray(trace.get("policy_reason", []), dtype=str),
@@ -402,6 +405,16 @@ def save_simulation_trace(trace, track, params):
         ),
         track_length=np.asarray(track.total_length),
         vehicle_model=np.asarray(trace["vehicle_model"]),
+        simulation_dt=np.asarray(params.SIM_DT),
+        control_dt=np.asarray(params.CONTROL_DT),
+        mpc_dt=np.asarray(params.MPC_DT),
+        llm_update_interval_seconds=np.asarray(
+            trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
+        ),
+        early_collision_window_seconds=np.asarray(params.EARLY_COLLISION_WINDOW_SECONDS),
+        early_collision_consecutive_seconds=np.asarray(
+            params.EARLY_COLLISION_CONSECUTIVE_SECONDS
+        ),
         early_stop=np.asarray(trace.get("early_stop", False)),
         early_stop_reason=np.asarray(trace.get("early_stop_reason", "")),
         completed_steps=np.asarray(trace.get("completed_steps", len(trace["time"]))),
@@ -427,7 +440,7 @@ def run_simulation(
     llm_model_names=None,
     llm_temperature=None,
     llm_temperatures=None,
-    llm_update_interval_steps=None,
+    llm_update_interval_seconds=None,
     llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -498,7 +511,7 @@ def run_simulation(
             Q=params.Q,
             R=params.R,
             max_vel_rate=params.MAX_VEL_RATE,
-            max_steer_delta=params.MPC_MAX_STEER_DELTA,
+            max_steer_delta=params.MPC_MAX_STEER_RATE * params.MPC_DT,
             db_params=vehicle_params,
             track_width=params.TRACK_WIDTH,
             track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
@@ -525,7 +538,7 @@ def run_simulation(
                 llm_output_mode=llm_output_mode,
                 llm_model_name=resolved_llm_model_names[car_idx],
                 llm_temperature=resolved_llm_temperatures[car_idx],
-                llm_update_interval_steps=llm_update_interval_steps,
+                llm_update_interval_seconds=llm_update_interval_seconds,
                 llm_safeguard_enabled=llm_safeguard_enabled,
                 self_play_rl_model_path=self_play_rl_model_path,
                 self_play_rl_backend=self_play_rl_backend,
@@ -536,7 +549,7 @@ def run_simulation(
         vehicle_models.append(
             create_vehicle_model(
                 vehicle_model_type,
-                dt=params.DT,
+                dt=params.SIM_DT,
                 db_params=vehicle_params,
                 max_speed=params.MAX_STATE_SPEED,
             )
@@ -547,7 +560,25 @@ def run_simulation(
         _, _, start_psi = track.interpolate(start_s)
         states.append(CarState(x=start_x, y=start_y, vx=v0, vy=0.0, psi=start_psi, omega=0.0))
 
-    total_steps = int(params.TOTAL_TIME / params.DT)
+    control_steps = duration_to_steps(params.CONTROL_DT, params.SIM_DT)
+    if not np.isclose(control_steps * params.SIM_DT, params.CONTROL_DT):
+        raise ValueError("CONTROL_DT must be an integer multiple of SIM_DT")
+    total_steps = int(params.TOTAL_TIME / params.SIM_DT)
+    early_collision_window_steps = duration_to_steps(
+        params.EARLY_COLLISION_WINDOW_SECONDS, params.SIM_DT
+    )
+    early_collision_consecutive_steps = duration_to_steps(
+        params.EARLY_COLLISION_CONSECUTIVE_SECONDS, params.SIM_DT
+    )
+    ref_debug_sample_steps = duration_to_steps(
+        params.REF_DEBUG_SAMPLE_INTERVAL_SECONDS, params.SIM_DT
+    )
+    trajectory_sample_steps = duration_to_steps(
+        params.TRAJECTORY_SAMPLE_INTERVAL_SECONDS, params.SIM_DT
+    )
+    progress_report_steps = duration_to_steps(
+        params.PROGRESS_REPORT_INTERVAL_SECONDS, params.SIM_DT
+    )
     track_half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     offroad_half_width = track_half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
     progress_s = [-start_ranks[car_idx] * params.CAR_START_GAP for car_idx in range(num_cars)]
@@ -613,6 +644,7 @@ def run_simulation(
         "mpc_solver_status": [],
         "mpc_recovery_active": [],
         "mpc_recovery_reason": [],
+        "control_update": [],
         "policy_params": [],
         "policy_mode": [],
         "policy_reason": [],
@@ -655,6 +687,11 @@ def run_simulation(
         "car_llm_safeguard_enabled": [
             bool(getattr(policy, "safeguard_enabled", False)) for policy in policies
         ],
+        "llm_update_interval_seconds": (
+            params.LLM_UPDATE_INTERVAL_SECONDS
+            if llm_update_interval_seconds is None
+            else float(llm_update_interval_seconds)
+        ),
         "ego_index": ego_idx,
         "ego_position": ego_position,
         "start_ranks": start_ranks,
@@ -666,7 +703,9 @@ def run_simulation(
         f"track={params.TRACK_CSV}, scale={params.TRACK_SCALE:g}, "
         f"half_width={params.TRACK_HALF_WIDTH:g}, "
         f"policies={resolved_policy_names}, ego_start_position={ego_position}/{num_cars}, "
-        f"vehicle_model={vehicle_model_type}"
+        f"vehicle_model={vehicle_model_type}, "
+        f"timing=sim:{params.SIM_DT:g}s/control:{params.CONTROL_DT:g}s/"
+        f"mpc:{params.MPC_DT:g}s"
     )
     if any(name == "llm_alpharacer" for name in resolved_policy_names):
         print(f"LLM models by car: {trace['llm_model_names']}")
@@ -694,6 +733,7 @@ def run_simulation(
     early_stop = False
     early_stop_reason = ""
     last_step = -1
+    held_actions = [CarAction(throttle=0.0, steer=0.0) for _ in range(num_cars)]
     for step in progress_iter:
         last_step = step
         car_s = []
@@ -710,32 +750,37 @@ def run_simulation(
             car_s.append(s)
             car_e.append(e_before)
 
-        actions = []
-        plan_alpharacer_policy_params(policies, states, car_s, car_e)
-        plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=step * params.DT)
-        for car_idx, state in enumerate(states):
-            opponents = [
-                {
-                    "car_idx": j,
-                    "px": car_s[j],
-                    "py": car_e[j],
-                    "vx": max(states[j].vx, 0.0),
-                    "vy": states[j].vy,
-                    "omega": states[j].omega,
-                    "psi": states[j].psi,
-                    "state": states[j],
-                }
-                for j in range(num_cars)
-                if j != car_idx
-            ]
-            actions.append(
-                policies[car_idx].get_action(
-                    state,
-                    car_s[car_idx],
-                    opponents=opponents,
-                    sim_time=step * params.DT,
+        control_update = step % control_steps == 0
+        if control_update:
+            next_actions = []
+            sim_time = step * params.SIM_DT
+            plan_alpharacer_policy_params(policies, states, car_s, car_e)
+            plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=sim_time)
+            for car_idx, state in enumerate(states):
+                opponents = [
+                    {
+                        "car_idx": j,
+                        "px": car_s[j],
+                        "py": car_e[j],
+                        "vx": max(states[j].vx, 0.0),
+                        "vy": states[j].vy,
+                        "omega": states[j].omega,
+                        "psi": states[j].psi,
+                        "state": states[j],
+                    }
+                    for j in range(num_cars)
+                    if j != car_idx
+                ]
+                next_actions.append(
+                    policies[car_idx].get_action(
+                        state,
+                        car_s[car_idx],
+                        opponents=opponents,
+                        sim_time=sim_time,
+                    )
                 )
-            )
+            held_actions = next_actions
+        actions = held_actions
 
         ego_policy = policies[ego_idx]
         ego_mpc = mpcs[ego_idx]
@@ -767,7 +812,7 @@ def run_simulation(
             trace["ref_py"].append(np.nan)
             trace["ref_speed"].append(np.nan)
 
-        trace["time"].append(step * params.DT)
+        trace["time"].append(step * params.SIM_DT)
         trace["x"].append(ego_state.x)
         trace["y"].append(ego_state.y)
         trace["psi"].append(ego_state.psi)
@@ -816,6 +861,7 @@ def run_simulation(
         trace["mpc_solver_status"].append(ego_mpc.last_solver_status)
         trace["mpc_recovery_active"].append(ego_mpc.last_recovery_active)
         trace["mpc_recovery_reason"].append(ego_mpc.last_recovery_reason)
+        trace["control_update"].append(control_update)
         trace["policy_params"].append(getattr(ego_policy, "params", np.full(5, np.nan)).copy())
         trace["policy_mode"].append(getattr(ego_policy, "current_mode", "fixed"))
         trace["policy_reason"].append(getattr(ego_policy, "last_llm_reason", ""))
@@ -852,7 +898,7 @@ def run_simulation(
         )
         trace["car_offroad"].append([abs(error) > offroad_half_width for error in car_e])
 
-        if (step + 1) % 100 == 0 and ego_policy.last_ref_traj is not None:
+        if (step + 1) % ref_debug_sample_steps == 0 and ego_policy.last_ref_traj is not None:
             frenet_ref_lines.append((ego_state.x, ego_state.y, ref_fx, ref_fy))
 
         mpc_losses.append(ego_mpc.last_loss)
@@ -912,10 +958,16 @@ def run_simulation(
                     continue
 
                 collision_scales[front_idx] *= np.exp(
-                    -params.COLLISION_FRONT_DECAY * overlap_cost
+                    -params.COLLISION_FRONT_DECAY
+                    * overlap_cost
+                    * params.SIM_DT
+                    / params.CONTROL_DT
                 )
                 collision_scales[rear_idx] *= np.exp(
-                    -params.COLLISION_REAR_DECAY * overlap_cost
+                    -params.COLLISION_REAR_DECAY
+                    * overlap_cost
+                    * params.SIM_DT
+                    / params.CONTROL_DT
                 )
 
         collision_happened = bool(np.any(collision_scales < 1.0))
@@ -926,9 +978,9 @@ def run_simulation(
                 states[car_idx].vx *= scale
                 states[car_idx].vy *= scale
 
-        if collision_happened and step < params.EARLY_COLLISION_WINDOW_STEPS:
+        if collision_happened and step < early_collision_window_steps:
             early_collision_count += 1
-        elif step < params.EARLY_COLLISION_WINDOW_STEPS:
+        elif step < early_collision_window_steps:
             early_collision_count = 0
 
         for car_idx, state in enumerate(states):
@@ -942,7 +994,7 @@ def run_simulation(
         lateral_errors.append(next_e[ego_idx])
         longitudinal_positions.append(progress_s[ego_idx])
 
-        if step % 2 == 0:
+        if step % trajectory_sample_steps == 0:
             for car_idx, state in enumerate(states):
                 all_traj_x[car_idx].append(state.x)
                 all_traj_y[car_idx].append(state.y)
@@ -950,14 +1002,14 @@ def run_simulation(
             traj_y.append(states[ego_idx].y)
             velocities.append(states[ego_idx].vx)
 
-        if (step + 1) % 200 == 0:
+        if (step + 1) % progress_report_steps == 0:
             current_position = 1 + sum(
                 progress_s[car_idx] > progress_s[ego_idx]
                 for car_idx in range(num_cars)
                 if car_idx != ego_idx
             )
             message = (
-                f"Step {step+1}/{total_steps}, t={(step+1)*params.DT:.1f}s, "
+                f"Step {step+1}/{total_steps}, t={(step+1)*params.SIM_DT:.1f}s, "
                 f"position={current_position}/{num_cars}, "
                 f"vx={states[ego_idx].vx:.2f} m/s, e={next_e[ego_idx]:.3f}, "
                 f"throttle={actions[ego_idx].throttle:.2f}, steer={actions[ego_idx].steer:.2f}"
@@ -969,16 +1021,17 @@ def run_simulation(
 
         if (
             params.EARLY_COLLISION_STOP
-            and early_collision_count >= params.EARLY_COLLISION_CONSECUTIVE_STEPS
+            and early_collision_count >= early_collision_consecutive_steps
         ):
             early_stop = True
             early_stop_reason = (
-                f"early collision for {early_collision_count} consecutive steps "
-                f"within first {params.EARLY_COLLISION_WINDOW_STEPS} steps"
+                f"continuous collision for at least "
+                f"{params.EARLY_COLLISION_CONSECUTIVE_SECONDS:g}s "
+                f"within the first {params.EARLY_COLLISION_WINDOW_SECONDS:g}s"
             )
             message = (
                 f"Early stop at step {step+1}/{total_steps}, "
-                f"t={(step+1)*params.DT:.2f}s: {early_stop_reason}"
+                f"t={(step+1)*params.SIM_DT:.2f}s: {early_stop_reason}"
             )
             if progress_bar is not None:
                 progress_bar.write(message)
@@ -992,7 +1045,7 @@ def run_simulation(
     trace["completed_steps"] = completed_steps
     trace["planned_steps"] = total_steps
 
-    final_time = last_step * params.DT if last_step >= 0 else 0.0
+    final_time = last_step * params.SIM_DT if last_step >= 0 else 0.0
     for policy in policies:
         policy.flush_solver_warnings(sim_time=final_time)
 
@@ -1077,13 +1130,21 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
+    # run_simulation(
+    #     v0 = 0,
+    #     # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
+    #     policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
+    #     llm_model_names=["qwen2.5:7b", None, None],
+    #     # llm_model_names=["qwen2.5:0.5b", "qwen2.5:0.5b", "qwen2.5:0.5b"],
+    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_seconds=1.0,
+    #     llm_temperature = 0.0,
+    #     llm_safeguard_enabled=False,
+    # )
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
-        policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
+        policy_names=["LLM", "static_alpharacer", "static_alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:7b", None, None],
-        # llm_model_names=["qwen2.5:0.5b", "qwen2.5:0.5b", "qwen2.5:0.5b"],
-        vehicle_model_type="kinematic", ego_position=3, llm_update_interval_steps=50, 
-        llm_temperature = 0.0,
-        llm_safeguard_enabled=False,
+        vehicle_model_type="kinematic", ego_position=3,
+
     )

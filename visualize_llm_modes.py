@@ -1,6 +1,6 @@
 """Compare the four discrete LLM modes in one fixed short driving scenario.
 
-The LLM in :mod:`policies` selects one of five parameter presets.  This script
+The LLM policy selects one of four parameter presets. This script
 does not call an LLM; it freezes each preset in turn so that mode is the only
 experimental variable.  Ego starts before a curved section and approaches a
 stationary opponent on the centerline.
@@ -26,7 +26,7 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.patches import Polygon
 from matplotlib.colors import Normalize
 
-from config import make_vehicle_params, params
+from config import duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
 from simulation import create_policy, create_vehicle_model, progress_delta, project_vehicle_state
 from state import CarState
@@ -87,7 +87,7 @@ def make_mpc(track, vehicle_params, horizon):
         Q=params.Q,
         R=params.R,
         max_vel_rate=params.MAX_VEL_RATE,
-        max_steer_delta=params.MPC_MAX_STEER_DELTA,
+        max_steer_delta=params.MPC_MAX_STEER_RATE * params.MPC_DT,
         db_params=vehicle_params,
         track_width=params.TRACK_WIDTH,
         track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
@@ -99,6 +99,8 @@ def make_mpc(track, vehicle_params, horizon):
         min_lateral_separation=params.MPC_MIN_LATERAL_SEPARATION,
         max_constrained_opponents=1,
         collision_superellipse_exponent=params.MPC_COLLISION_SUPERELLIPSE_EXPONENT,
+        enforce_track_boundary=params.MPC_ENFORCE_TRACK_BOUNDARY,
+        enforce_collision_avoidance=params.MPC_ENFORCE_COLLISION_AVOIDANCE,
     )
 
 
@@ -135,10 +137,10 @@ def simulate_mode(
     opponent_policy.log_fn = lambda _message: None
     # Construct the vehicle through the same factory as run_simulation().
     ego_model = create_vehicle_model(
-        "kinematic", params.DT, vehicle_params, params.MAX_STATE_SPEED
+        "kinematic", params.SIM_DT, vehicle_params, params.MAX_STATE_SPEED
     )
     opponent_model = create_vehicle_model(
-        "kinematic", params.DT, vehicle_params, params.MAX_STATE_SPEED
+        "kinematic", params.SIM_DT, vehicle_params, params.MAX_STATE_SPEED
     )
 
     x0, y0, psi0, ego_s0, ego_e0 = ego_start
@@ -158,7 +160,11 @@ def simulate_mode(
     )}
     progress_s = ego_s0
     opponent_progress_s = opponent_s0
-    for step in range(int(round(duration / params.DT)) + 1):
+    control_steps = duration_to_steps(params.CONTROL_DT, params.SIM_DT)
+    total_steps = int(round(duration / params.SIM_DT))
+    action = None
+    opponent_action = None
+    for step in range(total_steps + 1):
         progress_s, lateral_e = project_vehicle_state(
             track,
             state,
@@ -193,9 +199,18 @@ def simulate_mode(
             "psi": state.psi,
             "state": state,
         }]
-        action = policy.get_action(
-            state, progress_s, opponents=opponent_for_ego, sim_time=step * params.DT
-        )
+        if step % control_steps == 0:
+            sim_time = step * params.SIM_DT
+            action = policy.get_action(
+                state, progress_s, opponents=opponent_for_ego, sim_time=sim_time
+            )
+            if not stationary_opponent:
+                opponent_action = opponent_policy.get_action(
+                    opponent_state,
+                    opponent_progress_s,
+                    opponents=ego_for_opponent,
+                    sim_time=sim_time,
+                )
         ref_world = policy.last_ref_world_horizon
         if ref_world is None:
             ref_x = np.full(horizon + 1, np.nan)
@@ -204,7 +219,7 @@ def simulate_mode(
             ref_x = np.asarray(ref_world[0], dtype=float).copy()
             ref_y = np.asarray(ref_world[1], dtype=float).copy()
 
-        history["time"].append(step * params.DT)
+        history["time"].append(step * params.SIM_DT)
         history["x"].append(state.x)
         history["y"].append(state.y)
         history["psi"].append(state.psi)
@@ -224,19 +239,13 @@ def simulate_mode(
         history["opponent_s"].append(opponent_progress_s)
         history["opponent_e"].append(opponent_e)
         history["opponent_vx"].append(opponent_state.vx)
-        if step == int(round(duration / params.DT)):
+        if step == total_steps:
             break
 
         state = CarState.from_array(
             ego_model.step(state.to_array(), action.throttle, action.steer)
         )
         if not stationary_opponent:
-            opponent_action = opponent_policy.get_action(
-                opponent_state,
-                opponent_progress_s,
-                opponents=ego_for_opponent,
-                sim_time=step * params.DT,
-            )
             opponent_state = CarState.from_array(
                 opponent_model.step(
                     opponent_state.to_array(),

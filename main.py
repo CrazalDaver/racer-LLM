@@ -144,7 +144,7 @@ def simulation_kwargs(
     llm_model_names=None,
     llm_temperature=None,
     llm_temperatures=None,
-    llm_update_interval_steps=None,
+    llm_update_interval_seconds=None,
     llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -161,7 +161,7 @@ def simulation_kwargs(
         "llm_model_names": llm_model_names,
         "llm_temperature": llm_temperature,
         "llm_temperatures": llm_temperatures,
-        "llm_update_interval_steps": llm_update_interval_steps,
+        "llm_update_interval_seconds": llm_update_interval_seconds,
         "llm_safeguard_enabled": llm_safeguard_enabled,
         "self_play_rl_model_path": self_play_rl_model_path,
         "self_play_rl_backend": self_play_rl_backend,
@@ -181,7 +181,7 @@ def _override_snapshot(
     llm_model_names=None,
     llm_temperature=None,
     llm_temperatures=None,
-    llm_update_interval_steps=None,
+    llm_update_interval_seconds=None,
     llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -200,7 +200,7 @@ def _override_snapshot(
         llm_model_names=llm_model_names,
         llm_temperature=llm_temperature,
         llm_temperatures=llm_temperatures,
-        llm_update_interval_steps=llm_update_interval_steps,
+        llm_update_interval_seconds=llm_update_interval_seconds,
         llm_safeguard_enabled=llm_safeguard_enabled,
         self_play_rl_model_path=self_play_rl_model_path,
         self_play_rl_backend=self_play_rl_backend,
@@ -227,8 +227,10 @@ def _override_snapshot(
         snapshot["LLM_TEMPERATURE"] = float(overrides["llm_temperature"])
     if overrides["llm_temperatures"] is not None:
         snapshot["LLM_TEMPERATURES"] = [float(value) for value in overrides["llm_temperatures"]]
-    if overrides["llm_update_interval_steps"] is not None:
-        snapshot["LLM_UPDATE_INTERVAL_STEPS"] = int(overrides["llm_update_interval_steps"])
+    if overrides["llm_update_interval_seconds"] is not None:
+        snapshot["LLM_UPDATE_INTERVAL_SECONDS"] = float(
+            overrides["llm_update_interval_seconds"]
+        )
     if overrides["llm_safeguard_enabled"] is not None:
         snapshot["LLM_SAFEGUARD_ENABLED"] = bool(overrides["llm_safeguard_enabled"])
     if overrides["self_play_rl_model_path"] is not None:
@@ -261,7 +263,7 @@ def run_experiment(
     llm_model_names=None,
     llm_temperature=None,
     llm_temperatures=None,
-    llm_update_interval_steps=None,
+    llm_update_interval_seconds=None,
     llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -284,7 +286,7 @@ def run_experiment(
         llm_model_names=llm_model_names,
         llm_temperature=llm_temperature,
         llm_temperatures=llm_temperatures,
-        llm_update_interval_steps=llm_update_interval_steps,
+        llm_update_interval_seconds=llm_update_interval_seconds,
         llm_safeguard_enabled=llm_safeguard_enabled,
         self_play_rl_model_path=self_play_rl_model_path,
         self_play_rl_backend=self_play_rl_backend,
@@ -392,7 +394,7 @@ def run_experiment_suite(
     llm_model_name=None,
     llm_temperature=None,
     llm_temperatures=None,
-    llm_update_interval_steps=None,
+    llm_update_interval_seconds=None,
     llm_safeguard_enabled=None,
     self_play_rl_model_path=None,
     self_play_rl_backend=None,
@@ -437,7 +439,7 @@ def run_experiment_suite(
                 llm_model_names=llm_model_names,
                 llm_temperature=llm_temperature,
                 llm_temperatures=llm_temperatures,
-                llm_update_interval_steps=llm_update_interval_steps,
+                llm_update_interval_seconds=llm_update_interval_seconds,
                 llm_safeguard_enabled=llm_safeguard_enabled,
                 self_play_rl_model_path=self_play_rl_model_path,
                 self_play_rl_backend=self_play_rl_backend,
@@ -611,7 +613,12 @@ def _add_sim_args(parser):
     group.add_argument("--llm-models", nargs="+", default=None)
     group.add_argument("--llm-temperature", type=float, default=None)
     group.add_argument("--llm-temperatures", nargs="+", type=float, default=None)
-    group.add_argument("--llm-update-interval-steps", type=int, default=None)
+    group.add_argument(
+        "--llm-update-interval-seconds",
+        type=float,
+        default=None,
+        help="Wall-clock interval between LLM decisions (default: 1.0 s).",
+    )
     group.add_argument(
         "--llm-safeguard",
         action=argparse.BooleanOptionalAction,
@@ -657,7 +664,11 @@ if __name__ == "__main__":
         llm_output_mode=args.llm_output_mode or "mode",
         llm_model_name=args.llm_model,
         llm_model_names=args.llm_models,
-        llm_update_interval_steps=args.llm_update_interval_steps or 50,
+        llm_update_interval_seconds=(
+            args.llm_update_interval_seconds
+            if args.llm_update_interval_seconds is not None
+            else 1.0
+        ),
         llm_temperature=args.llm_temperature if args.llm_temperature is not None else 1.0,
         llm_temperatures=args.llm_temperatures,
         llm_safeguard_enabled=args.llm_safeguard if args.llm_safeguard is not None else False,

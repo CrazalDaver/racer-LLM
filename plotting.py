@@ -209,7 +209,7 @@ def plot_simulation_results(
 ):
     half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     offroad_half_width = half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
-    dt = params.DT
+    dt = params.SIM_DT
 
     fig, axes = plt.subplots(4, 2, figsize=(14, 17), constrained_layout=True)
     fig.set_constrained_layout_pads(w_pad=0.08, h_pad=0.12, wspace=0.12, hspace=0.18)
@@ -438,6 +438,7 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
     track_length = float(np.asarray(data["track_length"]).item()) if "track_length" in data.files else None
     params = SimpleNamespace(
         DT=dt,
+        SIM_DT=dt,
         TRACK_WIDTH=track_width,
         TRACK_HALF_WIDTH=track_half_width,
         OFFROAD_TOLERANCE=offroad_tolerance,

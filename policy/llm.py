@@ -7,7 +7,7 @@ import urllib.request
 
 import numpy as np
 
-from config import params as sim_params
+from config import duration_to_steps, params as sim_params
 from state import CarState
 
 from .mpc import MPCPolicy
@@ -28,7 +28,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         base_url="http://localhost:11434",
         timeout=3.0,
         temperature=0.0,
-        update_interval_steps=1,  # Only call the LLM every N steps to reduce latency and instability.
+        update_interval_seconds=1.0,
+        decision_dt=None,
         history_length=5,
         output_mode="auto", # "mode" for discrete mode selection, "params" for direct parameter output, "auto" to infer from model name.
         safeguard_enabled=False,  # If True, apply deterministic mode-guarding rules to the LLM output.
@@ -41,7 +42,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.temperature = float(np.clip(temperature, 0.0, 2.0))
-        self.update_interval_steps = max(1, int(update_interval_steps))
+        self.update_interval_seconds = max(float(update_interval_seconds), 0.0)
+        self.decision_dt = sim_params.CONTROL_DT if decision_dt is None else float(decision_dt)
+        self._update_interval_calls = duration_to_steps(
+            self.update_interval_seconds, self.decision_dt
+        )
         self.history_length = max(0, int(history_length))
         self.output_mode = self._resolve_output_mode(output_mode, model_name)
         self.safeguard_enabled = bool(safeguard_enabled)
@@ -535,9 +540,10 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self.params = self.mode_presets[guarded_mode].copy()
 
     def update_params_from_llm(self, state: CarState, current_s: float, opponents=None):
-        # Only call the LLM every update_interval_steps to avoid excessive latency and instability.
+        # Convert the wall-clock interval to calls once; callers invoke this
+        # policy at decision_dt intervals.
         self._llm_call_count += 1
-        if self._llm_call_count > 1 and (self._llm_call_count - 1) % self.update_interval_steps != 0:
+        if self._llm_call_count > 1 and (self._llm_call_count - 1) % self._update_interval_calls != 0:
             self.params = self.last_llm_params.copy()
             return
 
@@ -637,7 +643,7 @@ class RuleBasedSafeguardPolicy(LLMAlphaRacerPolicy):
 
     def update_params_from_rules(self, state: CarState, current_s: float, opponents=None):
         self._llm_call_count += 1
-        if self._llm_call_count > 1 and (self._llm_call_count - 1) % self.update_interval_steps != 0:
+        if self._llm_call_count > 1 and (self._llm_call_count - 1) % self._update_interval_calls != 0:
             self.params = self.last_rule_params.copy()
             return
 

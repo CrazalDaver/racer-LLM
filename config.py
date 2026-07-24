@@ -54,9 +54,19 @@ def make_vehicle_params(vehicle_model_type):
     return DynamicParams(vehicle_model_type)
 
 
+def duration_to_steps(duration_seconds, dt):
+    """Convert a positive duration to steps without triggering it early."""
+    return max(
+        1,
+        int(np.ceil(float(duration_seconds) / float(dt) - 1e-12)),
+    )
+
+
 class SimParams:
-    # DT = 0.02
-    DT = 0.1
+    # Multi-rate execution: vehicle/contact integration runs at 50 Hz, MPC and
+    # policy actions update at 10 Hz, and the LLM updates every 1 s.
+    SIM_DT = 0.02
+    CONTROL_DT = 0.1
     TOTAL_TIME = 50.0
     v0 = 0.0
     TRACK_CSV = "track_csv/berlin_2018.csv"
@@ -66,17 +76,20 @@ class SimParams:
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
     VEHICLE_HALF_LENGTH = 0.18
     VEHICLE_HALF_WIDTH = 0.12
-    # Upstream numerical simulator applies continuous, asymmetric speed loss
-    # based on oriented-rectangle overlap; the rear car is penalized more.
+    # Upstream-style asymmetric overlap decay, calibrated per CONTROL_DT.
+    # The simulator scales these exponents by SIM_DT / CONTROL_DT so contact
+    # loss does not become stronger merely because integration is finer.
     COLLISION_FRONT_DECAY = 5.0
     COLLISION_REAR_DECAY = 20.0
-    # MPC constrains the vehicle center, so reserve one vehicle half-width at
-    # each track edge: |e_center| <= track_half_width - vehicle_half_width.
+    # MPC may constrain the vehicle center while reserving one vehicle
+    # half-width at each edge: |e_center| <= half_width - vehicle_half_width.
+    # This safety envelope is separate from reference-trajectory generation.
     MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH - VEHICLE_HALF_WIDTH
-    # Keep references slightly inside the hard MPC boundary to leave tracking
-    # and numerical feasibility margin instead of targeting the constraint.
-    REF_BOUNDARY_MARGIN = 0.03
-    REF_LATERAL_CLIP = MPC_CONSTRAINT_HALF_WIDTH - REF_BOUNDARY_MARGIN
+    # Preserve the optimized raceline up to the geometric track edge. Do not
+    # shrink the reference merely because the simulated vehicle has width;
+    # vehicle-width safety belongs to the MPC/physical-boundary layer.
+    REF_BOUNDARY_MARGIN = 0.0
+    REF_LATERAL_CLIP = TRACK_HALF_WIDTH - REF_BOUNDARY_MARGIN
     # Smooth collision exclusion used by the continuous NLP solver:
     #
     #     (delta_s / a)^p + (delta_e / b)^p >= 1,
@@ -97,8 +110,14 @@ class SimParams:
     MPC_MIN_LATERAL_SEPARATION = 0.285
     MPC_MAX_CONSTRAINED_OPPONENTS = 2  # nearest car ahead and nearest car behind
     MPC_COLLISION_SUPERELLIPSE_EXPONENT = 4
+    # Temporary ablation: match the released controller more closely by
+    # omitting paper constraints (1f)-(1h) from the IPOPT problem. Physical
+    # off-track/contact detection and speed penalties remain active.
+    MPC_ENFORCE_TRACK_BOUNDARY = True
+    MPC_ENFORCE_COLLISION_AVOIDANCE = True
     OFFROAD_TOLERANCE = 0.05
-    OFFROAD_STRENGTH = 3.0 # multiplier for offroad penalty in MPC cost
+    # Continuous off-road speed-decay strength, calibrated per CONTROL_DT.
+    OFFROAD_STRENGTH = 3.0
     MPC_DT = 0.1
 
     MPC_HORIZON = 10
@@ -111,7 +130,7 @@ class SimParams:
 
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0
-    MPC_MAX_STEER_DELTA = 0.4  # max normalized steering-command change per MPC step
+    MPC_MAX_STEER_RATE = 4.0  # normalized steering-command change per second (0.4 per 0.1 s MPC step)
     MAX_RACELINE_SPEED = 5.0
     PROJECTION_SEARCH_RADIUS = 1.0
     PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
@@ -120,13 +139,16 @@ class SimParams:
     NUM_CARS = 1
     CAR_START_GAP = 6.0
     EARLY_COLLISION_STOP = False # stop early if cars collide immediately after launch
-    EARLY_COLLISION_WINDOW_STEPS = 150 # only apply early collision stop during the first N simulation steps
-    EARLY_COLLISION_CONSECUTIVE_STEPS = 3 # require this many consecutive collision steps before stopping
+    EARLY_COLLISION_WINDOW_SECONDS = 3.0
+    EARLY_COLLISION_CONSECUTIVE_SECONDS = 0.06
+    REF_DEBUG_SAMPLE_INTERVAL_SECONDS = 2.0
+    TRAJECTORY_SAMPLE_INTERVAL_SECONDS = 0.04
+    PROGRESS_REPORT_INTERVAL_SECONDS = 4.0
     LLM_MODEL = "qwen2.5:0.5b"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.2
-    LLM_UPDATE_INTERVAL_STEPS = 10 # how often to update the LLM policy in terms of MPC steps
+    LLM_UPDATE_INTERVAL_SECONDS = 1.0
     LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     LLM_SAFEGUARD_ENABLED = True # validate/correct discrete LLM modes against the current race context

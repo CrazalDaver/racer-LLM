@@ -188,6 +188,74 @@ def _sweep_table(summary) -> str:
       </div>"""
 
 
+def _replace_none_with_nan(value):
+    """Restore non-finite numeric NPZ values serialized as JSON null."""
+    if value is None:
+        return np.nan
+    if isinstance(value, list):
+        return [_replace_none_with_nan(item) for item in value]
+    return value
+
+
+def _write_json_trace(npz_contents, output_path):
+    """Rebuild a temporary NPZ from a trial's embedded JSON trace."""
+    arrays = {
+        str(name): np.asarray(_replace_none_with_nan(value))
+        for name, value in npz_contents.items()
+    }
+    np.savez(output_path, **arrays)
+
+
+def _trial_from_npz(trace_path, trial_number, repeat=1):
+    with np.load(trace_path, allow_pickle=False) as data:
+        policies = [str(value) for value in np.asarray(data["policy_names"]).tolist()]
+        final_progress = np.asarray(data["car_px"], dtype=float)[-1]
+        winner_index = int(np.nanargmax(final_progress))
+        ego_position = int(_scalar(data, "ego_position", 1))
+        start_ranks = _scalar(data, "start_ranks", list(range(len(final_progress))))
+    roles = ["ego", *[f"oppo{idx}" for idx in range(1, len(final_progress))]]
+    return {
+        "trial": int(trial_number),
+        "ego_position": ego_position,
+        "repeat": int(repeat),
+        "winner": roles[winner_index],
+        "winner_index": winner_index,
+        "winner_policy": policies[winner_index],
+        "final_progress": final_progress.tolist(),
+        "start_ranks": start_ranks,
+    }, policies
+
+
+def _combined_summary(trials, policies):
+    roles = ["ego", *[f"oppo{idx}" for idx in range(1, len(policies))]]
+    positions = sorted({int(trial["ego_position"]) for trial in trials})
+    winner_counts = {role: 0 for role in roles}
+    counts_by_position = {
+        str(position): {role: 0 for role in roles} for position in positions
+    }
+    trials_by_position = {position: 0 for position in positions}
+    for trial in trials:
+        role = str(trial["winner"])
+        position = int(trial["ego_position"])
+        if role not in winner_counts:
+            winner_counts[role] = 0
+            for counts in counts_by_position.values():
+                counts[role] = 0
+        winner_counts[role] += 1
+        counts_by_position[str(position)][role] += 1
+        trials_by_position[position] += 1
+    repeat_counts = set(trials_by_position.values())
+    trials_per_position = repeat_counts.pop() if len(repeat_counts) == 1 else "varies"
+    return {
+        "policy_names": list(policies),
+        "trials_per_position": trials_per_position,
+        "ego_positions": positions,
+        "winner_counts": winner_counts,
+        "winner_counts_by_position": counts_by_position,
+        "trials": trials,
+    }
+
+
 def generate_report(
     result_paths,
     output="simulation_report.html",
@@ -206,53 +274,97 @@ def generate_report(
     rows = []
     with tempfile.TemporaryDirectory(prefix="racer_html_report_") as temp_dir:
         temp_dir = Path(temp_dir)
-        for index, trace_path in enumerate(paths, start=1):
-            suffix = trace_path.suffix.lower()
-            if suffix not in {".npz", ".json"}:
-                raise ValueError(f"Unsupported result type: {trace_path} (use .npz or .json)")
+        trace_jobs = []
+        aggregate_trials = []
+        aggregate_policies = None
+        report_trial_number = 0
 
-            print(f"[{index}/{len(paths)}] Plotting {trace_path.name} ...")
-            plot_path = temp_dir / f"plot_{index}.png"
+        # Expand embedded JSON traces first. Older summary-only JSON files still
+        # contribute to the final statistics but cannot produce animations.
+        for source_index, source_path in enumerate(paths, start=1):
+            suffix = source_path.suffix.lower()
             if suffix == ".npz":
-                # The existing plotting helper is interactive; suppress only its show call.
-                with mock.patch.object(plt, "show"):
-                    figure = plot_trace_npz(trace_path)
+                report_trial_number += 1
+                trial, policies = _trial_from_npz(source_path, report_trial_number)
+                aggregate_trials.append(trial)
+                aggregate_policies = aggregate_policies or policies
+                trace_jobs.append((source_path, source_path.name, str(source_path)))
+            elif suffix == ".json":
+                summary = _load_sweep_json(source_path)
+                policies = [str(value) for value in summary["policy_names"]]
+                aggregate_policies = aggregate_policies or policies
+                for source_trial in summary["trials"]:
+                    report_trial_number += 1
+                    trial = {key: value for key, value in source_trial.items() if key != "npz"}
+                    trial["trial"] = report_trial_number
+                    aggregate_trials.append(trial)
+                    embedded_trace = source_trial.get("npz")
+                    if embedded_trace:
+                        temp_trace = temp_dir / (
+                            f"source_{source_index}_trial_{report_trial_number}.npz"
+                        )
+                        _write_json_trace(embedded_trace, temp_trace)
+                        label = (
+                            f"{source_path.name} — trial "
+                            f"{source_trial.get('trial', report_trial_number)} "
+                            f"(ego P{source_trial.get('ego_position', '?')}, "
+                            f"repeat {source_trial.get('repeat', 1)})"
+                        )
+                        trace_jobs.append((temp_trace, label, str(source_path)))
             else:
-                summary = _load_sweep_json(trace_path)
-                figure = _plot_sweep_summary(summary)
+                raise ValueError(
+                    f"Unsupported result type: {source_path} (use .npz or .json)"
+                )
+
+        for index, (trace_path, display_name, source_label) in enumerate(
+            trace_jobs, start=1
+        ):
+            print(f"[{index}/{len(trace_jobs)}] Plotting {display_name} ...")
+            plot_path = temp_dir / f"plot_{index}.png"
+            with mock.patch.object(plt, "show"):
+                figure = plot_trace_npz(trace_path)
             figure.savefig(plot_path, dpi=plot_dpi, bbox_inches="tight")
             plt.close(figure)
 
-            if suffix == ".npz":
-                print(f"[{index}/{len(paths)}] Animating {trace_path.name} ...")
-                gif_path = temp_dir / f"animation_{index}.gif"
-                make_animation(
-                    trace_path,
-                    stride=animation_stride,
-                    interval=animation_interval,
-                    save_path=gif_path,
-                    dpi=animation_dpi,
-                )
-                right_content = (
-                    f'<img src="{_data_uri(gif_path, "image/gif")}" '
-                    f'alt="Animation for {html.escape(trace_path.name)}">'
-                    "<figcaption>Simulation animation</figcaption>"
-                )
-                description = _trace_description(trace_path)
-                plot_caption = "Simulation diagnostics"
-            else:
-                right_content = _sweep_table(summary)
-                description = _sweep_description(summary)
-                plot_caption = "Position-sweep summary"
-
+            print(f"[{index}/{len(trace_jobs)}] Animating {display_name} ...")
+            gif_path = temp_dir / f"animation_{index}.gif"
+            make_animation(
+                trace_path,
+                stride=animation_stride,
+                interval=animation_interval,
+                save_path=gif_path,
+                dpi=animation_dpi,
+            )
+            escaped_name = html.escape(display_name)
             rows.append(
                 {
-                    "name": html.escape(trace_path.name),
-                    "path": html.escape(str(trace_path)),
-                    "description": description,
+                    "name": escaped_name,
+                    "path": html.escape(source_label),
+                    "description": _trace_description(trace_path),
                     "plot": _data_uri(plot_path, "image/png"),
-                    "plot_caption": plot_caption,
-                    "right_content": right_content,
+                    "plot_caption": "Simulation diagnostics",
+                    "right_content": (
+                        f'<img src="{_data_uri(gif_path, "image/gif")}" '
+                        f'alt="Animation for {escaped_name}">'
+                        "<figcaption>Simulation animation</figcaption>"
+                    ),
+                }
+            )
+
+        if aggregate_trials:
+            combined = _combined_summary(aggregate_trials, aggregate_policies)
+            summary_path = temp_dir / "overall_summary.png"
+            summary_figure = _plot_sweep_summary(combined)
+            summary_figure.savefig(summary_path, dpi=plot_dpi, bbox_inches="tight")
+            plt.close(summary_figure)
+            rows.append(
+                {
+                    "name": "Overall statistics",
+                    "path": html.escape(", ".join(str(path) for path in paths)),
+                    "description": _sweep_description(combined),
+                    "plot": _data_uri(summary_path, "image/png"),
+                    "plot_caption": "Aggregate results across all selected runs",
+                    "right_content": _sweep_table(combined),
                 }
             )
 
