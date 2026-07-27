@@ -4,7 +4,7 @@ import json
 import numpy as np
 
 from collision import oriented_rectangle_overlap_cost
-from config import duration_to_steps, make_vehicle_params, params
+from config import GRAVITY, duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
 from plotting import plot_simulation_results
 from policy import (
@@ -18,6 +18,7 @@ from policy import (
     plan_alpharacer_policy_params,
     plan_ibr_joint_actions,
     progress_delta,
+    track_heading_error,
 )
 from state import CarAction, CarState
 from track import Track, configure_track, load_centerline_csv, load_raceline_csv
@@ -317,6 +318,11 @@ def save_simulation_trace(trace, track, params):
         car_mpc_action_loss=np.asarray(trace["car_mpc_action_loss"]),
         car_mpc_velocity_loss=np.asarray(trace["car_mpc_velocity_loss"]),
         car_mpc_heading_loss=np.asarray(trace["car_mpc_heading_loss"]),
+        car_mpc_violation_loss=np.asarray(trace["car_mpc_violation_loss"]),
+        car_mpc_max_track_slack=np.asarray(trace["car_mpc_max_track_slack"]),
+        car_mpc_max_collision_slack=np.asarray(
+            trace["car_mpc_max_collision_slack"]
+        ),
         car_mpc_solver_success=np.asarray(trace["car_mpc_solver_success"]),
         car_mpc_solver_status=np.asarray(trace["car_mpc_solver_status"]),
         car_mpc_recovery_active=np.asarray(trace["car_mpc_recovery_active"]),
@@ -343,6 +349,9 @@ def save_simulation_trace(trace, track, params):
         mpc_action_loss=np.asarray(trace["mpc_action_loss"]),
         mpc_velocity_loss=np.asarray(trace["mpc_velocity_loss"]),
         mpc_heading_loss=np.asarray(trace["mpc_heading_loss"]),
+        mpc_violation_loss=np.asarray(trace["mpc_violation_loss"]),
+        mpc_max_track_slack=np.asarray(trace["mpc_max_track_slack"]),
+        mpc_max_collision_slack=np.asarray(trace["mpc_max_collision_slack"]),
         mpc_solver_success=np.asarray(trace["mpc_solver_success"]),
         mpc_solver_status=np.asarray(trace["mpc_solver_status"]),
         mpc_recovery_active=np.asarray(trace["mpc_recovery_active"]),
@@ -382,6 +391,12 @@ def save_simulation_trace(trace, track, params):
         car_policy_requested_mode=np.asarray(trace.get("car_policy_requested_mode", []), dtype=str),
         car_safeguard_override=np.asarray(trace.get("car_safeguard_override", []), dtype=str),
         car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
+        car_offroad_recovery_active=np.asarray(
+            trace.get("car_offroad_recovery_active", []), dtype=bool
+        ),
+        car_offroad_recovery_heading_error=np.asarray(
+            trace.get("car_offroad_recovery_heading_error", []), dtype=float
+        ),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -403,11 +418,33 @@ def save_simulation_trace(trace, track, params):
             getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
             + getattr(params, "OFFROAD_TOLERANCE", 0.0)
         ),
+        offroad_strength=np.asarray(params.OFFROAD_STRENGTH),
+        offroad_heading_realign_strength=np.asarray(
+            params.OFFROAD_HEADING_REALIGN_STRENGTH
+        ),
+        offroad_inward_steer=np.asarray(params.OFFROAD_INWARD_STEER),
+        offroad_large_heading_error=np.asarray(
+            params.OFFROAD_LARGE_HEADING_ERROR
+        ),
+        offroad_throttle_boost=np.asarray(params.OFFROAD_THROTTLE_BOOST),
+        offroad_low_speed_threshold=np.asarray(
+            params.OFFROAD_LOW_SPEED_THRESHOLD
+        ),
         track_length=np.asarray(track.total_length),
         vehicle_model=np.asarray(trace["vehicle_model"]),
         simulation_dt=np.asarray(params.SIM_DT),
         control_dt=np.asarray(params.CONTROL_DT),
         mpc_dt=np.asarray(params.MPC_DT),
+        mpc_enforce_track_boundary=np.asarray(params.MPC_ENFORCE_TRACK_BOUNDARY),
+        mpc_enforce_collision_avoidance=np.asarray(
+            params.MPC_ENFORCE_COLLISION_AVOIDANCE
+        ),
+        mpc_track_slack_weight=np.asarray(params.MPC_TRACK_SLACK_WEIGHT),
+        mpc_collision_slack_weight=np.asarray(params.MPC_COLLISION_SLACK_WEIGHT),
+        mpc_enforce_friction_speed_limit=np.asarray(
+            params.MPC_ENFORCE_FRICTION_SPEED_LIMIT
+        ),
+        mpc_friction_coefficient=np.asarray(params.MPC_FRICTION_COEFFICIENT),
         llm_update_interval_seconds=np.asarray(
             trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
         ),
@@ -523,6 +560,12 @@ def run_simulation(
             min_lateral_separation=params.MPC_MIN_LATERAL_SEPARATION,
             max_constrained_opponents=params.MPC_MAX_CONSTRAINED_OPPONENTS,
             collision_superellipse_exponent=params.MPC_COLLISION_SUPERELLIPSE_EXPONENT,
+            enforce_track_boundary=params.MPC_ENFORCE_TRACK_BOUNDARY,
+            enforce_collision_avoidance=params.MPC_ENFORCE_COLLISION_AVOIDANCE,
+            track_slack_weight=params.MPC_TRACK_SLACK_WEIGHT,
+            collision_slack_weight=params.MPC_COLLISION_SLACK_WEIGHT,
+            enforce_friction_speed_limit=params.MPC_ENFORCE_FRICTION_SPEED_LIMIT,
+            friction_coefficient=params.MPC_FRICTION_COEFFICIENT,
         )
         mpcs.append(mpc)
         policies.append(
@@ -614,6 +657,9 @@ def run_simulation(
         "car_mpc_action_loss": [],
         "car_mpc_velocity_loss": [],
         "car_mpc_heading_loss": [],
+        "car_mpc_violation_loss": [],
+        "car_mpc_max_track_slack": [],
+        "car_mpc_max_collision_slack": [],
         "car_mpc_solver_success": [],
         "car_mpc_solver_status": [],
         "car_mpc_recovery_active": [],
@@ -640,6 +686,9 @@ def run_simulation(
         "mpc_action_loss": [],
         "mpc_velocity_loss": [],
         "mpc_heading_loss": [],
+        "mpc_violation_loss": [],
+        "mpc_max_track_slack": [],
+        "mpc_max_collision_slack": [],
         "mpc_solver_success": [],
         "mpc_solver_status": [],
         "mpc_recovery_active": [],
@@ -662,6 +711,8 @@ def run_simulation(
         "car_policy_requested_mode": [],
         "car_safeguard_override": [],
         "car_offroad": [],
+        "car_offroad_recovery_active": [],
+        "car_offroad_recovery_heading_error": [],
         "policy_names": resolved_policy_names,
         "llm_model_names": [
             (
@@ -780,7 +831,85 @@ def run_simulation(
                     )
                 )
             held_actions = next_actions
-        actions = held_actions
+        # Apply the released alpha-RACER simulator's off-track recovery outside
+        # every high-level policy.  The upstream implementation runs at the
+        # control period; exponent strengths are scaled here because vehicle
+        # integration is finer than MPC/control updates.
+        actions = [
+            CarAction(throttle=action.throttle, steer=action.steer)
+            for action in held_actions
+        ]
+
+        # Apply off-track recovery to all cars when happens
+        offroad_recovery_active = []
+        offroad_recovery_heading_error = []
+        recovery_dt_ratio = params.SIM_DT / params.CONTROL_DT
+
+        for car_idx, state in enumerate(states):
+            e = car_e[car_idx]
+            active = abs(e) > offroad_half_width
+            heading_error = track_heading_error(track, state.psi, car_s[car_idx])
+            offroad_recovery_active.append(active)
+            offroad_recovery_heading_error.append(heading_error if active else 0.0)
+            if not active:
+                continue
+
+            overshoot = abs(e) - offroad_half_width
+            speed_factor = np.exp(
+                -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
+            )
+
+            # off-road penalty on velocity
+            state.vx *= speed_factor
+            state.vy *= speed_factor
+
+            # mandatory heading realignment when off-road
+            heading_blend = 1.0 - np.exp(
+                -params.OFFROAD_HEADING_REALIGN_STRENGTH
+                * overshoot
+                * recovery_dt_ratio
+            )
+            state.psi = np.arctan2(
+                np.sin(state.psi + heading_blend * heading_error),
+                np.cos(state.psi + heading_blend * heading_error),
+            )
+
+            # mandatory inward steering when off-road
+            steer_blend = 1.0 - np.exp(
+                -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
+            )
+            inward_steer = -np.sign(e) * params.OFFROAD_INWARD_STEER
+            actions[car_idx].steer += (
+                inward_steer - actions[car_idx].steer
+            ) * steer_blend
+            if abs(heading_error) > params.OFFROAD_LARGE_HEADING_ERROR:
+                actions[car_idx].throttle += params.OFFROAD_THROTTLE_BOOST
+            if state.vx < params.OFFROAD_LOW_SPEED_THRESHOLD:
+                vehicle_params_for_car = vehicle_models[car_idx].p
+                if getattr(vehicle_params_for_car, "ros_kinematic", False):
+                    neutral_throttle = (
+                        vehicle_params_for_car.fr / vehicle_params_for_car.Ta
+                    )
+                else:
+                    throttle_gain = (
+                        vehicle_params_for_car.Ta
+                        - vehicle_params_for_car.Tb * max(state.vx, 0.0)
+                    )
+                    neutral_throttle = (  # maintain velocity
+                        vehicle_params_for_car.fr
+                        * GRAVITY
+                        * vehicle_params_for_car.MASS
+                        / max(throttle_gain, 1.0e-6)
+                    )
+                actions[car_idx].throttle = max(
+                    actions[car_idx].throttle,
+                    neutral_throttle + params.OFFROAD_THROTTLE_BOOST,
+                )
+
+            actions[car_idx].steer = float(np.clip(actions[car_idx].steer, -1.0, 1.0))
+            actions[car_idx].throttle = float(
+                np.clip(actions[car_idx].throttle, -1.0, 1.0)
+            )
 
         ego_policy = policies[ego_idx]
         ego_mpc = mpcs[ego_idx]
@@ -834,6 +963,27 @@ def run_simulation(
         trace["car_mpc_action_loss"].append([mpc.last_action_loss for mpc in mpcs])
         trace["car_mpc_velocity_loss"].append([mpc.last_velocity_loss for mpc in mpcs])
         trace["car_mpc_heading_loss"].append([mpc.last_heading_loss for mpc in mpcs])
+        trace["car_mpc_violation_loss"].append(
+            [mpc.last_violation_loss for mpc in mpcs]
+        )
+        trace["car_mpc_max_track_slack"].append(
+            [
+                float(np.max(mpc.last_track_slack_plan))
+                if mpc.last_track_slack_plan is not None
+                and np.size(mpc.last_track_slack_plan)
+                else np.nan
+                for mpc in mpcs
+            ]
+        )
+        trace["car_mpc_max_collision_slack"].append(
+            [
+                float(np.max(mpc.last_collision_slack_plan))
+                if mpc.last_collision_slack_plan is not None
+                and np.size(mpc.last_collision_slack_plan)
+                else np.nan
+                for mpc in mpcs
+            ]
+        )
         trace["car_mpc_solver_success"].append([mpc.last_solver_success for mpc in mpcs])
         trace["car_mpc_solver_status"].append([mpc.last_solver_status for mpc in mpcs])
         trace["car_mpc_recovery_active"].append([mpc.last_recovery_active for mpc in mpcs])
@@ -857,6 +1007,19 @@ def run_simulation(
         trace["mpc_action_loss"].append(ego_mpc.last_action_loss)
         trace["mpc_velocity_loss"].append(ego_mpc.last_velocity_loss)
         trace["mpc_heading_loss"].append(ego_mpc.last_heading_loss)
+        trace["mpc_violation_loss"].append(ego_mpc.last_violation_loss)
+        trace["mpc_max_track_slack"].append(
+            float(np.max(ego_mpc.last_track_slack_plan))
+            if ego_mpc.last_track_slack_plan is not None
+            and np.size(ego_mpc.last_track_slack_plan)
+            else np.nan
+        )
+        trace["mpc_max_collision_slack"].append(
+            float(np.max(ego_mpc.last_collision_slack_plan))
+            if ego_mpc.last_collision_slack_plan is not None
+            and np.size(ego_mpc.last_collision_slack_plan)
+            else np.nan
+        )
         trace["mpc_solver_success"].append(ego_mpc.last_solver_success)
         trace["mpc_solver_status"].append(ego_mpc.last_solver_status)
         trace["mpc_recovery_active"].append(ego_mpc.last_recovery_active)
@@ -897,6 +1060,10 @@ def run_simulation(
             [getattr(policy, "last_safeguard_override", "") for policy in policies]
         )
         trace["car_offroad"].append([abs(error) > offroad_half_width for error in car_e])
+        trace["car_offroad_recovery_active"].append(offroad_recovery_active)
+        trace["car_offroad_recovery_heading_error"].append(
+            offroad_recovery_heading_error
+        )
 
         if (step + 1) % ref_debug_sample_steps == 0 and ego_policy.last_ref_traj is not None:
             frenet_ref_lines.append((ego_state.x, ego_state.y, ref_fx, ref_fy))
@@ -982,14 +1149,6 @@ def run_simulation(
             early_collision_count += 1
         elif step < early_collision_window_steps:
             early_collision_count = 0
-
-        for car_idx, state in enumerate(states):
-            e = next_e[car_idx]
-            if abs(e) > offroad_half_width:
-                overshoot = abs(e) - offroad_half_width
-                factor = np.exp(-params.OFFROAD_STRENGTH * overshoot)
-                state.vx *= factor
-                state.vy *= factor
 
         lateral_errors.append(next_e[ego_idx])
         longitudinal_positions.append(progress_s[ego_idx])
@@ -1143,8 +1302,9 @@ if __name__ == "__main__":
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
-        policy_names=["LLM", "static_alpharacer", "static_alpharacer"],  # ego, oppo1, oppo2
+        policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:7b", None, None],
         vehicle_model_type="kinematic", ego_position=3,
-
+        llm_temperature = 0.0,
+        llm_safeguard_enabled=False,
     )

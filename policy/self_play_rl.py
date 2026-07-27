@@ -365,7 +365,9 @@ class SelfPlayRLPolicy(BasePolicy):
         self.mpc.last_action_loss = np.nan
         self.mpc.last_velocity_loss = np.nan
         self.mpc.last_heading_loss = np.nan
+        self.mpc.last_violation_loss = np.nan
+        self.mpc.last_track_slack_plan = None
+        self.mpc.last_collision_slack_plan = None
         self.mpc.last_control_plan = np.repeat(self.last_u.reshape(2, 1), self.mpc.horizon, axis=1)
         self.mpc.last_state_plan = None
         return action
-

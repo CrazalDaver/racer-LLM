@@ -38,6 +38,10 @@ class MPCController:
         collision_superellipse_exponent=4,
         enforce_track_boundary=True,
         enforce_collision_avoidance=True,
+        track_slack_weight=1.0e4,
+        collision_slack_weight=1.0e3,
+        enforce_friction_speed_limit=True,
+        friction_coefficient=1.6,
     ):
         self.dt = dt
         self.horizon = horizon
@@ -62,15 +66,26 @@ class MPCController:
         self.collision_superellipse_exponent = int(collision_superellipse_exponent)
         self.enforce_track_boundary = bool(enforce_track_boundary)
         self.enforce_collision_avoidance = bool(enforce_collision_avoidance)
+        self.track_slack_weight = float(track_slack_weight)
+        self.collision_slack_weight = float(collision_slack_weight)
+        self.enforce_friction_speed_limit = bool(enforce_friction_speed_limit)
+        self.friction_coefficient = float(friction_coefficient)
         if self.min_longitudinal_separation <= 0.0 or self.min_lateral_separation <= 0.0:
             raise ValueError("MPC collision separations must be positive")
         if self.collision_superellipse_exponent < 2 or self.collision_superellipse_exponent % 2:
             raise ValueError("collision_superellipse_exponent must be an even integer >= 2")
+        if self.track_slack_weight < 0.0 or self.collision_slack_weight < 0.0:
+            raise ValueError("MPC slack weights must be non-negative")
+        if self.friction_coefficient <= 0.0:
+            raise ValueError("MPC friction coefficient must be positive")
         self.last_loss = np.nan
         self.last_track_loss = np.nan
         self.last_action_loss = np.nan
         self.last_velocity_loss = np.nan
         self.last_heading_loss = np.nan
+        self.last_violation_loss = np.nan
+        self.last_track_slack_plan = None
+        self.last_collision_slack_plan = None
         self.last_solver_success = True
         self.last_solver_status = "not_run"
         self.last_recovery_active = False
@@ -86,6 +101,15 @@ class MPCController:
         # Define optimization variables and parameters
         self.X = cs.SX.sym("X", self.n_states, self.horizon + 1) # state trajectory: (x, y, psi, v) for each timestep
         self.U = cs.SX.sym("U", self.n_controls, self.horizon) # control trajectory
+        # Non-negative violation variables soften only track and collision
+        # safety constraints. Dynamics, state bounds and control limits remain
+        # hard constraints.
+        self.track_slack = cs.SX.sym("track_slack", self.horizon)
+        self.collision_slack = cs.SX.sym(
+            "collision_slack",
+            self.max_constrained_opponents,
+            self.horizon,
+        )
         self.x0 = cs.SX.sym("x0", self.n_states, 1) # initial state
         # reference trajectory 
         # (x_ref, y_ref, cos(psi_ref), sin(psi_ref), x_center, y_center, tangent_x, tangent_y)
@@ -249,12 +273,20 @@ class MPCController:
         )
 
     def _store_loss_parts(self, x_opt, p_val):
-        loss, track_loss, action_loss, velocity_loss, heading_loss = self.loss_fn(x_opt, p_val)
+        (
+            loss,
+            track_loss,
+            action_loss,
+            velocity_loss,
+            heading_loss,
+            violation_loss,
+        ) = self.loss_fn(x_opt, p_val)
         self.last_loss = float(loss)
         self.last_track_loss = float(track_loss)
         self.last_action_loss = float(action_loss)
         self.last_velocity_loss = float(velocity_loss)
         self.last_heading_loss = float(heading_loss)
+        self.last_violation_loss = float(violation_loss)
 
     def evaluate_fallback_loss(
         self,
@@ -272,7 +304,22 @@ class MPCController:
         for k in range(self.horizon):
             X_guess[:, k + 1] = self._vehicle_dynamics_np(X_guess[:, k], U_guess[:, k])
 
-        x_eval = np.concatenate([X_guess.T.reshape(-1), U_guess.T.reshape(-1)])
+        track_slack_guess, collision_slack_guess = self._initial_slack_guess(
+            X_guess,
+            ref_traj,
+            opponents=opponents,
+            current_s=current_s,
+        )
+        self.last_track_slack_plan = track_slack_guess.copy()
+        self.last_collision_slack_plan = collision_slack_guess.copy()
+        x_eval = np.concatenate(
+            [
+                X_guess.T.reshape(-1),
+                U_guess.T.reshape(-1),
+                track_slack_guess,
+                collision_slack_guess.T.reshape(-1),
+            ]
+        )
         p_val = self._make_p_val(
             x0_mpc,
             ref_traj,
@@ -291,6 +338,10 @@ class MPCController:
         action_cost = 0
         velocity_cost = 0
         heading_cost = 0
+        violation_cost = (
+            self.track_slack_weight * cs.sumsqr(self.track_slack)
+            + self.collision_slack_weight * cs.sumsqr(self.collision_slack)
+        )
         # initial state constraint
         g_eq = [self.X[:, 0] - self.x0]
 
@@ -328,9 +379,10 @@ class MPCController:
                     )
 
                     # Enforce the MPC track boundary constraint (1f). The
-                    # supplied half-width is the center-safe track width.
-                    g_ineq.append(lateral_e - self.track_constraint_half_width)
-                    g_ineq.append(-lateral_e - self.track_constraint_half_width)
+                    # supplied half-width is the geometric point-mass bound.
+                    slack = self.track_slack[k - 1]
+                    g_ineq.append(lateral_e - self.track_constraint_half_width - slack)
+                    g_ineq.append(-lateral_e - self.track_constraint_half_width - slack)
 
                 # Paper (1g)-(1h) describe separate minimum lateral and
                 # longitudinal separations. Enforcing both inequalities with
@@ -350,8 +402,10 @@ class MPCController:
                             + (delta_e / self.min_lateral_separation)
                             ** self.collision_superellipse_exponent
                         )
+                        slack = self.collision_slack[opponent_idx, k - 1]
                         g_ineq.append(
                             self.opponent_active[opponent_idx] * (1.0 - collision_metric)
+                            - slack
                         )
 
         for k in range(self.horizon):
@@ -365,9 +419,23 @@ class MPCController:
             g_ineq.append(du[1] - self.max_steer_delta)
             g_ineq.append(-du[1] - self.max_steer_delta)
 
-        cost = track_cost + action_cost + velocity_cost + heading_cost
+            if self.enforce_friction_speed_limit:
+                # Match the released alpha-RACER MPC: the raw normalized
+                # steering command appears inside tan(), rather than Sa*steer.
+                wheelbase = self.p.LF + self.p.LR
+                lateral_proxy = self.X[3, k] ** 2 * cs.tan(self.U[1, k])
+                lateral_limit = self.friction_coefficient * GRAVITY * wheelbase
+                g_ineq.append(lateral_proxy - lateral_limit)
+                g_ineq.append(-lateral_proxy - lateral_limit)
+
+        cost = track_cost + action_cost + velocity_cost + heading_cost + violation_cost
         self.g = cs.vertcat(*g_eq, *g_ineq)
-        self.x_opt = cs.vertcat(cs.reshape(self.X, -1, 1), cs.reshape(self.U, -1, 1))
+        self.x_opt = cs.vertcat(
+            cs.reshape(self.X, -1, 1),
+            cs.reshape(self.U, -1, 1),
+            self.track_slack,
+            cs.reshape(self.collision_slack, -1, 1),
+        )
         self.p_opt = cs.vertcat(
             cs.reshape(self.x0, -1, 1),
             cs.reshape(self.ref, -1, 1),
@@ -384,13 +452,71 @@ class MPCController:
         self.loss_fn = cs.Function(
             "mpc_loss_parts",
             [self.x_opt, self.p_opt],
-            [cost, track_cost, action_cost, velocity_cost, heading_cost],
+            [
+                cost,
+                track_cost,
+                action_cost,
+                velocity_cost,
+                heading_cost,
+                violation_cost,
+            ],
         )
         
         self.n_x = self.n_states * (self.horizon + 1)
         self.n_u = self.n_controls * self.horizon
+        self.n_track_slack = self.horizon
+        self.n_collision_slack = self.max_constrained_opponents * self.horizon
+        self.n_opt = (
+            self.n_x
+            + self.n_u
+            + self.n_track_slack
+            + self.n_collision_slack
+        )
         self.n_eq = len(g_eq) * self.n_states
         self.n_total = self.g.size1()
+
+    def _initial_slack_guess(
+        self,
+        X_guess,
+        ref_traj,
+        opponents=None,
+        current_s=None,
+    ):
+        """Seed slacks with the violations in the initial state guess."""
+        track_slack = np.zeros(self.horizon, dtype=float)
+        collision_slack = np.zeros(
+            (self.max_constrained_opponents, self.horizon),
+            dtype=float,
+        )
+        opponent_s, opponent_e, active = self._prepare_opponent_predictions(
+            ref_traj,
+            opponents=opponents,
+            current_s=current_s,
+        )
+        for k in range(1, self.horizon + 1):
+            dx = X_guess[0, k] - ref_traj[4, k]
+            dy = X_guess[1, k] - ref_traj[5, k]
+            car_s = ref_traj[0, k] + dx * ref_traj[7, k] - dy * ref_traj[6, k]
+            car_e = dx * ref_traj[6, k] + dy * ref_traj[7, k]
+            if self.enforce_track_boundary:
+                track_slack[k - 1] = max(
+                    abs(car_e) - self.track_constraint_half_width,
+                    0.0,
+                )
+            if self.enforce_collision_avoidance:
+                for opponent_idx in range(self.max_constrained_opponents):
+                    if active[opponent_idx] <= 0.0:
+                        continue
+                    delta_s = car_s - opponent_s[opponent_idx, k]
+                    delta_e = car_e - opponent_e[opponent_idx, k]
+                    metric = (
+                        (delta_s / self.min_longitudinal_separation)
+                        ** self.collision_superellipse_exponent
+                        + (delta_e / self.min_lateral_separation)
+                        ** self.collision_superellipse_exponent
+                    )
+                    collision_slack[opponent_idx, k - 1] = max(1.0 - metric, 0.0)
+        return track_slack, collision_slack
 
     def solve(
         self,
@@ -404,7 +530,6 @@ class MPCController:
         x0_mpc = self._make_x0_mpc(x0)
         X_guess = np.tile(x0_mpc.reshape(-1, 1), (1, self.horizon + 1))
         U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
-        x_init = np.concatenate([X_guess.T.reshape(-1), U_guess.T.reshape(-1)])
         p_val = self._make_p_val(
             x0_mpc,
             ref_traj,
@@ -413,10 +538,24 @@ class MPCController:
             opponents=opponents,
             current_s=current_s,
         )
+        track_slack_guess, collision_slack_guess = self._initial_slack_guess(
+            X_guess,
+            ref_traj,
+            opponents=opponents,
+            current_s=current_s,
+        )
+        x_init = np.concatenate(
+            [
+                X_guess.T.reshape(-1),
+                U_guess.T.reshape(-1),
+                track_slack_guess,
+                collision_slack_guess.T.reshape(-1),
+            ]
+        )
 
         # constrains for states
-        lbx = np.full(self.n_x + self.n_u, -np.inf)
-        ubx = np.full(self.n_x + self.n_u, np.inf)
+        lbx = np.full(self.n_opt, -np.inf)
+        ubx = np.full(self.n_opt, np.inf)
 
         # State bounds: x, y unbounded; psi unbounded; v in [0, max_speed] for predicted states.
         # Do not bound k=0 here: it is fixed by the measured initial condition, and a DBM
@@ -434,6 +573,12 @@ class MPCController:
             ubx[u_start + k * 2] = 1.0
             lbx[u_start + k * 2 + 1] = -1.0
             ubx[u_start + k * 2 + 1] = 1.0
+
+        # Safety violation variables are non-negative and otherwise unbounded:
+        # a large violation remains expensive but cannot make the NLP
+        # structurally infeasible.
+        slack_start = self.n_x + self.n_u
+        lbx[slack_start:] = 0.0
 
         # g <= 0 for inequality constraints, g = 0 for equality constraints
         lbg = np.zeros(self.n_total)
@@ -455,6 +600,13 @@ class MPCController:
         x_opt = sol["x"].full().flatten()
         self._store_loss_parts(x_opt, p_val)
         self.last_state_plan = x_opt[:self.n_x].reshape(self.horizon + 1, self.n_states).T
-        u_opt = x_opt[self.n_x:].reshape(self.horizon, self.n_controls).T
+        u_end = self.n_x + self.n_u
+        u_opt = x_opt[self.n_x:u_end].reshape(self.horizon, self.n_controls).T
+        track_slack_end = u_end + self.n_track_slack
+        self.last_track_slack_plan = x_opt[u_end:track_slack_end].copy()
+        self.last_collision_slack_plan = x_opt[track_slack_end:].reshape(
+            self.horizon,
+            self.max_constrained_opponents,
+        ).T
         self.last_control_plan = u_opt
         return u_opt, u_opt[:, 0]

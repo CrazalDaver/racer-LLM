@@ -266,6 +266,7 @@ class MPCPolicy(BasePolicy):
                 self.mpc.last_action_loss = np.nan
                 self.mpc.last_velocity_loss = np.nan
                 self.mpc.last_heading_loss = np.nan
+                self.mpc.last_violation_loss = np.nan
         else:
             self._report_mpc_recovery(sim_time=sim_time)
             # Update this state only after a genuinely successful solve.

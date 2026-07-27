@@ -72,18 +72,11 @@ def configure_track(sim_params, name: str = "berlin", *, scale: float = None) ->
     sim_params.TRACK_SCALE = applied_scale
     sim_params.TRACK_HALF_WIDTH = applied_half_width
     sim_params.TRACK_WIDTH = 2.0 * applied_half_width
-    vehicle_half_width = float(getattr(sim_params, "VEHICLE_HALF_WIDTH", 0.0))
-    center_half_width = applied_half_width - vehicle_half_width
-    if center_half_width <= 0.0:
-        raise ValueError(
-            "Track half-width must be greater than VEHICLE_HALF_WIDTH "
-            f"({applied_half_width:g} <= {vehicle_half_width:g})"
-        )
-    # Both the MPC boundary and reference clipping operate on the vehicle
-    # center; subtracting half the car width keeps the full body on track.
-    sim_params.MPC_CONSTRAINT_HALF_WIDTH = center_half_width
+    # Track-boundary handling uses the vehicle centre as a point. Vehicle
+    # width is reserved for rectangle contact detection and visualization.
+    sim_params.MPC_CONSTRAINT_HALF_WIDTH = applied_half_width
     ref_boundary_margin = float(getattr(sim_params, "REF_BOUNDARY_MARGIN", 0.0))
-    sim_params.REF_LATERAL_CLIP = max(center_half_width - ref_boundary_margin, 0.0)
+    sim_params.REF_LATERAL_CLIP = max(applied_half_width - ref_boundary_margin, 0.0)
     return spec
 
 

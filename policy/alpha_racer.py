@@ -51,11 +51,11 @@ class AlphaRacerPolicy(MPCPolicy):
 
     The original model scores 5 policy parameters per car:
     sf1, sf2, lookahead_factor, speed_factor, blocking. This project uses
-    q, zeta, s1, s2, s3 in MPC, so the selected parameters are mapped as:
-    The upstream implementation stores q/2 as ``lookahead_factor`` and
-    sqrt(zeta) as ``speed_factor``.  This project's MPC directly multiplies
-    its tracking cost by q_weight, matching the paper's Q=qI definition, so
-    the executable map is q=2*lookahead_factor, zeta=speed_factor^2,
+    q, zeta, s1, s2, s3 in MPC.  The released controller passes
+    ``2 * lookahead_factor`` as its Q/R ratio and then sets
+    ``Q = I / qr_ratio``.  Since this project's MPC directly multiplies its
+    tracking cost by q, the equivalent executable map is
+    q=1/(2*lookahead_factor), zeta=speed_factor^2,
     s1=sf1, s2=sf2, s3=blocking.
     """
 
@@ -63,7 +63,7 @@ class AlphaRacerPolicy(MPCPolicy):
         [
             [0.1, 0.5],   # s1
             [0.1, 0.5],   # s2
-            [0.15, 0.5],  # lookahead_factor = q/2
+            [0.15, 0.5],  # q = 1 / (2 * lookahead_factor)
             [0.85, 1.1],  # speed_factor = zeta^0.5
             [0.0, 1.0],   # s3
         ],
@@ -131,7 +131,7 @@ class AlphaRacerPolicy(MPCPolicy):
         sf1, sf2, lookahead_factor, speed_factor, blocking = np.asarray(original_params, dtype=float)
         return np.asarray(
             [
-                float(np.clip(2.0 * lookahead_factor, 1e-6, None)),
+                float(1.0 / max(2.0 * lookahead_factor, 1e-6)),
                 float(np.clip(speed_factor * speed_factor, 0.1, 3.0)),
                 float(max(sf1, 0.0)),
                 float(max(sf2, 1e-3)),
@@ -324,5 +324,4 @@ def plan_alpharacer_policy_params(policies, states, car_s, car_e):
         policy.original_params = joint[idx].copy()
         policy.params = policy._map_original_params(policy.original_params)
         policy._joint_plan_ready = True
-
 

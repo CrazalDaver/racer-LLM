@@ -81,13 +81,10 @@ class SimParams:
     # loss does not become stronger merely because integration is finer.
     COLLISION_FRONT_DECAY = 5.0
     COLLISION_REAR_DECAY = 20.0
-    # MPC may constrain the vehicle center while reserving one vehicle
-    # half-width at each edge: |e_center| <= half_width - vehicle_half_width.
-    # This safety envelope is separate from reference-trajectory generation.
-    MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH - VEHICLE_HALF_WIDTH
-    # Preserve the optimized raceline up to the geometric track edge. Do not
-    # shrink the reference merely because the simulated vehicle has width;
-    # vehicle-width safety belongs to the MPC/physical-boundary layer.
+    # Boundary handling treats each car as a point: both the reference and
+    # predicted vehicle centre may use the full geometric track half-width.
+    # Vehicle dimensions remain relevant only to contact detection/visuals.
+    MPC_CONSTRAINT_HALF_WIDTH = TRACK_HALF_WIDTH
     REF_BOUNDARY_MARGIN = 0.0
     REF_LATERAL_CLIP = TRACK_HALF_WIDTH - REF_BOUNDARY_MARGIN
     # Smooth collision exclusion used by the continuous NLP solver:
@@ -110,14 +107,34 @@ class SimParams:
     MPC_MIN_LATERAL_SEPARATION = 0.285
     MPC_MAX_CONSTRAINED_OPPONENTS = 2  # nearest car ahead and nearest car behind
     MPC_COLLISION_SUPERELLIPSE_EXPONENT = 4
-    # Temporary ablation: match the released controller more closely by
-    # omitting paper constraints (1f)-(1h) from the IPOPT problem. Physical
-    # off-track/contact detection and speed penalties remain active.
+    # Paper constraints (1f)-(1h) are softened with non-negative violation
+    # variables. Large quadratic weights preserve safety in normal operation
+    # while allowing IPOPT to recover from an already unsafe measured state.
     MPC_ENFORCE_TRACK_BOUNDARY = True
     MPC_ENFORCE_COLLISION_AVOIDANCE = True
+    MPC_TRACK_SLACK_WEIGHT = 1.0e4
+    MPC_COLLISION_SLACK_WEIGHT = 1.0e3
+    # Released alpha-RACER MPC constraint:
+    # |v^2 tan(steer_command)| <= mu * g * wheelbase.
+    # It progressively limits steering at high speed using a friction proxy.
+    MPC_ENFORCE_FRICTION_SPEED_LIMIT = True
+    MPC_FRICTION_COEFFICIENT = 1.6
     OFFROAD_TOLERANCE = 0.05
-    # Continuous off-road speed-decay strength, calibrated per CONTROL_DT.
+    # Released alpha-RACER numerical-simulation recovery, calibrated per
+    # CONTROL_DT.  For overshoot d, the upstream code applies:
+    #   v *= exp(-3 d)
+    #   psi += (1 - exp(-d)) * heading_error
+    #   steer += (-sign(e) - steer) * (1 - exp(-3 d))
+    # and adds 0.2 throttle when |heading_error| > 1 rad.
     OFFROAD_STRENGTH = 3.0
+    OFFROAD_HEADING_REALIGN_STRENGTH = 1.0
+    OFFROAD_INWARD_STEER = 1.0
+    OFFROAD_LARGE_HEADING_ERROR = 1.0
+    OFFROAD_THROTTLE_BOOST = 0.2
+    # Kinematic-model compatibility: below this speed, force at least the
+    # neutral throttle plus the upstream +0.2 boost so an aligned car cannot
+    # remain trapped at the zero-acceleration equilibrium.
+    OFFROAD_LOW_SPEED_THRESHOLD = 0.3
     MPC_DT = 0.1
 
     MPC_HORIZON = 10
@@ -177,7 +194,10 @@ class SimParams:
         "overtake": np.array([0.80, 1.35, 0.45, 0.10, 0.00]),
         "block": np.array([0.75, 0.95, 0.00, 0.30, 0.70]),
     }
-    STATIC_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 0.5, 0.5])  # q, zeta, s1, s2, s3
+    # Conservative fixed baseline within the upstream parameter ranges:
+    # moderate tracking, slightly slower reference progression, small
+    # overtaking displacement, and no blocking.
+    STATIC_POLICY_PARAMS = np.array([0.75, 0.90, 0.20, 0.30, 0.00])  # q, zeta, s1, s2, s3
     # Upstream optimizer coordinates: sf1, sf2, lookahead_factor,
     # speed_factor, blocking. AlphaRacerPolicy maps these to q, zeta, s1,
     # s2, s3 and then updates them online with the learned potential model.
