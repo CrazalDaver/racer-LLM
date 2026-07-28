@@ -31,7 +31,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         update_interval_seconds=1.0,
         decision_dt=None,
         history_length=5,
-        output_mode="auto", # "mode" for discrete mode selection, "params" for direct parameter output, "auto" to infer from model name.
+        output_mode="auto", # Public compatibility option selecting the LLM response format: "mode", "params", or "auto".
         safeguard_enabled=False,  # If True, apply deterministic mode-guarding rules to the LLM output.
         param_bounds=None,
         system_prompt_path=None,
@@ -48,10 +48,10 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self.update_interval_seconds, self.decision_dt
         )
         self.history_length = max(0, int(history_length))
-        self.output_mode = self._resolve_output_mode(output_mode, model_name)
+        self.response_format = self._resolve_response_format(output_mode, model_name)
         self.safeguard_enabled = bool(safeguard_enabled)
-        if self.output_mode not in {"mode", "params"}:
-            raise ValueError(f"Unknown LLM output mode: {output_mode}")
+        if self.response_format not in {"mode", "params"}:
+            raise ValueError(f"Unknown LLM response format: {output_mode}")
         self.llm_decision_history = []
         self.llm_raw_io_history = []
         self._last_raw_llm_response = ""
@@ -71,40 +71,28 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.mode_presets = {
             name: values.copy() for name, values in sim_params.LLM_MODE_PRESETS.items()
         }
-        self.mode_aliases = {
-            "normal": "stable",
-            "safe": "stable",
-            "aggressive": "push",
-            "accelerate": "push",
-            "speed_up": "push",
-            "pass": "overtake",
-            "passing": "overtake",
-            "overtaking": "overtake",
-            "blocking": "block",
-            "defend": "block",
-            "defensive": "block",
-        }
         self.current_mode = "stable"
         self.last_llm_assessment = {}
         self.last_required_assessment = {}
         self.last_assessment_consistent = True
         if system_prompt_path is None:
-            filename = "params_system.txt" if self.output_mode == "params" else "mode_system.txt"
+            filename = "params_system.txt" if self.response_format == "params" else "mode_system.txt"
             system_prompt_path = Path(__file__).with_name("prompts") / filename
         self.system_prompt_path = Path(system_prompt_path)
         self.system_prompt = self.system_prompt_path.read_text(encoding="utf-8").strip()
 
-    def _resolve_output_mode(self, output_mode, model_name) -> str:
-        mode = str(output_mode).strip().lower().replace("-", "_")
-        if mode not in {"", "auto"}:
-            return mode
+    def _resolve_response_format(self, output_mode, model_name) -> str:
+        # Select discrete-mode or direct-parameter responses from the explicit option or model name.
+        requested_format = str(output_mode).strip().lower().replace("-", "_")
+        if requested_format not in {"", "auto"}:
+            return requested_format
         model_key = str(model_name).strip().lower().replace("-", "_")
         if any(token in model_key for token in ("params", "param", "direct")):
             return "params"
         return "mode"
 
     @staticmethod
-    def _rounded(value, digits=3):
+    def _rounded(value, digits=3):  # for standarized JSON output and logging
         if value is None or not np.isfinite(value):
             return None
         return round(float(value), digits)
@@ -115,15 +103,14 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             entry = {
                 "mode": item["mode"],
             }
-            if self.output_mode == "params":
+            if self.response_format == "params":
                 entry["params"] = {
                     name: self._rounded(value)
                     for name, value in zip(("q", "zeta", "s1", "s2", "s3"), item["params"])
                 }
             modes.append(entry)
         return {
-            "usage": "continuity_only",
-            "contains_scene_evidence": False,
+            "purpose": "mode_continuity_only",  # self-explaining meta-data
             "oldest_to_newest": modes,
         }
 
@@ -204,7 +191,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         opponents_payload.sort(key=lambda item: abs(item["delta_s"]))
         nearest_front = next((item for item in opponents_payload if item["relation"] == "ahead"), None)
         nearest_rear = next((item for item in opponents_payload if item["relation"] == "behind"), None)
-
+ 
         def interaction_risk(item):
             if item is None:
                 return "clear"
@@ -256,8 +243,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "lookahead_curvature": self._rounded(
                     track_curvature_at(self.track, current_s + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon)
                 ),
-                "mpc_health": mpc_health,
-                "mpc_status": str(self.mpc.last_solver_status),
+                # "mpc_health": mpc_health,
+                # "mpc_status": str(self.mpc.last_solver_status),
             },
             "interaction": {
                 "front_risk": interaction_risk(nearest_front),
@@ -287,7 +274,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "rear_risk": interaction_risk(nearest_rear),
                 "clear_ahead": clear_ahead,
                 "boundary_risk": boundary_risk,
-                "mpc_health": mpc_health,
+                # "mpc_health": mpc_health,
             },
         }
 
@@ -308,10 +295,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self.llm_decision_history = self.llm_decision_history[-self.history_length:]
 
     def _prompt(self, state: CarState, current_s: float, opponents=None) -> str:
-        # Generate a JSON payload of the current scene and race context
-        payload = self._scene_features(state, current_s, opponents=opponents)
+        payload = self._scene_features(state, current_s, opponents=opponents)  # real-time scene features
         self.last_required_assessment = payload["required_assessment"].copy()
-        if self.output_mode == "params":
+
+        # additional info for param mode, including parameter bounds and current values
+        if self.response_format == "params":
             payload["parameter_bounds"] = {
                 name: {"min": float(bounds[0]), "max": float(bounds[1])}
                 for name, bounds in self.param_bounds.items()
@@ -348,7 +336,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "reason": {"type": "string", "maxLength": 120},
         }
         required = ["basis", "reason"]
-        if self.output_mode == "mode":
+        if self.response_format == "mode":
             properties["mode"] = {
                 "type": "string",
                 "enum": list(self.mode_presets),
@@ -409,7 +397,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
 
     def _sanitize_params(self, raw_params: dict) -> np.ndarray:
         
-        if self.output_mode == "params":
+        if self.response_format == "params":
             self.current_mode = "custom"
             values = []
             for name, fallback in zip(("q", "zeta", "s1", "s2", "s3"), self.params):
@@ -421,7 +409,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         mode = raw_params.get("mode")
         if mode is not None:
             mode_key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
-            mode_key = self.mode_aliases.get(mode_key, mode_key)
             if mode_key not in self.mode_presets:
                 raise ValueError(f"Unknown LLM policy mode: {mode}")
             self.current_mode = mode_key
@@ -497,7 +484,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
 
     def _apply_mode_guard(self, state: CarState, current_s: float, opponents=None):
         self.last_safeguard_override = ""
-        if self.output_mode != "mode":
+        if self.response_format != "mode":
             return
 
         context = self._mode_context(state, current_s, opponents)
@@ -540,15 +527,17 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self.params = self.mode_presets[guarded_mode].copy()
 
     def update_params_from_llm(self, state: CarState, current_s: float, opponents=None):
-        # Convert the wall-clock interval to calls once; callers invoke this
-        # policy at decision_dt intervals.
+        # Call LLM only at the specified update interval; otherwise reuse the last parameters.
         self._llm_call_count += 1
         if self._llm_call_count > 1 and (self._llm_call_count - 1) % self._update_interval_calls != 0:
             self.params = self.last_llm_params.copy()
             return
 
+        # user prompt construction
         prompt = self._prompt(state, current_s, opponents=opponents)
         self._last_raw_llm_response = ""
+
+        # LLM query and response handling, with error recovery and logging.
         try:
             raw_params = self._query_llm(prompt)
             self.last_llm_reason = self._sanitize_reason(raw_params)

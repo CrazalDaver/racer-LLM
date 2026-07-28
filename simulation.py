@@ -327,6 +327,12 @@ def save_simulation_trace(trace, track, params):
         car_mpc_solver_status=np.asarray(trace["car_mpc_solver_status"]),
         car_mpc_recovery_active=np.asarray(trace["car_mpc_recovery_active"]),
         car_mpc_recovery_reason=np.asarray(trace["car_mpc_recovery_reason"]),
+        # TEMPORARY DIAGNOSTIC: delete after competitive-offset analysis.
+        car_ref_raceline_e=np.asarray(trace["car_ref_raceline_e"]),
+        car_ref_p_ot_front=np.asarray(trace["car_ref_p_ot_front"]),
+        car_ref_p_ot_rear=np.asarray(trace["car_ref_p_ot_rear"]),
+        car_ref_p_bl=np.asarray(trace["car_ref_p_bl"]),
+        car_ref_p_ref_e=np.asarray(trace["car_ref_p_ref_e"]),
         collision=np.asarray(trace["collision"]),
         collision_overlap=np.asarray(trace.get("collision_overlap", []), dtype=float),
         px=np.asarray(trace["px"]),
@@ -664,6 +670,12 @@ def run_simulation(
         "car_mpc_solver_status": [],
         "car_mpc_recovery_active": [],
         "car_mpc_recovery_reason": [],
+        # TEMPORARY DIAGNOSTIC: delete after competitive-offset analysis.
+        "car_ref_raceline_e": [],
+        "car_ref_p_ot_front": [],
+        "car_ref_p_ot_rear": [],
+        "car_ref_p_bl": [],
+        "car_ref_p_ref_e": [],
         "collision": [],
         "collision_overlap": [],
         "px": [],
@@ -748,6 +760,17 @@ def run_simulation(
         "start_ranks": start_ranks,
         "vehicle_model": vehicle_model_type,
     }
+    ref_component_horizon = max(mpc.horizon for mpc in mpcs) + 1
+
+    def ref_component_snapshot(policy, name):
+        values = np.full(ref_component_horizon, np.nan, dtype=float)
+        components = getattr(policy, "last_ref_components", None)
+        if components is None or name not in components:
+            return values
+        source = np.asarray(components[name], dtype=float).reshape(-1)
+        count = min(source.size, ref_component_horizon)
+        values[:count] = source[:count]
+        return values
 
     print(
         "Simulation setup: "
@@ -988,6 +1011,17 @@ def run_simulation(
         trace["car_mpc_solver_status"].append([mpc.last_solver_status for mpc in mpcs])
         trace["car_mpc_recovery_active"].append([mpc.last_recovery_active for mpc in mpcs])
         trace["car_mpc_recovery_reason"].append([mpc.last_recovery_reason for mpc in mpcs])
+        # TEMPORARY DIAGNOSTIC: one row per car, one column per MPC step.
+        for trace_key, component_name in (
+            ("car_ref_raceline_e", "raceline_e"),
+            ("car_ref_p_ot_front", "p_ot_front"),
+            ("car_ref_p_ot_rear", "p_ot_rear"),
+            ("car_ref_p_bl", "p_bl"),
+            ("car_ref_p_ref_e", "p_ref_e"),
+        ):
+            trace[trace_key].append(
+                [ref_component_snapshot(policy, component_name) for policy in policies]
+            )
         trace["px"].append(car_s[ego_idx])
         trace["py"].append(car_e[ego_idx])
         trace["ref_x"].append(ref_fx)

@@ -25,6 +25,10 @@ class BasePolicy(abc.ABC):
         self.last_ref_traj = None
         self.last_ref_world_horizon = None
         self.last_raceline_world_horizon = None
+        # TEMPORARY DIAGNOSTIC: per-horizon reference-trajectory components.
+        # Remove together with the matching simulation trace fields after the
+        # current competitive-offset investigation.
+        self.last_ref_components = None
         self.log_fn = print
 
     @abc.abstractmethod
@@ -41,5 +45,4 @@ class BasePolicy(abc.ABC):
     def flush_mpc_warnings(self, sim_time=None):
         """Backward-compatible wrapper for older simulation callers."""
         self.flush_solver_warnings(sim_time=sim_time)
-
 

@@ -389,9 +389,10 @@ class MPCPolicy(BasePolicy):
         opponents,
         k: int,
     ) -> tuple:
-        """Return the paper's overtaking and blocking offsets."""
+        """Return the paper's front/rear overtaking and blocking offsets."""
         _, _, s1, s2, s3 = self.params
-        p_ot = 0.0
+        p_ot_front = 0.0
+        p_ot_rear = 0.0
         p_bl = 0.0
 
         for opponent in opponents:
@@ -399,7 +400,11 @@ class MPCPolicy(BasePolicy):
             dx = progress_delta(p_pert_x, opp_px, self.track.total_length)
             dy_current = ego_py_t - opp_py
             ot_mag = max((s1 - abs(dy_current)) * math.exp(-s2 * dx * dx), 0.0)
-            p_ot += self._sign(dy_current) * ot_mag
+            p_ot = self._sign(dy_current) * ot_mag
+            if opponent["delta"] > 0.0:
+                p_ot_front += p_ot
+            elif opponent["delta"] < 0.0:
+                p_ot_rear += p_ot
 
             behind_now = opponent["delta"] < 0.0
             opponent_faster = opp_vx > v_pert_x
@@ -409,7 +414,7 @@ class MPCPolicy(BasePolicy):
                 proximity = math.exp(-s2 * dx * dx)
                 p_bl += (opp_py - p_pert_y) * speed_factor * proximity
 
-        return p_ot, p_bl
+        return p_ot_front, p_ot_rear, p_bl
 
     def _predict_opponent(self, opponent, k: int) -> tuple:
         """Predict one opponent at horizon step ``k``.
@@ -455,6 +460,11 @@ class MPCPolicy(BasePolicy):
         ref = np.zeros((8, horizon + 1))
         ref_world = np.zeros((2, horizon + 1))
         raceline_world = np.full((2, horizon + 1), np.nan)
+        # TEMPORARY DIAGNOSTIC: preserve the scalar terms before clipping.
+        ref_components = {
+            name: np.full(horizon + 1, np.nan, dtype=float)
+            for name in ("raceline_e", "p_ot_front", "p_ot_rear", "p_bl", "p_ref_e")
+        }
         
         # Select the nearest leading and trailing opponents (j^*, j_*)
         selected_opponents = self._closest_opponents(current_s, opponents)
@@ -480,7 +490,7 @@ class MPCPolicy(BasePolicy):
             raceline_speed_k = max(frenet["speed"], 0.0)
             p_pert_x = frenet["track_s"]
             p_pert_y = frenet["lateral_e"]
-            p_ot, p_bl = self._competitive_offsets(
+            p_ot_front, p_ot_rear, p_bl = self._competitive_offsets(
                 p_pert_x,
                 p_pert_y,
                 zeta * raceline_speed_k,
@@ -489,10 +499,15 @@ class MPCPolicy(BasePolicy):
                 k,
             )
             p_ref_y = float(np.clip(
-                p_pert_y + p_ot + p_bl,
+                p_pert_y + p_ot_front + p_ot_rear + p_bl,
                 -self._ref_lateral_limit(),
                 self._ref_lateral_limit(),
             ))
+            ref_components["raceline_e"][k] = p_pert_y
+            ref_components["p_ot_front"][k] = p_ot_front
+            ref_components["p_ot_rear"][k] = p_ot_rear
+            ref_components["p_bl"][k] = p_bl
+            ref_components["p_ref_e"][k] = p_ref_y
             xc, yc = frenet["center_x"], frenet["center_y"]
             psi_center = frenet["psi_center"]
             ref_world[:, k] = [
@@ -512,6 +527,7 @@ class MPCPolicy(BasePolicy):
             source_raceline_s += zeta * raceline_speed_k * self.mpc.dt
         self.last_ref_world_horizon = ref_world
         self.last_raceline_world_horizon = raceline_world
+        self.last_ref_components = ref_components
         return ref
 
 
