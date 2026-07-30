@@ -112,7 +112,9 @@ class SimParams:
     # while allowing IPOPT to recover from an already unsafe measured state.
     MPC_ENFORCE_TRACK_BOUNDARY = True
     MPC_ENFORCE_COLLISION_AVOIDANCE = True
-    MPC_TRACK_SLACK_WEIGHT = 1.0e4
+    # Keep the boundary recoverable, but make voluntarily leaving the track
+    # substantially more expensive than accepting collision slack.
+    MPC_TRACK_SLACK_WEIGHT = 1.0e5
     MPC_COLLISION_SLACK_WEIGHT = 1.0e3
     # Released alpha-RACER MPC constraint:
     # |v^2 tan(steer_command)| <= mu * g * wheelbase.
@@ -161,7 +163,7 @@ class SimParams:
     REF_DEBUG_SAMPLE_INTERVAL_SECONDS = 2.0
     TRAJECTORY_SAMPLE_INTERVAL_SECONDS = 0.04
     PROGRESS_REPORT_INTERVAL_SECONDS = 4.0
-    LLM_MODEL = "qwen2.5:0.5b"
+    LLM_MODEL = "qwen2.5:7b"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.2
@@ -177,27 +179,29 @@ class SimParams:
     LLM_SAME_LANE_MARGIN = 0.05
     LLM_PUSH_MAX_ABS_CURVATURE = 0.15
     # Official alpha-RACER sampling bounds mapped to this project's
-    # [q, zeta, s1, s2, s3] parameterization.
+    # [q, zeta, s1, s2, s3] parameterization. The upstream
+    # lookahead_factor range [0.15, 0.50] maps through
+    # q = 1 / (2 * lookahead_factor).
     LLM_PARAMETER_BOUNDS = {
-        "q": (0.30, 1.00),
+        "q": (1.00, 1.0 / (2.0 * 0.15)),
         "zeta": (0.85**2, 1.10**2),
         "s1": (0.10, 0.50),
         "s2": (0.10, 0.50),
         "s3": (0.00, 1.00),
     }
-    # Previous hand-tuned presets:
-    # stable=[1.3,1.0,0.05,1.0,0.0], push=[1.8,1.25,0.05,1.0,0.0]
-    # overtake=[1.0,1.35,1.75,0.1,0.0], block=[1.6,0.9,0.05,0.45,2.0]
+    # Discrete modes within LLM_PARAMETER_BOUNDS. Push keeps fast reference
+    # progression; overtake reduces it while applying a broad lateral offset.
+    # Stable/push use high s2 to localize the unavoidable minimum s1 response.
     LLM_MODE_PRESETS = {
-        "stable": np.array([0.75, 1.00, 0.00, 0.00, 0.00]),
-        "push": np.array([0.85, 1.20, 0.00, 0.00, 0.00]),
-        "overtake": np.array([0.80, 1.35, 0.45, 0.10, 0.00]),
-        "block": np.array([0.75, 0.95, 0.00, 0.30, 0.70]),
+        "stable": np.array([1.0 / 0.75, 1.00, 0.10, 0.50, 0.00]),
+        "push": np.array([1.0 / 0.85, 1.20, 0.10, 0.50, 0.00]),
+        "overtake": np.array([1.0 / 0.80, 1.05, 0.45, 0.10, 0.00]),
+        "block": np.array([1.0 / 0.75, 0.90, 0.10, 0.30, 0.70]),
     }
     # Conservative fixed baseline within the upstream parameter ranges:
     # moderate tracking, slightly slower reference progression, small
     # overtaking displacement, and no blocking.
-    STATIC_POLICY_PARAMS = np.array([0.75, 0.90, 0.20, 0.30, 0.00])  # q, zeta, s1, s2, s3
+    STATIC_POLICY_PARAMS = np.array([1.0 / 0.75, 0.90, 0.20, 0.30, 0.00])  # q, zeta, s1, s2, s3
     # Upstream optimizer coordinates: sf1, sf2, lookahead_factor,
     # speed_factor, blocking. AlphaRacerPolicy maps these to q, zeta, s1,
     # s2, s3 and then updates them online with the learned potential model.

@@ -436,6 +436,12 @@ def save_simulation_trace(trace, track, params):
         offroad_low_speed_threshold=np.asarray(
             params.OFFROAD_LOW_SPEED_THRESHOLD
         ),
+        velocity_track_weight=np.asarray(
+            trace.get("velocity_track_weight", params.VELOCITY_TRACK_WEIGHT)
+        ),
+        heading_track_weight=np.asarray(
+            trace.get("heading_track_weight", params.HEADING_TRACK_WEIGHT)
+        ),
         track_length=np.asarray(track.total_length),
         vehicle_model=np.asarray(trace["vehicle_model"]),
         simulation_dt=np.asarray(params.SIM_DT),
@@ -759,6 +765,8 @@ def run_simulation(
         "ego_position": ego_position,
         "start_ranks": start_ranks,
         "vehicle_model": vehicle_model_type,
+        "velocity_track_weight": mpc_velocity_track_weight,
+        "heading_track_weight": params.HEADING_TRACK_WEIGHT,
     }
     ref_component_horizon = max(mpc.horizon for mpc in mpcs) + 1
 
@@ -1305,6 +1313,8 @@ def run_simulation(
             policy_names=trace["policy_names"],
             policy_mode_history=trace["policy_mode"],
             track_length=track.total_length,
+            velocity_track_weight=mpc_velocity_track_weight,
+            heading_track_weight=params.HEADING_TRACK_WEIGHT,
         )
 
 

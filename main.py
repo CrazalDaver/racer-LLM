@@ -661,15 +661,11 @@ if __name__ == "__main__":
         static_policy_params=args.static_params,
         alpharacer_params=args.alpha_params,
         llm_policy_params=args.llm_params,
-        llm_output_mode=args.llm_output_mode or "mode",
+        llm_output_mode=args.llm_output_mode,
         llm_model_name=args.llm_model,
         llm_model_names=args.llm_models,
-        llm_update_interval_seconds=(
-            args.llm_update_interval_seconds
-            if args.llm_update_interval_seconds is not None
-            else 1.0
-        ),
-        llm_temperature=args.llm_temperature if args.llm_temperature is not None else 1.0,
+        llm_update_interval_seconds=args.llm_update_interval_seconds,
+        llm_temperature=args.llm_temperature if args.llm_temperature is not None else 0.0,
         llm_temperatures=args.llm_temperatures,
         llm_safeguard_enabled=args.llm_safeguard if args.llm_safeguard is not None else False,
         self_play_rl_model_path=args.rl_model_path,

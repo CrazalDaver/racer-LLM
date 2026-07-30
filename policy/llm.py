@@ -24,7 +24,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
     def __init__(
         self,
         *args,
-        model_name="qwen2.5:0.5b",  #"my-racing-ctrl",
+        model_name="qwen2.5:7b",
         base_url="http://localhost:11434",
         timeout=3.0,
         temperature=0.0,
@@ -97,81 +97,35 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             return None
         return round(float(value), digits)
 
-    def _decision_history_payload(self) -> dict:
-        modes = []
-        for item in self.llm_decision_history[-self.history_length:]:
-            entry = {
-                "mode": item["mode"],
-            }
-            if self.response_format == "params":
-                entry["params"] = {
-                    name: self._rounded(value)
-                    for name, value in zip(("q", "zeta", "s1", "s2", "s3"), item["params"])
-                }
-            modes.append(entry)
-        return {
-            "purpose": "mode_continuity_only",  # self-explaining meta-data
-            "oldest_to_newest": modes,
-        }
+    def _decision_history_payload(self) -> list:
+        """Return only recent executed modes, oldest to newest."""
+        return [
+            item["mode"]
+            for item in self.llm_decision_history[-self.history_length:]
+        ]
 
-    def _opponent_feature(self, state, current_py, current_s, opponent, fallback_id) -> dict:
+    def _opponent_feature(self, state, current_s, opponent) -> dict:
         delta_s = float(progress_delta(opponent["px"], current_s, self.track.total_length))
-        delta_e = float(opponent.get("py", 0.0) - current_py)
-        relation = "ahead" if delta_s > 0.05 else "behind" if delta_s < -0.05 else "alongside"
+        position = "front" if delta_s > 0.05 else "rear" if delta_s < -0.05 else "alongside"
         ego_speed = max(float(state.vx), 0.0)
         opponent_speed = max(float(opponent.get("vx", 0.0)), 0.0)
-        if relation == "ahead":
-            closing_speed = ego_speed - opponent_speed
-        elif relation == "behind":
-            closing_speed = opponent_speed - ego_speed
-        else:
-            closing_speed = abs(ego_speed - opponent_speed)
-        ttc = abs(delta_s) / closing_speed if closing_speed > 0.05 else None
 
         abs_delta_s = abs(delta_s)
-        min_longitudinal = float(getattr(self.mpc, "min_longitudinal_separation", 0.36))
-        if abs_delta_s < min_longitudinal:
-            gap_band = "overlap"
-        elif abs_delta_s < sim_params.LLM_CRITICAL_DISTANCE:
-            gap_band = "critical"
-        elif abs_delta_s < sim_params.LLM_CLOSE_DISTANCE:
-            gap_band = "close"
-        elif abs_delta_s < sim_params.LLM_OVERTAKE_DISTANCE:
-            gap_band = "nearby"
-        else:
-            gap_band = "far"
-
-        lateral_limit = float(self.ref_lateral_clip)
-        min_lateral = float(getattr(self.mpc, "min_lateral_separation", 0.24))
-        opponent_py = float(opponent.get("py", 0.0))
-        left_pass_possible = lateral_limit - opponent_py >= min_lateral
-        right_pass_possible = opponent_py + lateral_limit >= min_lateral
-        if left_pass_possible and right_pass_possible:
-            pass_space = "both"
-        elif left_pass_possible:
-            pass_space = "left"
-        elif right_pass_possible:
-            pass_space = "right"
-        else:
-            pass_space = "none"
-
         speed_delta = ego_speed - opponent_speed
-        speed_relation = "slower" if speed_delta > 0.1 else "faster" if speed_delta < -0.1 else "similar"
-        same_lane_limit = min_lateral + sim_params.LLM_SAME_LANE_MARGIN
+        relative_speed = "slower" if speed_delta > 0.1 else "faster" if speed_delta < -0.1 else "similar"
+
+        if abs_delta_s < sim_params.LLM_CRITICAL_DISTANCE:
+            proximity = "critical"
+        elif abs_delta_s < sim_params.LLM_OVERTAKE_DISTANCE:
+            proximity = "near"
+        else:
+            proximity = "far"
+
         return {
-            "id": int(opponent.get("car_idx", fallback_id)),
-            "relation": relation,
-            "delta_s": self._rounded(delta_s),
-            "delta_e": self._rounded(delta_e),
-            "longitudinal_clearance": self._rounded(abs_delta_s - min_longitudinal),
-            "lateral_clearance": self._rounded(abs(delta_e) - min_lateral),
-            "distance_band": gap_band,
-            "same_lane": abs(delta_e) < same_lane_limit,
-            "speed": self._rounded(opponent_speed),
-            "speed_relation_to_ego": speed_relation,
-            "closing_speed": self._rounded(max(closing_speed, 0.0)),
-            "ttc": self._rounded(ttc),
-            "pass_space": pass_space,
+            "id": int(opponent.get("car_idx", -1)),
+            "position": position,
+            "proximity": proximity,
+            "relative_speed": relative_speed,
         }
 
     def _scene_features(self, state: CarState, current_s: float, opponents=None) -> dict:
@@ -183,100 +137,83 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             psi_hint=state.psi,
             max_heading_error=math.pi / 2.0,
         )
-        lateral_limit = float(getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width))
-        opponents_payload = [
-            self._opponent_feature(state, current_py, current_s, opponent, idx)
-            for idx, opponent in enumerate(opponents or [])
-        ]
-        opponents_payload.sort(key=lambda item: abs(item["delta_s"]))
-        nearest_front = next((item for item in opponents_payload if item["relation"] == "ahead"), None)
-        nearest_rear = next((item for item in opponents_payload if item["relation"] == "behind"), None)
- 
-        def interaction_risk(item):
-            if item is None:
-                return "clear"
-            if item["distance_band"] == "overlap" and item["same_lane"]:
-                return "overlap"
-            # Spatial proximity remains critical even when the gap is steady
-            # or opening; closing speed and TTC are separate facts.
-            if item["distance_band"] == "critical" and item["same_lane"]:
-                return "critical"
-            if (
-                item["closing_speed"] > 0.1
-                and item["distance_band"] in {"close", "nearby"}
-                and item["same_lane"]
-            ):
-                return "closing"
-            if item["distance_band"] != "far":
-                return "close"
-            return "far"
-
-        clear_ahead = (
-            nearest_front is None
-            or nearest_front["delta_s"] > sim_params.LLM_OVERTAKE_DISTANCE
+        lateral_limit = float(
+            getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width)
         )
+        raw_opponents = opponents or []
+        opponent_features = [
+            self._opponent_feature(state, current_s, opponent)
+            for opponent in raw_opponents
+        ]
+        keyed_opponents = list(zip(raw_opponents, opponent_features))
+
+        def nearest(position):
+            candidates = [
+                (
+                    abs(progress_delta(raw["px"], current_s, self.track.total_length)),
+                    feature,
+                )
+                for raw, feature in keyed_opponents
+                if feature["position"] == position
+            ]
+            if not candidates:
+                return None
+            feature = min(candidates, key=lambda item: item[0])[1]
+            return {
+                "id": feature["id"],
+                "proximity": feature["proximity"],
+                "relative_speed": feature["relative_speed"],
+            }
 
         boundary_ratio = abs(float(current_py)) / max(lateral_limit, 1e-6)
-        boundary_risk = "outside" if boundary_ratio > 1.0 else "near" if boundary_ratio >= 0.95 else "low"
-        if not self.mpc.last_solver_success or self.mpc.last_recovery_active:
-            mpc_health = "failure"
-        elif np.isfinite(self.mpc.last_loss):
-            mpc_health = "ok"
-        else:
-            mpc_health = "not_run"
+        boundary = (
+            "outside"
+            if boundary_ratio > 1.0
+            else "near"
+            if boundary_ratio >= 0.95
+            else "safe"
+        )
+        lookahead_s = (
+            current_s
+            + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon
+        )
+        road_shape = (
+            "sharp_curve"
+            if abs(track_curvature_at(self.track, lookahead_s))
+            > sim_params.LLM_PUSH_MAX_ABS_CURVATURE
+            else "gentle"
+        )
 
-        held_updates = 0
-        for item in reversed(self.llm_decision_history):
-            if item["mode"] != self.current_mode:
-                break
-            held_updates += 1
+        alongside = nearest("alongside")
+        if alongside is not None:
+            alongside = {
+                "id": alongside["id"],
+                "relative_speed": alongside["relative_speed"],
+            }
 
-        return {
+        scene = {
             "ego": {
-                "progress": self._rounded(current_s),
-                "speed": self._rounded(max(float(state.vx), 0.0)),
-                "lateral_offset": self._rounded(current_py),
-                "heading_error": self._rounded(track_heading_error(self.track, state.psi, current_s)),
-                "left_boundary_space": self._rounded(lateral_limit - current_py),
-                "right_boundary_space": self._rounded(lateral_limit + current_py),
-                "boundary_risk": boundary_risk,
-                "lookahead_curvature": self._rounded(
-                    track_curvature_at(self.track, current_s + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon)
-                ),
-                # "mpc_health": mpc_health,
-                # "mpc_status": str(self.mpc.last_solver_status),
+                "boundary": boundary,
+                "road_shape": road_shape,
             },
-            "interaction": {
-                "front_risk": interaction_risk(nearest_front),
-                "rear_risk": interaction_risk(nearest_rear),
-                "clear_ahead": clear_ahead,
-                "nearest_front": nearest_front,
-                "nearest_rear": nearest_rear,
-                "opponents_by_distance": opponents_payload,
-            },
-            "limits": {
-                "vehicle_center_half_width": self._rounded(lateral_limit),
-                "reference_half_width": self._rounded(self.ref_lateral_clip),
-                "same_lane_margin": self._rounded(sim_params.LLM_SAME_LANE_MARGIN),
-                "critical_distance": self._rounded(sim_params.LLM_CRITICAL_DISTANCE),
-                "close_front_distance": self._rounded(sim_params.LLM_CLOSE_DISTANCE),
-                "overtake_distance": self._rounded(sim_params.LLM_OVERTAKE_DISTANCE),
-                "push_max_abs_curvature": self._rounded(sim_params.LLM_PUSH_MAX_ABS_CURVATURE),
-                "critical_ttc": 1.0,
-            },
-            "decision_state": {
-                "previous_mode": self.current_mode,
-                "held_updates": held_updates,
-                "recent_decisions": self._decision_history_payload(),
-            },
-            "required_assessment": {
-                "front_risk": interaction_risk(nearest_front),
-                "rear_risk": interaction_risk(nearest_rear),
-                "clear_ahead": clear_ahead,
-                "boundary_risk": boundary_risk,
-                # "mpc_health": mpc_health,
+            "traffic": {
+                "front": nearest("front"),
+                "rear": nearest("rear"),
+                "alongside": alongside,
             },
         }
+        if self.response_format == "mode":
+            previous_basis = (
+                self.llm_decision_history[-1].get("basis")
+                if self.llm_decision_history
+                else None
+            )
+            scene["memory"] = {
+                "previous_mode": self.current_mode,
+                "previous_basis": previous_basis,
+                "recent_modes_oldest_to_newest": self._decision_history_payload(),
+            }
+        return scene
 
     def _record_llm_decision(self):
         if self.history_length <= 0:
@@ -286,6 +223,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "call": self._llm_call_count,
                 "mode": self.current_mode,
                 "requested_mode": self.last_llm_requested_mode,
+                "basis": self.last_llm_basis,
                 "reason": self.last_llm_reason,
                 "safeguard_override": self.last_safeguard_override,
                 "params": self.params.copy(),
@@ -296,7 +234,12 @@ class LLMAlphaRacerPolicy(MPCPolicy):
 
     def _prompt(self, state: CarState, current_s: float, opponents=None) -> str:
         payload = self._scene_features(state, current_s, opponents=opponents)  # real-time scene features
-        self.last_required_assessment = payload["required_assessment"].copy()
+        # Preserve the existing trace field without duplicating a second
+        # assessment block inside the model input.
+        self.last_required_assessment = {
+            "ego": payload["ego"].copy(),
+            "traffic": payload["traffic"].copy(),
+        }
 
         # additional info for param mode, including parameter bounds and current values
         if self.response_format == "params":
@@ -324,8 +267,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "basis": {
                 "type": "string",
                 "enum": [
-                    "mpc_failure",
-                    "outside_boundary",
+                    "boundary_caution",
                     "critical_front",
                     "slower_front_pass",
                     "faster_rear",

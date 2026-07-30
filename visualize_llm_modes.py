@@ -53,7 +53,7 @@ MODE_COLORS = {
 
 # Official alpha-RACER sampling bounds mapped to this project's
 # [q, zeta, s1, s2, s3] representation:
-# q=2*lookahead_factor and zeta=speed_factor**2.
+# q=1/(2*lookahead_factor) and zeta=speed_factor**2.
 PARAMETER_SWEEP_RANGES = params.LLM_PARAMETER_BOUNDS
 PARAMETER_NAMES = tuple(PARAMETER_SWEEP_RANGES)
 PARAMETER_BASELINE = np.array([

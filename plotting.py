@@ -46,6 +46,15 @@ def _same_length(a, b):
     return a[:n], b[:n]
 
 
+def _loss_term_enabled(weight, values):
+    """Use the configured objective weight, with data fallback for old traces."""
+    if weight is not None:
+        return np.isfinite(weight) and abs(float(weight)) > 1e-12
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    return bool(finite.size and np.any(np.abs(finite) > 1e-12))
+
+
 def _mode_runs(modes):
     runs = []
     if not modes:
@@ -206,6 +215,8 @@ def plot_simulation_results(
     trajectory_stride=2,
     velocity_dt_multiplier=2,
     trajectory_time_mark_interval=5.0,
+    velocity_track_weight=None,
+    heading_track_weight=None,
 ):
     half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     offroad_half_width = half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
@@ -359,8 +370,22 @@ def plot_simulation_results(
     ax.plot(loss_time, mpc_losses, "m-", label="Total loss")
     ax.plot(loss_time, mpc_track_losses, "b-", alpha=0.8, label="Track loss")
     ax.plot(loss_time, mpc_action_losses, "g-", alpha=0.8, label="Action change loss")
-    ax.plot(loss_time, mpc_velocity_losses, color="tab:orange", alpha=0.8, label="Velocity loss")
-    ax.plot(loss_time, mpc_heading_losses, color="tab:red", alpha=0.8, label="Heading loss")
+    if _loss_term_enabled(velocity_track_weight, mpc_velocity_losses):
+        ax.plot(
+            loss_time,
+            mpc_velocity_losses,
+            color="tab:orange",
+            alpha=0.8,
+            label="Velocity loss",
+        )
+    if _loss_term_enabled(heading_track_weight, mpc_heading_losses):
+        ax.plot(
+            loss_time,
+            mpc_heading_losses,
+            color="tab:red",
+            alpha=0.8,
+            label="Heading loss",
+        )
     ax.grid(alpha=0.3)
     ax.set_title("MPC loss")
     ax.set_xlabel("Time (s)")
@@ -443,6 +468,16 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         TRACK_HALF_WIDTH=track_half_width,
         OFFROAD_TOLERANCE=offroad_tolerance,
     )
+    velocity_track_weight = (
+        float(np.asarray(data["velocity_track_weight"]).item())
+        if "velocity_track_weight" in data.files
+        else None
+    )
+    heading_track_weight = (
+        float(np.asarray(data["heading_track_weight"]).item())
+        if "heading_track_weight" in data.files
+        else None
+    )
 
     track_csv = _scalar_string(data["track_csv"]) if "track_csv" in data.files else "track_csv/berlin_2018.csv"
     raceline_csv = (
@@ -501,6 +536,8 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         track_length=track_length,
         trajectory_stride=1,
         velocity_dt_multiplier=1,
+        velocity_track_weight=velocity_track_weight,
+        heading_track_weight=heading_track_weight,
     )
 
 

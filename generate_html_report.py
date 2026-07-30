@@ -5,7 +5,8 @@ the animation from ``animate_trace.py`` on the right. Position-sweep JSON rows
 contain aggregate plots on the left and a trial table on the right. Images are
 embedded into the HTML, so the report can be moved or shared as one file.
 
-Either edit ``NPZ_FILES`` and run this file without arguments, or pass paths:
+Run this file without arguments to read ``result/position_sweep_summary.json``
+and write ``result/position_sweep_report.html``. You can still pass other paths:
 
     .venv/bin/python generate_html_report.py LLM_alpha_1.npz LLM_alpha_2.npz
     .venv/bin/python generate_html_report.py result/no_safeguard_LLM_alpha.json
@@ -34,12 +35,17 @@ from animate_trace import make_animation
 from plotting import plot_trace_npz
 
 
-# Option 1: put any mixture of .npz and position-sweep .json files here.
+# Optional custom default inputs. When this list is empty, running the script
+# directly uses result/position_sweep_summary.json.
 NPZ_FILES = [
     # "LLM_alpha_1.npz",
     # "LLM_alpha_2.npz",
     # "LLM_alpha_3.npz",
 ]
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_RESULT_PATH = PROJECT_ROOT / "result" / "position_sweep_summary.json"
+DEFAULT_REPORT_PATH = PROJECT_ROOT / "result" / "position_sweep_report.html"
 
 
 def _data_uri(path: Path, media_type: str) -> str:
@@ -467,7 +473,7 @@ def parse_args():
         help="NPZ/JSON path list (alternative to positional paths).",
     )
     
-    parser.add_argument("-o", "--output", default="simulation_report.html")
+    parser.add_argument("-o", "--output", default=str(DEFAULT_REPORT_PATH))
     parser.add_argument("--stride", type=int, default=2, help="Animation frame stride.")
     parser.add_argument("--interval", type=int, default=30, help="GIF frame interval in ms.")
     parser.add_argument("--animation-dpi", type=int, default=80)
@@ -477,9 +483,12 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    selected_paths = args.result_options or args.results or NPZ_FILES
-    if not selected_paths:
-        raise SystemExit("Provide NPZ/JSON paths on the command line or add them to NPZ_FILES.")
+    selected_paths = (
+        args.result_options
+        or args.results
+        or NPZ_FILES
+        or [DEFAULT_RESULT_PATH]
+    )
     generate_report(
         selected_paths,
         output=args.output,
