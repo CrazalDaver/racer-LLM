@@ -176,6 +176,7 @@ class SimParams:
     LLM_CRITICAL_DISTANCE = 1.0
     LLM_CLOSE_DISTANCE = 2.5
     LLM_OVERTAKE_DISTANCE = 4.0
+    LLM_BLOCK_MAX_TTC_SECONDS = 1.0
     LLM_SAME_LANE_MARGIN = 0.05
     LLM_PUSH_MAX_ABS_CURVATURE = 0.15
     # Official alpha-RACER sampling bounds mapped to this project's
@@ -196,7 +197,7 @@ class SimParams:
         "stable": np.array([1.0 / 0.75, 1.00, 0.10, 0.50, 0.00]),
         "push": np.array([1.0 / 0.85, 1.20, 0.10, 0.50, 0.00]),
         "overtake": np.array([1.0 / 0.80, 1.05, 0.45, 0.10, 0.00]),
-        "block": np.array([1.0 / 0.75, 0.90, 0.10, 0.30, 0.70]),
+        "block": np.array([1.0 / 0.75, 1.0, 0.10, 0.30, 0.70]),
     }
     # Conservative fixed baseline within the upstream parameter ranges:
     # moderate tracking, slightly slower reference progression, small

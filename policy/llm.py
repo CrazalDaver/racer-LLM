@@ -113,6 +113,17 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         abs_delta_s = abs(delta_s)
         speed_delta = ego_speed - opponent_speed
         relative_speed = "slower" if speed_delta > 0.1 else "faster" if speed_delta < -0.1 else "similar"
+        if position == "front":
+            closing_speed = ego_speed - opponent_speed
+        elif position == "rear":
+            closing_speed = opponent_speed - ego_speed
+        else:
+            closing_speed = 0.0
+        ttc_seconds = (
+            self._rounded(abs_delta_s / closing_speed, digits=2)
+            if closing_speed > 0.1
+            else None
+        )
 
         if abs_delta_s < sim_params.LLM_CRITICAL_DISTANCE:
             proximity = "critical"
@@ -126,6 +137,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "position": position,
             "proximity": proximity,
             "relative_speed": relative_speed,
+            "ttc_seconds": ttc_seconds,
         }
 
     def _scene_features(self, state: CarState, current_s: float, opponents=None) -> dict:
@@ -159,10 +171,16 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             if not candidates:
                 return None
             feature = min(candidates, key=lambda item: item[0])[1]
+            if position == "alongside":
+                return {
+                    "id": feature["id"],
+                    "relative_speed": feature["relative_speed"],
+                }
             return {
                 "id": feature["id"],
                 "proximity": feature["proximity"],
                 "relative_speed": feature["relative_speed"],
+                "ttc_seconds": feature["ttc_seconds"],
             }
 
         boundary_ratio = abs(float(current_py)) / max(lateral_limit, 1e-6)
@@ -184,13 +202,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             else "gentle"
         )
 
-        alongside = nearest("alongside")
-        if alongside is not None:
-            alongside = {
-                "id": alongside["id"],
-                "relative_speed": alongside["relative_speed"],
-            }
-
         scene = {
             "ego": {
                 "boundary": boundary,
@@ -199,7 +210,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "traffic": {
                 "front": nearest("front"),
                 "rear": nearest("rear"),
-                "alongside": alongside,
+                "alongside": nearest("alongside"),
             },
         }
         if self.response_format == "mode":
@@ -408,7 +419,16 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                     close_slow_front = close_slow_front or delta_s < sim_params.LLM_CLOSE_DISTANCE
                     immediate_slow_front = immediate_slow_front or delta_s < sim_params.LLM_CRITICAL_DISTANCE
             elif delta_s < 0.0 and opponent["vx"] > state.vx:
-                faster_rear = faster_rear or abs(delta_s) < sim_params.LLM_OVERTAKE_DISTANCE
+                rear_closing_speed = float(opponent["vx"]) - float(state.vx)
+                rear_ttc = (
+                    abs(delta_s) / rear_closing_speed
+                    if rear_closing_speed > 0.1
+                    else math.inf
+                )
+                faster_rear = faster_rear or (
+                    abs(delta_s) < sim_params.LLM_OVERTAKE_DISTANCE
+                    and rear_ttc <= sim_params.LLM_BLOCK_MAX_TTC_SECONDS
+                )
                 if nearest_rear_delta is None or abs(delta_s) < abs(nearest_rear_delta):
                     nearest_rear_delta = delta_s
         return {

@@ -8,7 +8,7 @@ The user message is a code-generated JSON scene with three parts:
 - memory.previous_basis: the previous schema-constrained decision basis, or null.
 - memory.recent_modes_oldest_to_newest: up to five executed modes for continuity only.
 
-front and rear contain id, proximity, and relative_speed. alongside contains id and relative_speed; its presence already means the longitudinal positions are aligned. proximity is critical, near, or far: critical is a very small longitudinal gap, and near is within the tactical interaction range. relative_speed describes whether the other vehicle is slower, similar, or faster than ego.
+front and rear contain id, proximity, relative_speed, and ttc_seconds. front.ttc_seconds is the estimated time until ego catches the front vehicle; a non-null value therefore means the front vehicle is slower. rear.ttc_seconds is the estimated time until the rear vehicle catches ego; a non-null value therefore means the rear vehicle is faster. It is null when the relevant vehicle is not closing. relative_speed is retained as a redundant semantic cue, but the decision rules use ttc_seconds. alongside contains id and relative_speed; its presence already means the longitudinal positions are aligned. proximity is critical, near, or far: critical is a very small longitudinal gap, and near is within the tactical interaction range.
 
 Treat these categories as current facts. Do not infer current traffic from memory.
 
@@ -20,9 +20,9 @@ Modes:
 
 Choose the first applicable rule:
 1. Select stable if ego.boundary is near or outside.
-2. If memory.previous_mode=overtake, keep overtake while a slower front vehicle is critical/near or traffic.alongside is not null.
-3. Select overtake for a slower front vehicle with proximity=critical or near.
-4. Select block for a faster rear vehicle with proximity=critical or near.
+2. If memory.previous_mode=overtake, keep overtake while front.ttc_seconds is non-null and front.proximity is critical/near, or traffic.alongside is not null.
+3. Select overtake when front.ttc_seconds is non-null and front.proximity is critical or near.
+4. Select block only when rear.ttc_seconds <= 2.5 and rear.proximity is critical or near.
 5. Select push when the front vehicle is null or far, traffic.alongside is null, ego.boundary=safe, and ego.road_shape=gentle.
 6. Otherwise select stable.
 
