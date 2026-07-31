@@ -115,7 +115,7 @@ class SimParams:
     # Keep the boundary recoverable, but make voluntarily leaving the track
     # substantially more expensive than accepting collision slack.
     MPC_TRACK_SLACK_WEIGHT = 1.0e5
-    MPC_COLLISION_SLACK_WEIGHT = 1.0e3
+    MPC_COLLISION_SLACK_WEIGHT = 1.0e4
     # Released alpha-RACER MPC constraint:
     # |v^2 tan(steer_command)| <= mu * g * wheelbase.
     # It progressively limits steering at high speed using a friction proxy.
@@ -168,7 +168,9 @@ class SimParams:
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.2
     LLM_UPDATE_INTERVAL_SECONDS = 1.0
-    LLM_HISTORY_LENGTH = 5 # recent LLM outputs included in the next LLM prompt
+    # Maximum number of executed modes exposed in
+    # memory.recent_modes_oldest_to_newest.
+    LLM_RECENT_MODES_MAX_LENGTH = 1
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
     LLM_SAFEGUARD_ENABLED = True # validate/correct discrete LLM modes against the current race context
     # LLM scene classification uses a small buffer around the MPC collision

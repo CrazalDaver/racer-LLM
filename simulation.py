@@ -204,7 +204,7 @@ def create_policy(
                 else llm_update_interval_seconds
             ),
             decision_dt=params.CONTROL_DT,
-            history_length=params.LLM_HISTORY_LENGTH,
+            history_length=params.LLM_RECENT_MODES_MAX_LENGTH,
             output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode,
             safeguard_enabled=(
                 params.LLM_SAFEGUARD_ENABLED
@@ -231,7 +231,7 @@ def create_policy(
                 else llm_update_interval_seconds
             ),
             decision_dt=params.CONTROL_DT,
-            history_length=params.LLM_HISTORY_LENGTH,
+            history_length=params.LLM_RECENT_MODES_MAX_LENGTH,
         )
     if policy_type == "alpharacer":
         return AlphaRacerPolicy(
@@ -1333,22 +1333,12 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
-    # run_simulation(
-    #     v0 = 0,
-    #     # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
-    #     policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
-    #     llm_model_names=["qwen2.5:7b", None, None],
-    #     # llm_model_names=["qwen2.5:0.5b", "qwen2.5:0.5b", "qwen2.5:0.5b"],
-    #     vehicle_model_type="kinematic", ego_position=3, llm_update_interval_seconds=1.0,
-    #     llm_temperature = 0.0,
-    #     llm_safeguard_enabled=False,
-    # )
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
         policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:7b", None, None],
-        vehicle_model_type="kinematic", ego_position=3,
+        vehicle_model_type="kinematic", ego_position=1,
         llm_temperature = 0.0,
         llm_safeguard_enabled=False,
     )

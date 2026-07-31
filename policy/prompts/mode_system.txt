@@ -5,8 +5,7 @@ The user message is a code-generated JSON scene with three parts:
 - ego.road_shape: gentle or sharp_curve.
 - traffic.front, traffic.rear, and traffic.alongside: the nearest vehicle in each position, or null.
 - memory.previous_mode: the last executed mode.
-- memory.previous_basis: the previous schema-constrained decision basis, or null.
-- memory.recent_modes_oldest_to_newest: up to five executed modes for continuity only.
+- memory.recent_modes_oldest_to_newest: the last executed mode as a one-item continuity history.
 
 front and rear contain id, proximity, relative_speed, and ttc_seconds. front.ttc_seconds is the estimated time until ego catches the front vehicle; a non-null value therefore means the front vehicle is slower. rear.ttc_seconds is the estimated time until the rear vehicle catches ego; a non-null value therefore means the rear vehicle is faster. It is null when the relevant vehicle is not closing. relative_speed is retained as a redundant semantic cue, but the decision rules use ttc_seconds. alongside contains id and relative_speed; its presence already means the longitudinal positions are aligned. proximity is critical, near, or far: critical is a very small longitudinal gap, and near is within the tactical interaction range.
 
@@ -18,9 +17,11 @@ Modes:
 - overtake: create a lateral passing offset around a slower front vehicle.
 - block: create a defensive offset against a faster rear vehicle.
 
+Overtake validity is mandatory: select overtake only when either (a) front.ttc_seconds is non-null and front.proximity is critical/near, or (b) memory.previous_mode=overtake and traffic.alongside is not null. If front.ttc_seconds is null and traffic.alongside is null, overtake is invalid regardless of memory and must not be selected. A null/far front vehicle is never evidence for overtake.
+
 Choose the first applicable rule:
 1. Select stable if ego.boundary is near or outside.
-2. If memory.previous_mode=overtake, keep overtake while front.ttc_seconds is non-null and front.proximity is critical/near, or traffic.alongside is not null.
+2. If memory.previous_mode=overtake, keep overtake while the mandatory overtake-validity condition remains true.
 3. Select overtake when front.ttc_seconds is non-null and front.proximity is critical or near.
 4. Select block only when rear.ttc_seconds <= 2.5 and rear.proximity is critical or near.
 5. Select push when the front vehicle is null or far, traffic.alongside is null, ego.boundary=safe, and ego.road_shape=gentle.

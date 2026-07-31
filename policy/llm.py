@@ -30,7 +30,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         temperature=0.0,
         update_interval_seconds=1.0,
         decision_dt=None,
-        history_length=5,
+        history_length=None,
         output_mode="auto", # Public compatibility option selecting the LLM response format: "mode", "params", or "auto".
         safeguard_enabled=False,  # If True, apply deterministic mode-guarding rules to the LLM output.
         param_bounds=None,
@@ -47,6 +47,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self._update_interval_calls = duration_to_steps(
             self.update_interval_seconds, self.decision_dt
         )
+        if history_length is None:
+            history_length = sim_params.LLM_RECENT_MODES_MAX_LENGTH
         self.history_length = max(0, int(history_length))
         self.response_format = self._resolve_response_format(output_mode, model_name)
         self.safeguard_enabled = bool(safeguard_enabled)
@@ -214,14 +216,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             },
         }
         if self.response_format == "mode":
-            previous_basis = (
-                self.llm_decision_history[-1].get("basis")
-                if self.llm_decision_history
-                else None
-            )
             scene["memory"] = {
                 "previous_mode": self.current_mode,
-                "previous_basis": previous_basis,
+                # Deliberately omit previous_basis in this memory ablation.
                 "recent_modes_oldest_to_newest": self._decision_history_payload(),
             }
         return scene
@@ -451,7 +448,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
 
         context = self._mode_context(state, current_s, opponents)
         guarded_mode = self.current_mode
-        
+
         near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < sim_params.LLM_CRITICAL_DISTANCE
         near_overlap = (
             context["nearest_delta"] is not None
