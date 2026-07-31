@@ -308,6 +308,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self._last_raw_llm_response = ""
         self._last_llm_done_reason = ""
         self._last_llm_eval_count = -1
+        
+        # ollama query
         payload = {
             "model": self.model_name,
             "system": self.system_prompt,  # local file that describes tasks definition and mode explanation
