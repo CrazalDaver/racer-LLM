@@ -8,3 +8,12 @@ myplot.png
 *.gif
 *.npz
 result/
+
+# Unity replay generated files (keep unity/Assets, Packages, ProjectSettings).
+unity/Library/
+unity/Logs/
+unity/Temp/
+unity/UserSettings/
+unity_build/
+unity*_build.log
+*_unity_frames/

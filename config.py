@@ -172,7 +172,7 @@ class SimParams:
     # memory.recent_modes_oldest_to_newest.
     LLM_RECENT_MODES_MAX_LENGTH = 1
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
-    LLM_SAFEGUARD_ENABLED = True # validate/correct discrete LLM modes against the current race context
+    LLM_SAFEGUARD_ENABLED = False # keep pure-LLM experiments free of hand-coded mode corrections
     # LLM scene classification uses a small buffer around the MPC collision
     # envelope so millimetre-scale threshold crossings do not imply clear road.
     LLM_CRITICAL_DISTANCE = 1.0
@@ -181,6 +181,11 @@ class SimParams:
     LLM_BLOCK_MAX_TTC_SECONDS = 1.0
     LLM_SAME_LANE_MARGIN = 0.05
     LLM_PUSH_MAX_ABS_CURVATURE = 0.15
+    # Ego-centered centerline/raceline preview exposed to the LLM. Sampling
+    # resolution is observational only; it does not classify the road or pick
+    # a behavior mode.
+    LLM_ROAD_PREVIEW_LENGTH_METERS = 8.0
+    LLM_ROAD_PREVIEW_SAMPLE_COUNT = 5
     # Official alpha-RACER sampling bounds mapped to this project's
     # [q, zeta, s1, s2, s3] parameterization. The upstream
     # lookahead_factor range [0.15, 0.50] maps through

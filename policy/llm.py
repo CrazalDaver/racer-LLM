@@ -11,7 +11,7 @@ from config import duration_to_steps, params as sim_params
 from state import CarState
 
 from .mpc import MPCPolicy
-from .utils import progress_delta, track_curvature_at, track_heading_error
+from .utils import angle_delta, progress_delta, track_curvature_at, track_heading_error
 
 class LLMAlphaRacerPolicy(MPCPolicy):
     """
@@ -106,39 +106,85 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             for item in self.llm_decision_history[-self.history_length:]
         ]
 
-    def _opponent_feature(self, state, current_s, opponent) -> dict:
+    def _road_preview(self, current_s: float, lateral_limit: float) -> dict:
+        """Describe upcoming road geometry without classifying its difficulty."""
+        preview_length = max(float(sim_params.LLM_ROAD_PREVIEW_LENGTH_METERS), 0.0)
+        sample_count = max(int(sim_params.LLM_ROAD_PREVIEW_SAMPLE_COUNT), 1)
+        distances = np.linspace(0.0, preview_length, sample_count)
+        _, _, current_heading = self.track.interpolate(current_s)
+
+        samples = []
+        for distance in distances:
+            sample_s = current_s + float(distance)
+            center_x, center_y, center_heading = self.track.interpolate(sample_s)
+            raceline_left_offset_percent = None
+            if self.raceline is not None:
+                raceline_idx = self.raceline.nearest_index(center_x, center_y)
+                raceline_s = float(self.raceline.s[raceline_idx])
+                raceline_state = self._raceline_frenet_point(
+                    raceline_s,
+                    centerline_s_hint=sample_s,
+                )
+                raceline_left_offset_percent = self._rounded(
+                    100.0 * raceline_state["lateral_e"] / max(lateral_limit, 1e-6),
+                    digits=1,
+                )
+
+            samples.append(
+                {
+                    "distance_ahead_meters": self._rounded(distance, digits=1),
+                    "centerline_left_curvature_per_meter": self._rounded(
+                        track_curvature_at(self.track, sample_s),
+                        digits=3,
+                    ),
+                    "centerline_left_turn_degrees_from_current": self._rounded(
+                        math.degrees(angle_delta(center_heading, current_heading)),
+                        digits=1,
+                    ),
+                    "raceline_left_offset_percent_of_half_width": raceline_left_offset_percent,
+                }
+            )
+
+        return {
+            "preview_length_meters": self._rounded(preview_length, digits=1),
+            "samples_near_to_far": samples,
+        }
+
+    def _opponent_feature(
+        self,
+        state,
+        current_s,
+        current_py,
+        lateral_limit,
+        opponent,
+    ) -> dict:
         delta_s = float(progress_delta(opponent["px"], current_s, self.track.total_length))
-        position = "front" if delta_s > 0.05 else "rear" if delta_s < -0.05 else "alongside"
+        position = "front" if delta_s >= 0.0 else "rear"
         ego_speed = max(float(state.vx), 0.0)
         opponent_speed = max(float(opponent.get("vx", 0.0)), 0.0)
 
         abs_delta_s = abs(delta_s)
-        speed_delta = ego_speed - opponent_speed
-        relative_speed = "slower" if speed_delta > 0.1 else "faster" if speed_delta < -0.1 else "similar"
         if position == "front":
             closing_speed = ego_speed - opponent_speed
-        elif position == "rear":
-            closing_speed = opponent_speed - ego_speed
         else:
-            closing_speed = 0.0
+            closing_speed = opponent_speed - ego_speed
         ttc_seconds = (
             self._rounded(abs_delta_s / closing_speed, digits=2)
             if closing_speed > 0.1
             else None
         )
 
-        if abs_delta_s < sim_params.LLM_CRITICAL_DISTANCE:
-            proximity = "critical"
-        elif abs_delta_s < sim_params.LLM_OVERTAKE_DISTANCE:
-            proximity = "near"
-        else:
-            proximity = "far"
-
         return {
             "id": int(opponent.get("car_idx", -1)),
             "position": position,
-            "proximity": proximity,
-            "relative_speed": relative_speed,
+            "longitudinal_gap_meters": self._rounded(abs_delta_s, digits=2),
+            "left_offset_from_ego_percent_of_half_width": self._rounded(
+                100.0
+                * (float(opponent.get("py", current_py)) - float(current_py))
+                / max(lateral_limit, 1e-6),
+                digits=1,
+            ),
+            "closing_speed_meters_per_second": self._rounded(closing_speed, digits=2),
             "ttc_seconds": ttc_seconds,
         }
 
@@ -156,64 +202,57 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         )
         raw_opponents = opponents or []
         opponent_features = [
-            self._opponent_feature(state, current_s, opponent)
+            self._opponent_feature(
+                state,
+                current_s,
+                current_py,
+                lateral_limit,
+                opponent,
+            )
             for opponent in raw_opponents
         ]
-        keyed_opponents = list(zip(raw_opponents, opponent_features))
 
         def nearest(position):
             candidates = [
-                (
-                    abs(progress_delta(raw["px"], current_s, self.track.total_length)),
-                    feature,
-                )
-                for raw, feature in keyed_opponents
+                feature
+                for feature in opponent_features
                 if feature["position"] == position
             ]
             if not candidates:
                 return None
-            feature = min(candidates, key=lambda item: item[0])[1]
-            if position == "alongside":
-                return {
-                    "id": feature["id"],
-                    "relative_speed": feature["relative_speed"],
-                }
+            feature = min(candidates, key=lambda item: item["longitudinal_gap_meters"])
             return {
                 "id": feature["id"],
-                "proximity": feature["proximity"],
-                "relative_speed": feature["relative_speed"],
+                "longitudinal_gap_meters": feature["longitudinal_gap_meters"],
+                "left_offset_from_ego_percent_of_half_width": feature[
+                    "left_offset_from_ego_percent_of_half_width"
+                ],
+                "closing_speed_meters_per_second": feature[
+                    "closing_speed_meters_per_second"
+                ],
                 "ttc_seconds": feature["ttc_seconds"],
             }
 
-        boundary_ratio = abs(float(current_py)) / max(lateral_limit, 1e-6)
-        boundary = (
-            "outside"
-            if boundary_ratio > 1.0
-            else "near"
-            if boundary_ratio >= 0.95
-            else "safe"
-        )
-        lookahead_s = (
-            current_s
-            + max(float(state.vx), 0.0) * self.mpc.dt * self.mpc.horizon
-        )
-        road_shape = (
-            "sharp_curve"
-            if abs(track_curvature_at(self.track, lookahead_s))
-            > sim_params.LLM_PUSH_MAX_ABS_CURVATURE
-            else "gentle"
-        )
-
         scene = {
             "ego": {
-                "boundary": boundary,
-                "road_shape": road_shape,
+                "lap_progress_percent": self._rounded(
+                    100.0 * (float(current_s) % self.track.total_length) / self.track.total_length,
+                    digits=1,
+                ),
+                "left_position_percent_of_half_width": self._rounded(
+                    100.0 * float(current_py) / max(lateral_limit, 1e-6),
+                    digits=1,
+                ),
+                "speed_percent_of_maximum": self._rounded(
+                    100.0 * max(float(state.vx), 0.0) / max(self.max_speed, 1e-6),
+                    digits=1,
+                ),
             },
             "traffic": {
                 "front": nearest("front"),
                 "rear": nearest("rear"),
-                "alongside": nearest("alongside"),
             },
+            "road_preview": self._road_preview(current_s, lateral_limit),
         }
         if self.response_format == "mode":
             scene["memory"] = {
@@ -247,6 +286,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.last_required_assessment = {
             "ego": payload["ego"].copy(),
             "traffic": payload["traffic"].copy(),
+            "road_preview": payload["road_preview"].copy(),
         }
 
         # additional info for param mode, including parameter bounds and current values
@@ -259,7 +299,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 name: self._rounded(value)
                 for name, value in zip(("q", "zeta", "s1", "s2", "s3"), self.params)
             }
-        return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        # Whitespace keeps the structured observation readable in raw prompt
+        # logs while preserving valid JSON and the exact same data semantics.
+        return json.dumps(payload, indent=2, ensure_ascii=True)
 
     def _extract_json(self, text: str) -> dict:
         try:
@@ -271,32 +313,22 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             return json.loads(match.group(0))
 
     def _output_schema(self) -> dict:
-        properties = {
-            "basis": {
-                "type": "string",
-                "enum": [
-                    "boundary_caution",
-                    "critical_front",
-                    "slower_front_pass",
-                    "faster_rear",
-                    "clear_track",
-                    "uncertain",
-                ],
-            },
-            "reason": {"type": "string", "maxLength": 120},
-        }
-        required = ["basis", "reason"]
+        properties = {}
+        required = []
         if self.response_format == "mode":
             properties["mode"] = {
                 "type": "string",
                 "enum": list(self.mode_presets),
             }
-            required.insert(1, "mode")
+            required.append("mode")
         else:
             for name in ("q", "zeta", "s1", "s2", "s3"):
                 lo, hi = self.param_bounds[name]
                 properties[name] = {"type": "number", "minimum": float(lo), "maximum": float(hi)}
                 required.append(name)
+        properties["basis"] = {"type": "string", "maxLength": 40}
+        properties["reason"] = {"type": "string", "maxLength": 120}
+        required.extend(["basis", "reason"])
         return {
             "type": "object",
             "properties": properties,

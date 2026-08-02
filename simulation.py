@@ -1338,7 +1338,7 @@ if __name__ == "__main__":
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
         policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:7b", None, None],
-        vehicle_model_type="kinematic", ego_position=1,
+        vehicle_model_type="kinematic", ego_position=3,
         llm_temperature = 0.0,
         llm_safeguard_enabled=False,
     )
