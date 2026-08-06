@@ -30,7 +30,7 @@ class _StrictIBRSolver:
         friction=1.0,       # rolling friction coefficient fr
         mu=1.6,             # friction coefficient mu
         gravity=9.81,       # g
-        use_upstream_collision_expression=True,
+        use_upstream_collision_expression=False,
         lateral_half_width=None,
     ):
         self.horizon = int(horizon)
@@ -92,10 +92,11 @@ class _StrictIBRSolver:
             g.append(x[3, k + 1])
         for k in range(n):
             if self.use_upstream_collision_expression:
-                # The upstream source: s - oppo_e
+                # Reproduce the released alpha-RACER source literally.  Its
+                # second term mixes longitudinal s with opponent lateral e.
                 g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[0, k] - opp_e[k + 1]) ** 2)
             else:
-                # e - oppo_e should be more reasonable
+                # Correct squared distance in the two-dimensional Frenet plane.
                 g.append((x[0, k] - opp_s[k + 1]) ** 2 + (x[1, k] - opp_e[k + 1]) ** 2)
         if self.lateral_half_width is not None:
             for k in range(1, n + 1):
@@ -200,11 +201,20 @@ class _StrictIBRSolver:
 
 class IteratedBestResponsePolicy(BasePolicy):
     """
-    IBR baseline policy in alpha-RACER paper (multi_car_comp_blocking.py).
-    https://arxiv.org/abs/1801.02302 
-    The upstream baseline chooses the nearest interaction partner, solves a
-    two-car Frenet MPC with 3 alternating best responses, and applies the
-    current car's first direct control command.
+    IBR baseline ported from alpha-RACER's multi_car_comp_blocking.py.
+
+    The released code uses a two-car, 10-step (1 s) MPC and performs three
+    *single-agent* alternating best-response solves per call: neighbor, ego,
+    neighbor.  Thus ``iterations=3`` means three NLP solves in total, not
+    three complete neighbor/ego rounds and not six solves.  The current car
+    is deliberately the second participant, so its executed action comes
+    from the middle solve, matching how the released code consumes mpc_ibr's
+    second returned control.
+
+    This differs from Appendix F of the paper supplement, which reports six
+    IBR iterations with a 20-step (2 s) horizon.  Keep the released-code
+    defaults here for computational practicality; use iterations=6 and
+    ibr_horizon=20 together when evaluating the paper-specified variant.
     """
 
     def __init__(
@@ -215,9 +225,9 @@ class IteratedBestResponsePolicy(BasePolicy):
         max_speed=5.0,
         car_idx=None,
         policy_name=None,
-        iterations=3,  # N=3*2, total iterations
+        iterations=3,  # Three alternating single-agent NLP solves; see class docstring.
         ibr_horizon=None,
-        use_upstream_collision_expression=True,
+        use_upstream_collision_expression=False,
         lateral_half_width=None,
     ):
         super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)

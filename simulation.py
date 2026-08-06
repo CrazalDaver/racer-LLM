@@ -1333,10 +1333,12 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
+    # .venv/bin/python main.py --policies LLM ibr ib
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
-        policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
+        policy_names=["LLM", "ibr", "ibr"],  # ego, oppo1, oppo2
+        # policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:7b", None, None],
         vehicle_model_type="kinematic", ego_position=3,
         llm_temperature = 0.0,

@@ -150,7 +150,63 @@ public class RaceReplay : MonoBehaviour {
 
         BuildRoadMesh();
         BuildRaceline();
+        BuildOuterCurb("Left outer curb", 1f);
+        BuildOuterCurb("Right outer curb", -1f);
 
+    }
+
+    void BuildOuterCurb(string name, float side) {
+        int count = replay.trackX.Length;
+        float innerOffset = replay.trackWidth * 0.5f;
+        float outerOffset = innerOffset + 0.08f;
+        Vector3[] vertices = new Vector3[count * 4];
+        List<int> red = new List<int>();
+        List<int> white = new List<int>();
+        for (int i = 0; i < count; i++) {
+            int next = (i + 1) % count;
+            Vector3 normalA = TrackNormal(i) * side;
+            Vector3 normalB = TrackNormal(next) * side;
+            Vector3 centerA = new Vector3(replay.trackX[i], 0.018f, replay.trackY[i]);
+            Vector3 centerB = new Vector3(replay.trackX[next], 0.018f, replay.trackY[next]);
+            int v = i * 4;
+            vertices[v] = centerA + normalA * innerOffset;
+            vertices[v + 1] = centerA + normalA * outerOffset;
+            vertices[v + 2] = centerB + normalB * innerOffset;
+            vertices[v + 3] = centerB + normalB * outerOffset;
+            List<int> target = (i / 10) % 2 == 0 ? red : white;
+            if (side > 0f) {
+                target.Add(v); target.Add(v + 1); target.Add(v + 2);
+                target.Add(v + 1); target.Add(v + 3); target.Add(v + 2);
+            } else {
+                target.Add(v); target.Add(v + 2); target.Add(v + 1);
+                target.Add(v + 1); target.Add(v + 2); target.Add(v + 3);
+            }
+        }
+        Mesh mesh = new Mesh();
+        mesh.name = name + " mesh";
+        mesh.vertices = vertices;
+        mesh.subMeshCount = 2;
+        mesh.SetTriangles(red, 0);
+        mesh.SetTriangles(white, 1);
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        GameObject curb = new GameObject(name);
+        curb.AddComponent<MeshFilter>().mesh = mesh;
+        curb.AddComponent<MeshRenderer>().materials = new [] {
+            Resources.Load<Material>("ReplayCurbRed"),
+            Resources.Load<Material>("ReplayCurbWhite")
+        };
+    }
+
+    Vector3 TrackNormal(int index) {
+        int count = replay.trackX.Length;
+        int prev = (index - 1 + count) % count;
+        int next = (index + 1) % count;
+        Vector2 tangent = new Vector2(
+            replay.trackX[next] - replay.trackX[prev],
+            replay.trackY[next] - replay.trackY[prev]
+        ).normalized;
+        return new Vector3(-tangent.y, 0f, tangent.x);
     }
 
     void BuildRaceline() {

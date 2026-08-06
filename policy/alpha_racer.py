@@ -204,9 +204,16 @@ class AlphaRacerPolicy(MPCPolicy):
             self._wrap_delta(s2, s0),
         ]
 
-        # Frenet states features for each car: 3 * 5 = 15 features
-        for car in cars:
-            features.extend(self._car_feature_block(car))
+        # Match the released model's training layout exactly: all three lateral
+        # offsets first, followed by each car's remaining four state features.
+        # The order is:
+        #   e0, e1, e2,
+        #   heading_error0, vx0, vy0, omega0, ... (cars 1 and 2)
+        car_feature_blocks = [self._car_feature_block(car) for car in cars]
+        features.extend(block[0] for block in car_feature_blocks)
+        # Remaining Frenet-state features: 3 * 4 = 12 features.
+        for block in car_feature_blocks:
+            features.extend(block[1:])
 
         # track curvature features for each car: 3 features
         for car in cars:
@@ -324,4 +331,3 @@ def plan_alpharacer_policy_params(policies, states, car_s, car_e):
         policy.original_params = joint[idx].copy()
         policy.params = policy._map_original_params(policy.original_params)
         policy._joint_plan_ready = True
-

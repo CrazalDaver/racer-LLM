@@ -31,8 +31,8 @@ public static class BuildReplay {
             new Color(0.57f, 0.66f, 0.54f), 0.08f, 0.65f
         );
         CreateLitMaterial("Assets/Resources/ReplayLitTemplate.mat", null, null, Color.white, 0.28f, 0f);
-        AssetDatabase.DeleteAsset("Assets/Resources/ReplayCurbRed.mat");
-        AssetDatabase.DeleteAsset("Assets/Resources/ReplayCurbWhite.mat");
+        CreateLitMaterial("Assets/Resources/ReplayCurbRed.mat", null, null, new Color(0.82f, 0.035f, 0.025f), 0.3f, 0f);
+        CreateLitMaterial("Assets/Resources/ReplayCurbWhite.mat", null, null, new Color(0.9f, 0.9f, 0.86f), 0.25f, 0f);
         CreateTireMarkMaterial();
         CreateSkyMaterial();
         CopyReplayAsset("Assets/ThirdParty/KenneyCarKit/Models/FBX format/race.fbx", "Assets/Resources/ReplayAssets/RaceCar.fbx");

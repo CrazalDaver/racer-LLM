@@ -184,7 +184,7 @@ class SimParams:
     # Ego-centered centerline/raceline preview exposed to the LLM. Sampling
     # resolution is observational only; it does not classify the road or pick
     # a behavior mode.
-    LLM_ROAD_PREVIEW_LENGTH_METERS = 8.0
+    LLM_ROAD_PREVIEW_LENGTH_METERS = 8.0 
     LLM_ROAD_PREVIEW_SAMPLE_COUNT = 5
     # Official alpha-RACER sampling bounds mapped to this project's
     # [q, zeta, s1, s2, s3] parameterization. The upstream
@@ -203,7 +203,7 @@ class SimParams:
     LLM_MODE_PRESETS = {
         "stable": np.array([1.0 / 0.75, 1.00, 0.10, 0.50, 0.00]),
         "push": np.array([1.0 / 0.85, 1.20, 0.10, 0.50, 0.00]),
-        "overtake": np.array([1.0 / 0.80, 1.05, 0.45, 0.10, 0.00]),
+        "overtake": np.array([1.0 / 0.80, 1.20, 0.45, 0.10, 0.00]),
         "block": np.array([1.0 / 0.75, 1.0, 0.10, 0.30, 0.70]),
     }
     # Conservative fixed baseline within the upstream parameter ranges:
@@ -229,7 +229,13 @@ class SimParams:
     SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
     SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
-    IBR_HORIZON = 10 # Matches multi_car_comp_blocking.py's IBR horizon.
+    # Computationally cheaper settings from the released alpha-RACER code:
+    # a 10-step = 1 s horizon and three alternating single-agent NLP solves
+    # (neighbor -> ego -> neighbor), not three complete two-agent rounds.
+    # Appendix F of the paper supplement instead reports a 20-step = 2 s
+    # horizon and six alternating solves; use (20, 6) together to evaluate
+    # that paper-specified, substantially more expensive IBR variant.
+    IBR_HORIZON = 10
     IBR_ITERATIONS = 3
 
 

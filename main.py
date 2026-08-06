@@ -653,7 +653,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     run_position_sweep(
-        policy_names=args.policies or ["LLM", "alpharacer", "alpharacer"],
+        policy_names=args.policies or ["LLM", "ibr", "ibr"],
         trials_per_position=1,  # total race = trials_per_position * len(ego_positions)
         ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
         output_path="result/position_sweep_summary.json",

@@ -185,7 +185,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 digits=1,
             ),
             "closing_speed_meters_per_second": self._rounded(closing_speed, digits=2),
-            "ttc_seconds": ttc_seconds,
+            "ttc_seconds": ttc_seconds,  # null if donot approach
         }
 
     def _scene_features(self, state: CarState, current_s: float, opponents=None) -> dict:
@@ -213,6 +213,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         ]
 
         def nearest(position):
+            # Return the nearest opponent feature in the given position ("front" or "rear"),
             candidates = [
                 feature
                 for feature in opponent_features
@@ -367,6 +368,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         return self._extract_json(self._last_raw_llm_response)
 
     def _record_llm_raw_io(self, prompt: str, error=None):
+        # for debugging
         self.llm_raw_io_history.append(
             {
                 "call": self._llm_call_count,
