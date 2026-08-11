@@ -19,6 +19,7 @@ if not _COMPLETING:
 
     from animate_trace import make_animation
     from config import params
+    from generate_html_report import generate_report
     from simulation import run_simulation
 
     try:
@@ -138,6 +139,7 @@ def simulation_kwargs(
     vehicle_model_type=None,
     static_policy_params=None,
     alpharacer_params=None,
+    alpharacer_weight_path=None,
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
@@ -155,6 +157,7 @@ def simulation_kwargs(
         "vehicle_model_type": vehicle_model_type,
         "static_policy_params": static_policy_params,
         "alpharacer_params": alpharacer_params,
+        "alpharacer_weight_path": alpharacer_weight_path,
         "llm_policy_params": llm_policy_params,
         "llm_output_mode": llm_output_mode,
         "llm_model_name": llm_model_name,
@@ -175,6 +178,7 @@ def _override_snapshot(
     vehicle_model_type=None,
     static_policy_params=None,
     alpharacer_params=None,
+    alpharacer_weight_path=None,
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
@@ -194,6 +198,7 @@ def _override_snapshot(
         vehicle_model_type=vehicle_model_type,
         static_policy_params=static_policy_params,
         alpharacer_params=alpharacer_params,
+        alpharacer_weight_path=alpharacer_weight_path,
         llm_policy_params=llm_policy_params,
         llm_output_mode=llm_output_mode,
         llm_model_name=llm_model_name,
@@ -215,6 +220,9 @@ def _override_snapshot(
     if fixed_params is not None:
         fixed_params = [float(value) for value in fixed_params]
         snapshot["STATIC_POLICY_PARAMS"] = fixed_params
+    if overrides["alpharacer_weight_path"] is not None:
+        snapshot["ALPHARACER_WEIGHT_PATH"] = str(overrides["alpharacer_weight_path"])
+        snapshot["POTENTIAL_FUNCTION_WEIGHT_PATH"] = str(overrides["alpharacer_weight_path"])
     if overrides["llm_policy_params"] is not None:
         snapshot["LLM_POLICY_PARAMS"] = [float(value) for value in overrides["llm_policy_params"]]
     if overrides["llm_output_mode"] is not None:
@@ -257,6 +265,7 @@ def run_experiment(
     vehicle_model_type=None,
     static_policy_params=None,
     alpharacer_params=None,
+    alpharacer_weight_path=None,
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
@@ -280,6 +289,7 @@ def run_experiment(
         vehicle_model_type=vehicle_model_type,
         static_policy_params=static_policy_params,
         alpharacer_params=alpharacer_params,
+        alpharacer_weight_path=alpharacer_weight_path,
         llm_policy_params=llm_policy_params,
         llm_output_mode=llm_output_mode,
         llm_model_name=llm_model_name,
@@ -389,6 +399,7 @@ def run_experiment_suite(
     vehicle_model_type=None,
     static_policy_params=None,
     alpharacer_params=None,
+    alpharacer_weight_path=None,
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
@@ -433,6 +444,7 @@ def run_experiment_suite(
                 vehicle_model_type=vehicle_model_type,
                 static_policy_params=static_policy_params,
                 alpharacer_params=alpharacer_params,
+                alpharacer_weight_path=alpharacer_weight_path,
                 llm_policy_params=llm_policy_params,
                 llm_output_mode=llm_output_mode,
                 llm_model_name=llm_model_name,
@@ -607,6 +619,12 @@ def _add_sim_args(parser):
     group.add_argument("--vehicle-model", choices=["kinematic", "kinetic", "kinetics", "dbm"], default=None)
     group.add_argument("--static-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
     group.add_argument("--alpha-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
+    group.add_argument(
+        "--alpharacer-weight",
+        type=Path,
+        default=None,
+        help="Potential checkpoint for every alpha-RACER policy (official raw or local metadata-bearing .pth).",
+    )
     group.add_argument("--llm-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
     group.add_argument("--llm-output-mode", choices=["auto", "mode", "params"], default=None)
     group.add_argument("--llm-model", default=None)
@@ -624,6 +642,28 @@ def _add_sim_args(parser):
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable or disable validation/correction of LLM policy modes.",
+    )
+    group.add_argument(
+        "--ibr-implementation",
+        choices=["local_wang", "historical_strict"],
+        default=None,
+        help=(
+            "IBR solver: local_wang uses local dynamics and supports SE; "
+            "historical_strict is the locally adapted alpha-RACER IBR."
+        ),
+    )
+    group.add_argument(
+        "--ibr-se",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable SE-IBR using config.IBR_SE_DEFAULT_WEIGHT (default: ordinary IBR).",
+    )
+    group.add_argument(
+        "--ibr-sensitivity-weight",
+        type=float,
+        default=None,
+        metavar="ALPHA",
+        help="Set Wang SE-IBR alpha explicitly; 0 selects ordinary IBR.",
     )
     group.add_argument("--rl-model-path", default=None)
     group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
@@ -652,14 +692,27 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.ibr_implementation is not None:
+        params.IBR_IMPLEMENTATION = args.ibr_implementation
+    if args.ibr_sensitivity_weight is not None:
+        if args.ibr_sensitivity_weight < 0.0:
+            raise ValueError("--ibr-sensitivity-weight must be non-negative")
+        params.IBR_SENSITIVITY_WEIGHT = args.ibr_sensitivity_weight
+    elif args.ibr_se is True:
+        params.IBR_SENSITIVITY_WEIGHT = params.IBR_SE_DEFAULT_WEIGHT
+    elif args.ibr_se is False:
+        params.IBR_SENSITIVITY_WEIGHT = 0.0
+    sweep_output_path = Path("result/position_sweep_summary.json")
     run_position_sweep(
         policy_names=args.policies or ["LLM", "ibr", "ibr"],
         trials_per_position=1,  # total race = trials_per_position * len(ego_positions)
         ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
-        output_path="result/position_sweep_summary.json",
+        output_path=sweep_output_path,
         vehicle_model_type=args.vehicle_model or "kinematic",
         static_policy_params=args.static_params,
         alpharacer_params=args.alpha_params,
+        alpharacer_weight_path=args.alpharacer_weight,
+        ibr_implementation=params.IBR_IMPLEMENTATION,
         llm_policy_params=args.llm_params,
         llm_output_mode=args.llm_output_mode,
         llm_model_name=args.llm_model,
@@ -672,4 +725,12 @@ if __name__ == "__main__":
         self_play_rl_backend=args.rl_backend,
         self_play_rl_strict_load=args.rl_strict_load or None,
         self_play_rl_action_order=args.rl_action_order,
+    )
+    report_path = Path("result/position_sweep_report.html")
+    generate_report(
+        [sweep_output_path],
+        output=report_path,
+        animation_stride=args.stride,
+        animation_interval=args.interval,
+        animation_dpi=args.dpi,
     )

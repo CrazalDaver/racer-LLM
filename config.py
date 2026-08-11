@@ -4,6 +4,20 @@ import copy
 
 GRAVITY = 9.81
 
+# Canonical high-level policy coordinates used throughout this repository.
+# They match the alpha-RACER paper: theta=(q, zeta, s1, s2, s3).
+ALPHARACER_PARAMETER_NAMES = ("q", "zeta", "s1", "s2", "s3")
+ALPHARACER_PARAMETER_BOUNDS = np.asarray(
+    [
+        [1.0, 1.0 / (2.0 * 0.15)],  # q; converted from upstream lookahead [0.15, 0.50]
+        [0.85**2, 1.10**2],         # zeta; converted from upstream speed factor
+        [0.10, 0.50],               # s1
+        [0.10, 0.50],               # s2
+        [0.00, 1.00],               # s3
+    ],
+    dtype=float,
+)
+
 
 class DynamicParams:
     def __init__(self, vehicle_model_type="dbm"):
@@ -190,12 +204,11 @@ class SimParams:
     # [q, zeta, s1, s2, s3] parameterization. The upstream
     # lookahead_factor range [0.15, 0.50] maps through
     # q = 1 / (2 * lookahead_factor).
+    ALPHARACER_PARAMETER_NAMES = ALPHARACER_PARAMETER_NAMES
+    ALPHARACER_PARAMETER_BOUNDS = ALPHARACER_PARAMETER_BOUNDS
     LLM_PARAMETER_BOUNDS = {
-        "q": (1.00, 1.0 / (2.0 * 0.15)),
-        "zeta": (0.85**2, 1.10**2),
-        "s1": (0.10, 0.50),
-        "s2": (0.10, 0.50),
-        "s3": (0.00, 1.00),
+        name: tuple(float(value) for value in ALPHARACER_PARAMETER_BOUNDS[idx])
+        for idx, name in enumerate(ALPHARACER_PARAMETER_NAMES)
     }
     # Discrete modes within LLM_PARAMETER_BOUNDS. Push keeps fast reference
     # progression; overtake reduces it while applying a broad lateral offset.
@@ -210,12 +223,12 @@ class SimParams:
     # moderate tracking, slightly slower reference progression, small
     # overtaking displacement, and no blocking.
     STATIC_POLICY_PARAMS = np.array([1.0 / 0.75, 0.90, 0.20, 0.30, 0.00])  # q, zeta, s1, s2, s3
-    # Upstream optimizer coordinates: sf1, sf2, lookahead_factor,
-    # speed_factor, blocking. AlphaRacerPolicy maps these to q, zeta, s1,
-    # s2, s3 and then updates them online with the learned potential model.
-    ALPHARACER_INITIAL_ORIGINAL_PARAMS = np.array([0.3, 0.2, 0.25, 0.95, 0.0])
-    POTENTIAL_FUNCTION_WEIGHT_PATH = "alpha_racer_weights/p_models_rel/model_multi_myopic_mpc.pth"
-    POTENTIAL_FUNCTION_OPT_STYLE = "grad"  # Paper/default upstream online optimizer.
+    # Canonical paper coordinates: q, zeta, s1, s2, s3. Official checkpoints
+    # are adapted internally because they were trained in transformed coords.
+    ALPHARACER_INITIAL_PARAMS = np.array([2.0, 0.95**2, 0.3, 0.2, 0.0])
+    POTENTIAL_FUNCTION_WEIGHT_PATH = "train/weights/alpha_racer/upstream/potential_myopic_mpc.pth"
+    POTENTIAL_FUNCTION_OPT_STYLE = "grad"
+    # Step size in normalized paper-parameter coordinates xi in [0,1]^15.
     POTENTIAL_FUNCTION_GRADIENT_RATE = 1e-4
     POTENTIAL_FUNCTION_SEARCH_POINTS = 7
     POTENTIAL_FUNCTION_SEARCH_ITERS = 6
@@ -229,14 +242,32 @@ class SimParams:
     SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
     SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
-    # Computationally cheaper settings from the released alpha-RACER code:
-    # a 10-step = 1 s horizon and three alternating single-agent NLP solves
-    # (neighbor -> ego -> neighbor), not three complete two-agent rounds.
-    # Appendix F of the paper supplement instead reports a 20-step = 2 s
-    # horizon and six alternating solves; use (20, 6) together to evaluate
-    # that paper-specified, substantially more expensive IBR variant.
+    # IBR_IMPLEMENTATION choices:
+    #   local_wang      Wang-style IBR/SE-IBR using this project's dynamics,
+    #                   constraints, action definition, and MPC timing.
+    #   historical_strict restored local _StrictIBRSolver used from commit
+    #                   5ab4f74 onward: upstream objective plus local vehicle
+    #                   parameters, hard track bounds, and own-action recovery.
+    # SE is intentionally available only for local_wang.
+    IBR_IMPLEMENTATION = "local_wang"
+    # local_wang uses complete ego/opponent rounds and finishes with a final
+    # ego solve. IBR_SENSITIVITY_WEIGHT=0 is ordinary IBR; positive values
+    # enable the sensitivity-enhanced loss from Wang et al. (2019).
     IBR_HORIZON = 10
-    IBR_ITERATIONS = 3
+    IBR_ITERATIONS = 2
+    IBR_SENSITIVITY_WEIGHT = 0.0
+    IBR_SE_DEFAULT_WEIGHT = 0.05
+    IBR_PROGRESS_WEIGHT = 10.0
+    IBR_LATERAL_WEIGHT = 0.4
+    IBR_HEADING_WEIGHT = 0.3
+    IBR_SPEED_WEIGHT = 0.15
+    IBR_CONTROL_WEIGHT = 0.15
+    IBR_CONTROL_RATE_WEIGHT = 0.4
+    IBR_CONVERGENCE_TOLERANCE = 1.0e-3
+    # Historical local port kept three alternating solves and the upstream
+    # friction proxy while taking vehicle geometry/actuation from local MPC.
+    IBR_HISTORICAL_ITERATIONS = 3
+    IBR_HISTORICAL_FRICTION_COEFFICIENT = 1.6
 
 
 params = SimParams()

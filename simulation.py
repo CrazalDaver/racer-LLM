@@ -142,6 +142,8 @@ def create_policy(
     car_idx=0,
     static_policy_params=None,
     alpharacer_params=None,
+    alpharacer_weight_path=None,
+    ibr_implementation=None,
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
@@ -242,12 +244,16 @@ def create_policy(
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
             ref_lateral_clip=params.REF_LATERAL_CLIP,
-            weight_path=params.ALPHARACER_WEIGHT_PATH,
+            weight_path=(
+                params.ALPHARACER_WEIGHT_PATH
+                if alpharacer_weight_path is None
+                else alpharacer_weight_path
+            ),
             search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS,
             search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS,
             opt_style=params.POTENTIAL_FUNCTION_OPT_STYLE,
             gradient_rate=params.POTENTIAL_FUNCTION_GRADIENT_RATE,
-            initial_original_params=params.ALPHARACER_INITIAL_ORIGINAL_PARAMS,
+            initial_params=params.ALPHARACER_INITIAL_PARAMS,
         )
     if policy_type == "self_play_rl":
         return SelfPlayRLPolicy(
@@ -284,6 +290,12 @@ def create_policy(
             car_idx=car_idx,
             policy_name=policy_type,
             iterations=params.IBR_ITERATIONS,
+            sensitivity_weight=params.IBR_SENSITIVITY_WEIGHT,
+            implementation=(
+                params.IBR_IMPLEMENTATION
+                if ibr_implementation is None
+                else ibr_implementation
+            ),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
         )
@@ -371,6 +383,15 @@ def save_simulation_trace(trace, track, params):
         policy_required_assessment=np.asarray(trace.get("policy_required_assessment", []), dtype=str),
         policy_assessment_consistent=np.asarray(trace.get("policy_assessment_consistent", []), dtype=bool),
         policy_names=np.asarray(trace.get("policy_names", [])),
+        car_alpharacer_weight_paths=np.asarray(
+            trace.get("car_alpharacer_weight_paths", []), dtype=str
+        ),
+        car_alpharacer_weight_parameterizations=np.asarray(
+            trace.get("car_alpharacer_weight_parameterizations", []), dtype=str
+        ),
+        car_ibr_implementations=np.asarray(
+            trace.get("car_ibr_implementations", []), dtype=str
+        ),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
         llm_safeguard_enabled=np.asarray(trace.get("llm_safeguard_enabled", False), dtype=bool),
@@ -406,6 +427,14 @@ def save_simulation_trace(trace, track, params):
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
+        start_gap=np.asarray(trace.get("start_gap", params.CAR_START_GAP)),
+        initial_longitudinal_offsets=np.asarray(
+            trace.get("initial_longitudinal_offsets", []), dtype=float
+        ),
+        initial_lateral_offsets=np.asarray(
+            trace.get("initial_lateral_offsets", []), dtype=float
+        ),
+        initial_speeds=np.asarray(trace.get("initial_speeds", []), dtype=float),
         track_csv=np.asarray(params.TRACK_CSV),
         raceline_csv=np.asarray(params.RACELINE_CSV),
         track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),
@@ -457,6 +486,20 @@ def save_simulation_trace(trace, track, params):
             params.MPC_ENFORCE_FRICTION_SPEED_LIMIT
         ),
         mpc_friction_coefficient=np.asarray(params.MPC_FRICTION_COEFFICIENT),
+        ibr_horizon=np.asarray(params.IBR_HORIZON),
+        ibr_iterations=np.asarray(params.IBR_ITERATIONS),
+        ibr_implementation=np.asarray(
+            trace.get("ibr_implementation", params.IBR_IMPLEMENTATION)
+        ),
+        ibr_sensitivity_weight=np.asarray(params.IBR_SENSITIVITY_WEIGHT),
+        ibr_se_enabled=np.asarray(params.IBR_SENSITIVITY_WEIGHT > 0.0),
+        ibr_progress_weight=np.asarray(params.IBR_PROGRESS_WEIGHT),
+        ibr_lateral_weight=np.asarray(params.IBR_LATERAL_WEIGHT),
+        ibr_heading_weight=np.asarray(params.IBR_HEADING_WEIGHT),
+        ibr_speed_weight=np.asarray(params.IBR_SPEED_WEIGHT),
+        ibr_control_weight=np.asarray(params.IBR_CONTROL_WEIGHT),
+        ibr_control_rate_weight=np.asarray(params.IBR_CONTROL_RATE_WEIGHT),
+        ibr_convergence_tolerance=np.asarray(params.IBR_CONVERGENCE_TOLERANCE),
         llm_update_interval_seconds=np.asarray(
             trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
         ),
@@ -482,7 +525,11 @@ def run_simulation(
     policy_names=None,
     vehicle_model_type=None,
     static_policy_params=None,
+    static_policy_params_per_car=None,
     alpharacer_params=None,
+    alpharacer_weight_path=None,
+    alpharacer_weight_paths=None,
+    ibr_implementation=None,
     llm_policy_params=None,
     llm_output_mode=None,
     llm_model_name=None,
@@ -496,9 +543,15 @@ def run_simulation(
     self_play_rl_strict_load=None,
     self_play_rl_action_order=None,
     v0=params.v0 if hasattr(params, "v0") else 0.0,
+    start_gap=None,
+    initial_longitudinal_offsets=None,
+    initial_lateral_offsets=None,
+    initial_speeds=None,
     velocity_track_weight=None,
     horizon=None,
     ego_position=1,
+    total_time=None,
+    quiet=False,
 ):
     if track_name is not None:
         configure_track(params, track_name, scale=track_scale)
@@ -514,6 +567,11 @@ def run_simulation(
     elif num_cars is None:
         num_cars = params.NUM_CARS
     resolved_policy_names = _resolve_policy_names(policy_type, policy_names, num_cars)
+    if alpharacer_weight_paths is not None and len(alpharacer_weight_paths) != num_cars:
+        raise ValueError(
+            f"alpharacer_weight_paths length must equal num_cars ({num_cars}), "
+            f"got {len(alpharacer_weight_paths)}"
+        )
     if llm_model_names is not None and len(llm_model_names) != num_cars:
         raise ValueError(f"llm_model_names length must equal num_cars ({num_cars}), got {len(llm_model_names)}")
     resolved_llm_model_names = [
@@ -536,6 +594,29 @@ def run_simulation(
     remaining_ranks = [rank for rank in range(num_cars) if rank != ego_start_rank]
     for car_idx in range(1, num_cars):
         start_ranks[car_idx] = remaining_ranks[car_idx - 1]
+    start_gap = params.CAR_START_GAP if start_gap is None else float(start_gap)
+    if start_gap <= 0.0:
+        raise ValueError(f"start_gap must be positive, got {start_gap}")
+
+    def initial_values(values, default, name):
+        if values is None:
+            return np.full(num_cars, default, dtype=float)
+        array = np.asarray(values, dtype=float)
+        if array.shape != (num_cars,):
+            raise ValueError(f"{name} must contain {num_cars} values, got shape {array.shape}")
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain only finite values")
+        return array
+
+    initial_longitudinal_offsets = initial_values(
+        initial_longitudinal_offsets, 0.0, "initial_longitudinal_offsets"
+    )
+    initial_lateral_offsets = initial_values(
+        initial_lateral_offsets, 0.0, "initial_lateral_offsets"
+    )
+    initial_speeds = initial_values(initial_speeds, float(v0), "initial_speeds")
+    if np.any(initial_speeds < 0.0):
+        raise ValueError("initial_speeds must be non-negative")
     vehicle_model_type = (params.VEHICLE_MODEL if vehicle_model_type is None else vehicle_model_type).lower()
     vehicle_params = make_vehicle_params(vehicle_model_type)
     mpc_horizon = params.MPC_HORIZON if horizon is None else int(horizon)
@@ -587,8 +668,18 @@ def run_simulation(
                 mpc,
                 raceline=raceline,
                 car_idx=car_idx,
-                static_policy_params=static_policy_params,
+                static_policy_params=(
+                    static_policy_params
+                    if static_policy_params_per_car is None
+                    else np.asarray(static_policy_params_per_car, dtype=float)[car_idx]
+                ),
                 alpharacer_params=alpharacer_params,
+                alpharacer_weight_path=(
+                    alpharacer_weight_path
+                    if alpharacer_weight_paths is None
+                    else _per_car_option(alpharacer_weight_paths, car_idx, alpharacer_weight_path)
+                ),
+                ibr_implementation=ibr_implementation,
                 llm_policy_params=llm_policy_params,
                 llm_output_mode=llm_output_mode,
                 llm_model_name=resolved_llm_model_names[car_idx],
@@ -610,15 +701,26 @@ def run_simulation(
             )
         )
 
-        start_s = -start_ranks[car_idx] * params.CAR_START_GAP
-        start_x, start_y = track.frenet_to_world(start_s, 0.0)
+        start_s = -start_ranks[car_idx] * start_gap + initial_longitudinal_offsets[car_idx]
+        start_e = initial_lateral_offsets[car_idx]
+        start_x, start_y = track.frenet_to_world(start_s, start_e)
         _, _, start_psi = track.interpolate(start_s)
-        states.append(CarState(x=start_x, y=start_y, vx=v0, vy=0.0, psi=start_psi, omega=0.0))
+        states.append(
+            CarState(
+                x=start_x,
+                y=start_y,
+                vx=initial_speeds[car_idx],
+                vy=0.0,
+                psi=start_psi,
+                omega=0.0,
+            )
+        )
 
     control_steps = duration_to_steps(params.CONTROL_DT, params.SIM_DT)
     if not np.isclose(control_steps * params.SIM_DT, params.CONTROL_DT):
         raise ValueError("CONTROL_DT must be an integer multiple of SIM_DT")
-    total_steps = int(params.TOTAL_TIME / params.SIM_DT)
+    simulation_time = params.TOTAL_TIME if total_time is None else float(total_time)
+    total_steps = int(simulation_time / params.SIM_DT)
     early_collision_window_steps = duration_to_steps(
         params.EARLY_COLLISION_WINDOW_SECONDS, params.SIM_DT
     )
@@ -636,7 +738,10 @@ def run_simulation(
     )
     track_half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     offroad_half_width = track_half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
-    progress_s = [-start_ranks[car_idx] * params.CAR_START_GAP for car_idx in range(num_cars)]
+    progress_s = [
+        -start_ranks[car_idx] * start_gap + initial_longitudinal_offsets[car_idx]
+        for car_idx in range(num_cars)
+    ]
 
     traj_x, traj_y, velocities, lateral_errors = [], [], [], []
     all_traj_x = [[] for _ in range(num_cars)]
@@ -732,6 +837,20 @@ def run_simulation(
         "car_offroad_recovery_active": [],
         "car_offroad_recovery_heading_error": [],
         "policy_names": resolved_policy_names,
+        "car_alpharacer_weight_paths": [
+            str(getattr(policy, "weight_path", "")) for policy in policies
+        ],
+        "car_alpharacer_weight_parameterizations": [
+            str(getattr(policy, "weight_parameterization", "")) for policy in policies
+        ],
+        "car_ibr_implementations": [
+            str(getattr(policy, "implementation", "")) for policy in policies
+        ],
+        "ibr_implementation": (
+            params.IBR_IMPLEMENTATION
+            if ibr_implementation is None
+            else str(ibr_implementation)
+        ),
         "llm_model_names": [
             (
                 params.LLM_MODEL
@@ -764,6 +883,10 @@ def run_simulation(
         "ego_index": ego_idx,
         "ego_position": ego_position,
         "start_ranks": start_ranks,
+        "start_gap": start_gap,
+        "initial_longitudinal_offsets": initial_longitudinal_offsets.copy(),
+        "initial_lateral_offsets": initial_lateral_offsets.copy(),
+        "initial_speeds": initial_speeds.copy(),
         "vehicle_model": vehicle_model_type,
         "velocity_track_weight": mpc_velocity_track_weight,
         "heading_track_weight": params.HEADING_TRACK_WEIGHT,
@@ -780,22 +903,23 @@ def run_simulation(
         values[:count] = source[:count]
         return values
 
-    print(
-        "Simulation setup: "
-        f"track={params.TRACK_CSV}, scale={params.TRACK_SCALE:g}, "
-        f"half_width={params.TRACK_HALF_WIDTH:g}, "
-        f"policies={resolved_policy_names}, ego_start_position={ego_position}/{num_cars}, "
-        f"vehicle_model={vehicle_model_type}, "
-        f"timing=sim:{params.SIM_DT:g}s/control:{params.CONTROL_DT:g}s/"
-        f"mpc:{params.MPC_DT:g}s"
-    )
-    if any(name == "llm_alpharacer" for name in resolved_policy_names):
+    if not quiet:
+        print(
+            "Simulation setup: "
+            f"track={params.TRACK_CSV}, scale={params.TRACK_SCALE:g}, "
+            f"half_width={params.TRACK_HALF_WIDTH:g}, "
+            f"policies={resolved_policy_names}, ego_start_position={ego_position}/{num_cars}, "
+            f"vehicle_model={vehicle_model_type}, "
+            f"timing=sim:{params.SIM_DT:g}s/control:{params.CONTROL_DT:g}s/"
+            f"mpc:{params.MPC_DT:g}s"
+        )
+    if not quiet and any(name == "llm_alpharacer" for name in resolved_policy_names):
         print(f"LLM models by car: {trace['llm_model_names']}")
         print(f"LLM temperatures by car: {trace['llm_temperatures']}")
         print(f"LLM safeguards by car: {trace['car_llm_safeguard_enabled']}")
     progress_iter = range(total_steps)
     progress_bar = None
-    if tqdm is not None:
+    if tqdm is not None and not quiet:
         progress_bar = tqdm(
             progress_iter,
             total=total_steps,
@@ -1203,7 +1327,7 @@ def run_simulation(
             traj_y.append(states[ego_idx].y)
             velocities.append(states[ego_idx].vx)
 
-        if (step + 1) % progress_report_steps == 0:
+        if not quiet and (step + 1) % progress_report_steps == 0:
             current_position = 1 + sum(
                 progress_s[car_idx] > progress_s[ego_idx]
                 for car_idx in range(num_cars)
@@ -1280,7 +1404,7 @@ def run_simulation(
 
     if save_trace:
         save_simulation_trace(trace, track, params)
-    else:
+    elif not quiet:
         print("Skipped saving simulation trace")
 
     if show_plot:
@@ -1316,6 +1440,10 @@ def run_simulation(
             velocity_track_weight=mpc_velocity_track_weight,
             heading_track_weight=params.HEADING_TRACK_WEIGHT,
         )
+
+    # Returning the trace is useful for training/data analysis and does not
+    # change existing CLI callers, which simply ignore the return value.
+    return trace
 
 
 if __name__ == "__main__":
