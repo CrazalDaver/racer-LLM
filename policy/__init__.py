@@ -1,6 +1,11 @@
 from .alpha_racer import AlphaRacerPolicy, plan_alpharacer_policy_params
 from .ibr import IteratedBestResponsePolicy, plan_ibr_joint_actions
-from .llm import LLMAlphaRacerPolicy, RuleBasedSafeguardPolicy
+from .llm import (
+    ExplicitRuleLLMPolicy,
+    LLMAlphaRacerPolicy,
+    RuleBasedPolicy,
+    RuleBasedSafeguardPolicy,
+)
 from .base import BasePolicy
 from .mpc import CenterLinePolicy, MPCPolicy, StaticAlphaRacerPolicy
 from .self_play_rl import SelfPlayRLPolicy
@@ -11,8 +16,10 @@ __all__ = [
     "BasePolicy",
     "CenterLinePolicy",
     "IteratedBestResponsePolicy",
+    "ExplicitRuleLLMPolicy",
     "LLMAlphaRacerPolicy",
     "MPCPolicy",
+    "RuleBasedPolicy",
     "RuleBasedSafeguardPolicy",
     "SelfPlayRLPolicy",
     "StaticAlphaRacerPolicy",

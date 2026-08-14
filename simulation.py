@@ -1,15 +1,15 @@
 import argparse
-import json
 
 import numpy as np
 
 from collision import oriented_rectangle_overlap_cost
-from config import GRAVITY, duration_to_steps, make_vehicle_params, params
+from config import duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
 from plotting import plot_simulation_results
 from policy import (
     AlphaRacerPolicy,
     CenterLinePolicy,
+    ExplicitRuleLLMPolicy,
     IteratedBestResponsePolicy,
     LLMAlphaRacerPolicy,
     RuleBasedSafeguardPolicy,
@@ -21,8 +21,13 @@ from policy import (
     track_heading_error,
 )
 from state import CarAction, CarState
+from simulation_trace import (
+    create_simulation_trace,
+    record_simulation_step,
+    save_simulation_trace,
+)
 from track import Track, configure_track, load_centerline_csv, load_raceline_csv
-from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
+from vehicle_model import DynamicBicycleModel, KinematicBicycleModel, neutral_throttle
 
 try:
     from tqdm.auto import tqdm
@@ -71,12 +76,18 @@ def _normalize_policy_name(policy_name):
         "llmalpha": "llm_alpharacer",
         "llmalpharacer": "llm_alpharacer",
 
-        "rule": "rule_based_safeguard",
-        "rules": "rule_based_safeguard",
-        "rule_based": "rule_based_safeguard",
-        "rule_based_safeguard": "rule_based_safeguard",
-        "safeguard_baseline": "rule_based_safeguard",
-        "decision_tree": "rule_based_safeguard",
+        "llm_rules": "llm_explicit_rules",
+        "llm_rule": "llm_explicit_rules",
+        "llm_with_rules": "llm_explicit_rules",
+        "llm_explicit_rules": "llm_explicit_rules",
+        "explicit_rule_llm": "llm_explicit_rules",
+
+        "rule": "rule_based",
+        "rules": "rule_based",
+        "rule_based": "rule_based",
+        "rule_based_safeguard": "rule_based",
+        "safeguard_baseline": "rule_based",
+        "decision_tree": "rule_based",
 
         "rl": "self_play_rl",
         "ppo": "self_play_rl",
@@ -183,8 +194,13 @@ def create_policy(
             max_speed=params.MAX_RACELINE_SPEED,
             ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
-    if policy_type == "llm_alpharacer":
-        return LLMAlphaRacerPolicy(
+    if policy_type in {"llm_alpharacer", "llm_explicit_rules"}:
+        policy_class = (
+            ExplicitRuleLLMPolicy
+            if policy_type == "llm_explicit_rules"
+            else LLMAlphaRacerPolicy
+        )
+        return policy_class(
             track,
             mpc,
             car_idx=car_idx,
@@ -214,7 +230,7 @@ def create_policy(
                 else llm_safeguard_enabled
             ),
         )
-    if policy_type == "rule_based_safeguard":
+    if policy_type == "rule_based":
         return RuleBasedSafeguardPolicy(
             track,
             mpc,
@@ -300,219 +316,6 @@ def create_policy(
             max_speed=params.MAX_RACELINE_SPEED,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
-
-
-def save_simulation_trace(trace, track, params):
-    if not trace["time"]:
-        return
-
-    np.savez(
-        params.TRACE_OUTPUT,
-        time=np.asarray(trace["time"]),
-        x=np.asarray(trace["x"]),
-        y=np.asarray(trace["y"]),
-        psi=np.asarray(trace["psi"]),
-        vx=np.asarray(trace["vx"]),
-        vy=np.asarray(trace["vy"]),
-        omega=np.asarray(trace["omega"]),
-        car_x=np.asarray(trace["car_x"]),
-        car_y=np.asarray(trace["car_y"]),
-        car_psi=np.asarray(trace["car_psi"]),
-        car_vx=np.asarray(trace["car_vx"]),
-        car_vy=np.asarray(trace["car_vy"]),
-        car_omega=np.asarray(trace["car_omega"]),
-        car_px=np.asarray(trace["car_px"]),
-        car_py=np.asarray(trace["car_py"]),
-        car_throttle=np.asarray(trace["car_throttle"]),
-        car_steer=np.asarray(trace["car_steer"]),
-        car_mpc_loss=np.asarray(trace["car_mpc_loss"]),
-        car_mpc_track_loss=np.asarray(trace["car_mpc_track_loss"]),
-        car_mpc_action_loss=np.asarray(trace["car_mpc_action_loss"]),
-        car_mpc_velocity_loss=np.asarray(trace["car_mpc_velocity_loss"]),
-        car_mpc_heading_loss=np.asarray(trace["car_mpc_heading_loss"]),
-        car_mpc_violation_loss=np.asarray(trace["car_mpc_violation_loss"]),
-        car_mpc_max_track_slack=np.asarray(trace["car_mpc_max_track_slack"]),
-        car_mpc_max_collision_slack=np.asarray(
-            trace["car_mpc_max_collision_slack"]
-        ),
-        car_mpc_solver_success=np.asarray(trace["car_mpc_solver_success"]),
-        car_mpc_solver_status=np.asarray(trace["car_mpc_solver_status"]),
-        car_mpc_recovery_active=np.asarray(trace["car_mpc_recovery_active"]),
-        car_mpc_recovery_reason=np.asarray(trace["car_mpc_recovery_reason"]),
-        # TEMPORARY DIAGNOSTIC: delete after competitive-offset analysis.
-        car_ref_raceline_e=np.asarray(trace["car_ref_raceline_e"]),
-        car_ref_p_ot_front=np.asarray(trace["car_ref_p_ot_front"]),
-        car_ref_p_ot_rear=np.asarray(trace["car_ref_p_ot_rear"]),
-        car_ref_p_bl=np.asarray(trace["car_ref_p_bl"]),
-        car_ref_p_ref_e=np.asarray(trace["car_ref_p_ref_e"]),
-        collision=np.asarray(trace["collision"]),
-        collision_overlap=np.asarray(trace.get("collision_overlap", []), dtype=float),
-        px=np.asarray(trace["px"]),
-        py=np.asarray(trace["py"]),
-        ref_px=np.asarray(trace["ref_px"]),
-        ref_py=np.asarray(trace["ref_py"]),
-        ref_speed=np.asarray(trace["ref_speed"]),
-        ref_x=np.asarray(trace["ref_x"]),
-        ref_y=np.asarray(trace["ref_y"]),
-        ref_raceline_s=np.asarray(trace["ref_raceline_s"]),
-        raceline_horizon_x=np.asarray(trace["raceline_horizon_x"]),
-        raceline_horizon_y=np.asarray(trace["raceline_horizon_y"]),
-        ref_horizon_x=np.asarray(trace["ref_horizon_x"]),
-        ref_horizon_y=np.asarray(trace["ref_horizon_y"]),
-        offroad=np.asarray(trace["offroad"]),
-        throttle=np.asarray(trace["throttle"]),
-        steer=np.asarray(trace["steer"]),
-        mpc_loss=np.asarray(trace["mpc_loss"]),
-        mpc_track_loss=np.asarray(trace["mpc_track_loss"]),
-        mpc_action_loss=np.asarray(trace["mpc_action_loss"]),
-        mpc_velocity_loss=np.asarray(trace["mpc_velocity_loss"]),
-        mpc_heading_loss=np.asarray(trace["mpc_heading_loss"]),
-        mpc_violation_loss=np.asarray(trace["mpc_violation_loss"]),
-        mpc_max_track_slack=np.asarray(trace["mpc_max_track_slack"]),
-        mpc_max_collision_slack=np.asarray(trace["mpc_max_collision_slack"]),
-        mpc_solver_success=np.asarray(trace["mpc_solver_success"]),
-        mpc_solver_status=np.asarray(trace["mpc_solver_status"]),
-        mpc_recovery_active=np.asarray(trace["mpc_recovery_active"]),
-        mpc_recovery_reason=np.asarray(trace["mpc_recovery_reason"]),
-        control_update=np.asarray(trace.get("control_update", []), dtype=bool),
-        policy_params=np.asarray(trace["policy_params"]),
-        policy_mode=np.asarray(trace["policy_mode"]),
-        policy_reason=np.asarray(trace.get("policy_reason", []), dtype=str),
-        policy_basis=np.asarray(trace.get("policy_basis", []), dtype=str),
-        policy_assessment=np.asarray(trace.get("policy_assessment", []), dtype=str),
-        policy_required_assessment=np.asarray(trace.get("policy_required_assessment", []), dtype=str),
-        policy_assessment_consistent=np.asarray(trace.get("policy_assessment_consistent", []), dtype=bool),
-        policy_names=np.asarray(trace.get("policy_names", [])),
-        car_alpharacer_weight_paths=np.asarray(
-            trace.get("car_alpharacer_weight_paths", []), dtype=str
-        ),
-        car_alpharacer_weight_parameterizations=np.asarray(
-            trace.get("car_alpharacer_weight_parameterizations", []), dtype=str
-        ),
-        car_ibr_implementations=np.asarray(
-            trace.get("car_ibr_implementations", []), dtype=str
-        ),
-        llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
-        llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
-        llm_safeguard_enabled=np.asarray(trace.get("llm_safeguard_enabled", False), dtype=bool),
-        car_llm_safeguard_enabled=np.asarray(
-            trace.get("car_llm_safeguard_enabled", []), dtype=bool
-        ),
-        llm_raw_call_indices=np.asarray(trace.get("llm_raw_call_indices", []), dtype=int),
-        llm_raw_prompts=np.asarray(trace.get("llm_raw_prompts", []), dtype=str),
-        llm_raw_responses=np.asarray(trace.get("llm_raw_responses", []), dtype=str),
-        llm_raw_errors=np.asarray(trace.get("llm_raw_errors", []), dtype=str),
-        llm_raw_done_reasons=np.asarray(trace.get("llm_raw_done_reasons", []), dtype=str),
-        llm_raw_eval_counts=np.asarray(trace.get("llm_raw_eval_counts", []), dtype=int),
-        car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
-        car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
-        car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
-        car_policy_basis=np.asarray(trace.get("car_policy_basis", []), dtype=str),
-        car_policy_assessment=np.asarray(trace.get("car_policy_assessment", []), dtype=str),
-        car_policy_required_assessment=np.asarray(
-            trace.get("car_policy_required_assessment", []), dtype=str
-        ),
-        car_policy_assessment_consistent=np.asarray(
-            trace.get("car_policy_assessment_consistent", []), dtype=bool
-        ),
-        car_policy_requested_mode=np.asarray(trace.get("car_policy_requested_mode", []), dtype=str),
-        car_safeguard_override=np.asarray(trace.get("car_safeguard_override", []), dtype=str),
-        car_offroad=np.asarray(trace.get("car_offroad", []), dtype=bool),
-        car_offroad_recovery_active=np.asarray(
-            trace.get("car_offroad_recovery_active", []), dtype=bool
-        ),
-        car_offroad_recovery_heading_error=np.asarray(
-            trace.get("car_offroad_recovery_heading_error", []), dtype=float
-        ),
-        ego_index=np.asarray(trace.get("ego_index", 0)),
-        ego_position=np.asarray(trace.get("ego_position", 1)),
-        start_ranks=np.asarray(trace.get("start_ranks", [])),
-        start_gap=np.asarray(trace.get("start_gap", params.CAR_START_GAP)),
-        initial_longitudinal_offsets=np.asarray(
-            trace.get("initial_longitudinal_offsets", []), dtype=float
-        ),
-        initial_lateral_offsets=np.asarray(
-            trace.get("initial_lateral_offsets", []), dtype=float
-        ),
-        initial_speeds=np.asarray(trace.get("initial_speeds", []), dtype=float),
-        track_csv=np.asarray(params.TRACK_CSV),
-        raceline_csv=np.asarray(params.RACELINE_CSV),
-        track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),
-        track_width=np.asarray(params.TRACK_WIDTH),
-        track_half_width=np.asarray(getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)),
-        vehicle_half_length=np.asarray(params.VEHICLE_HALF_LENGTH),
-        vehicle_half_width=np.asarray(params.VEHICLE_HALF_WIDTH),
-        mpc_constraint_half_width=np.asarray(
-            getattr(params, "MPC_CONSTRAINT_HALF_WIDTH", getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0))
-        ),
-        ref_lateral_clip=np.asarray(
-            getattr(params, "REF_LATERAL_CLIP", getattr(params, "MPC_CONSTRAINT_HALF_WIDTH", params.TRACK_WIDTH / 2.0))
-        ),
-        offroad_tolerance=np.asarray(getattr(params, "OFFROAD_TOLERANCE", 0.0)),
-        offroad_half_width=np.asarray(
-            getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
-            + getattr(params, "OFFROAD_TOLERANCE", 0.0)
-        ),
-        offroad_strength=np.asarray(params.OFFROAD_STRENGTH),
-        offroad_heading_realign_strength=np.asarray(
-            params.OFFROAD_HEADING_REALIGN_STRENGTH
-        ),
-        offroad_inward_steer=np.asarray(params.OFFROAD_INWARD_STEER),
-        offroad_large_heading_error=np.asarray(
-            params.OFFROAD_LARGE_HEADING_ERROR
-        ),
-        offroad_throttle_boost=np.asarray(params.OFFROAD_THROTTLE_BOOST),
-        offroad_low_speed_threshold=np.asarray(
-            params.OFFROAD_LOW_SPEED_THRESHOLD
-        ),
-        velocity_track_weight=np.asarray(
-            trace.get("velocity_track_weight", params.VELOCITY_TRACK_WEIGHT)
-        ),
-        heading_track_weight=np.asarray(
-            trace.get("heading_track_weight", params.HEADING_TRACK_WEIGHT)
-        ),
-        track_length=np.asarray(track.total_length),
-        vehicle_model=np.asarray(trace["vehicle_model"]),
-        simulation_dt=np.asarray(params.SIM_DT),
-        control_dt=np.asarray(params.CONTROL_DT),
-        mpc_dt=np.asarray(params.MPC_DT),
-        mpc_enforce_track_boundary=np.asarray(params.MPC_ENFORCE_TRACK_BOUNDARY),
-        mpc_enforce_collision_avoidance=np.asarray(
-            params.MPC_ENFORCE_COLLISION_AVOIDANCE
-        ),
-        mpc_track_slack_weight=np.asarray(params.MPC_TRACK_SLACK_WEIGHT),
-        mpc_collision_slack_weight=np.asarray(params.MPC_COLLISION_SLACK_WEIGHT),
-        mpc_enforce_friction_speed_limit=np.asarray(
-            params.MPC_ENFORCE_FRICTION_SPEED_LIMIT
-        ),
-        mpc_friction_coefficient=np.asarray(params.MPC_FRICTION_COEFFICIENT),
-        ibr_horizon=np.asarray(params.IBR_HORIZON),
-        ibr_iterations=np.asarray(params.IBR_ITERATIONS),
-        ibr_implementation=np.asarray(
-            trace.get("ibr_implementation", params.IBR_IMPLEMENTATION)
-        ),
-        ibr_sensitivity_weight=np.asarray(params.IBR_SENSITIVITY_WEIGHT),
-        ibr_se_enabled=np.asarray(params.IBR_SENSITIVITY_WEIGHT > 0.0),
-        ibr_progress_weight=np.asarray(params.IBR_PROGRESS_WEIGHT),
-        ibr_lateral_weight=np.asarray(params.IBR_LATERAL_WEIGHT),
-        ibr_heading_weight=np.asarray(params.IBR_HEADING_WEIGHT),
-        ibr_speed_weight=np.asarray(params.IBR_SPEED_WEIGHT),
-        ibr_control_weight=np.asarray(params.IBR_CONTROL_WEIGHT),
-        ibr_control_rate_weight=np.asarray(params.IBR_CONTROL_RATE_WEIGHT),
-        ibr_convergence_tolerance=np.asarray(params.IBR_CONVERGENCE_TOLERANCE),
-        llm_update_interval_seconds=np.asarray(
-            trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
-        ),
-        early_collision_window_seconds=np.asarray(params.EARLY_COLLISION_WINDOW_SECONDS),
-        early_collision_consecutive_seconds=np.asarray(
-            params.EARLY_COLLISION_CONSECUTIVE_SECONDS
-        ),
-        early_stop=np.asarray(trace.get("early_stop", False)),
-        early_stop_reason=np.asarray(trace.get("early_stop_reason", "")),
-        completed_steps=np.asarray(trace.get("completed_steps", len(trace["time"]))),
-        planned_steps=np.asarray(trace.get("planned_steps", len(trace["time"]))),
-    )
-    print(f"Saved simulation trace to {params.TRACE_OUTPUT}")
 
 
 def run_simulation(
@@ -737,7 +540,7 @@ def run_simulation(
         params.PROGRESS_REPORT_INTERVAL_SECONDS, params.SIM_DT
     )
     track_half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
-    offroad_half_width = track_half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
+    offroad_recovery_threshold = params.OFFROAD_RECOVERY_THRESHOLD
     progress_s = [
         -start_ranks[car_idx] * start_gap + initial_longitudinal_offsets[car_idx]
         for car_idx in range(num_cars)
@@ -751,146 +554,24 @@ def run_simulation(
     mpc_velocity_losses, mpc_heading_losses = [], []
     throttle_history, steering_history = [], []
     frenet_ref_lines = []
-    trace = {
-        "time": [],
-        "x": [],
-        "y": [],
-        "psi": [],
-        "vx": [],
-        "vy": [],
-        "omega": [],
-        "car_x": [],
-        "car_y": [],
-        "car_psi": [],
-        "car_vx": [],
-        "car_vy": [],
-        "car_omega": [],
-        "car_px": [],
-        "car_py": [],
-        "car_throttle": [],
-        "car_steer": [],
-        "car_mpc_loss": [],
-        "car_mpc_track_loss": [],
-        "car_mpc_action_loss": [],
-        "car_mpc_velocity_loss": [],
-        "car_mpc_heading_loss": [],
-        "car_mpc_violation_loss": [],
-        "car_mpc_max_track_slack": [],
-        "car_mpc_max_collision_slack": [],
-        "car_mpc_solver_success": [],
-        "car_mpc_solver_status": [],
-        "car_mpc_recovery_active": [],
-        "car_mpc_recovery_reason": [],
-        # TEMPORARY DIAGNOSTIC: delete after competitive-offset analysis.
-        "car_ref_raceline_e": [],
-        "car_ref_p_ot_front": [],
-        "car_ref_p_ot_rear": [],
-        "car_ref_p_bl": [],
-        "car_ref_p_ref_e": [],
-        "collision": [],
-        "collision_overlap": [],
-        "px": [],
-        "py": [],
-        "ref_px": [],
-        "ref_py": [],
-        "ref_speed": [],
-        "ref_x": [],
-        "ref_y": [],
-        "ref_raceline_s": [],
-        "raceline_horizon_x": [],
-        "raceline_horizon_y": [],
-        "ref_horizon_x": [],
-        "ref_horizon_y": [],
-        "offroad": [],
-        "throttle": [],
-        "steer": [],
-        "mpc_loss": [],
-        "mpc_track_loss": [],
-        "mpc_action_loss": [],
-        "mpc_velocity_loss": [],
-        "mpc_heading_loss": [],
-        "mpc_violation_loss": [],
-        "mpc_max_track_slack": [],
-        "mpc_max_collision_slack": [],
-        "mpc_solver_success": [],
-        "mpc_solver_status": [],
-        "mpc_recovery_active": [],
-        "mpc_recovery_reason": [],
-        "control_update": [],
-        "policy_params": [],
-        "policy_mode": [],
-        "policy_reason": [],
-        "policy_basis": [],
-        "policy_assessment": [],
-        "policy_required_assessment": [],
-        "policy_assessment_consistent": [],
-        "car_policy_params": [],
-        "car_policy_mode": [],
-        "car_policy_reason": [],
-        "car_policy_basis": [],
-        "car_policy_assessment": [],
-        "car_policy_required_assessment": [],
-        "car_policy_assessment_consistent": [],
-        "car_policy_requested_mode": [],
-        "car_safeguard_override": [],
-        "car_offroad": [],
-        "car_offroad_recovery_active": [],
-        "car_offroad_recovery_heading_error": [],
-        "policy_names": resolved_policy_names,
-        "car_alpharacer_weight_paths": [
-            str(getattr(policy, "weight_path", "")) for policy in policies
-        ],
-        "car_alpharacer_weight_parameterizations": [
-            str(getattr(policy, "weight_parameterization", "")) for policy in policies
-        ],
-        "car_ibr_implementations": [
-            str(getattr(policy, "implementation", "")) for policy in policies
-        ],
-        "ibr_implementation": (
-            params.IBR_IMPLEMENTATION
-            if ibr_implementation is None
-            else str(ibr_implementation)
-        ),
-        "llm_model_names": [
-            (
-                params.LLM_MODEL
-                if resolved_policy_names[idx] == "llm_alpharacer" and resolved_llm_model_names[idx] is None
-                else str(resolved_llm_model_names[idx])
-            )
-            if resolved_policy_names[idx] == "llm_alpharacer"
-            else ""
-            for idx in range(num_cars)
-        ],
-        "llm_temperatures": [
-            (
-                params.LLM_TEMPERATURE
-                if resolved_llm_temperatures[idx] is None
-                else float(resolved_llm_temperatures[idx])
-            )
-            if resolved_policy_names[idx] == "llm_alpharacer"
-            else np.nan
-            for idx in range(num_cars)
-        ],
-        "llm_safeguard_enabled": bool(getattr(policies[ego_idx], "safeguard_enabled", False)),
-        "car_llm_safeguard_enabled": [
-            bool(getattr(policy, "safeguard_enabled", False)) for policy in policies
-        ],
-        "llm_update_interval_seconds": (
-            params.LLM_UPDATE_INTERVAL_SECONDS
-            if llm_update_interval_seconds is None
-            else float(llm_update_interval_seconds)
-        ),
-        "ego_index": ego_idx,
-        "ego_position": ego_position,
-        "start_ranks": start_ranks,
-        "start_gap": start_gap,
-        "initial_longitudinal_offsets": initial_longitudinal_offsets.copy(),
-        "initial_lateral_offsets": initial_lateral_offsets.copy(),
-        "initial_speeds": initial_speeds.copy(),
-        "vehicle_model": vehicle_model_type,
-        "velocity_track_weight": mpc_velocity_track_weight,
-        "heading_track_weight": params.HEADING_TRACK_WEIGHT,
-    }
+    trace = create_simulation_trace(
+        resolved_policy_names=resolved_policy_names,
+        policies=policies,
+        ego_idx=ego_idx,
+        ibr_implementation=ibr_implementation,
+        resolved_llm_model_names=resolved_llm_model_names,
+        resolved_llm_temperatures=resolved_llm_temperatures,
+        num_cars=num_cars,
+        llm_update_interval_seconds=llm_update_interval_seconds,
+        ego_position=ego_position,
+        start_ranks=start_ranks,
+        start_gap=start_gap,
+        initial_longitudinal_offsets=initial_longitudinal_offsets,
+        initial_lateral_offsets=initial_lateral_offsets,
+        initial_speeds=initial_speeds,
+        vehicle_model_type=vehicle_model_type,
+        mpc_velocity_track_weight=mpc_velocity_track_weight,
+    )
     ref_component_horizon = max(mpc.horizon for mpc in mpcs) + 1
 
     def ref_component_snapshot(policy, name):
@@ -1002,14 +683,14 @@ def run_simulation(
 
         for car_idx, state in enumerate(states):
             e = car_e[car_idx]
-            active = abs(e) > offroad_half_width
+            active = abs(e) > offroad_recovery_threshold
             heading_error = track_heading_error(track, state.psi, car_s[car_idx])
             offroad_recovery_active.append(active)
             offroad_recovery_heading_error.append(heading_error if active else 0.0)
             if not active:
                 continue
 
-            overshoot = abs(e) - offroad_half_width
+            overshoot = abs(e) - offroad_recovery_threshold
             speed_factor = np.exp(
                 -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
             )
@@ -1041,24 +722,10 @@ def run_simulation(
                 actions[car_idx].throttle += params.OFFROAD_THROTTLE_BOOST
             if state.vx < params.OFFROAD_LOW_SPEED_THRESHOLD:
                 vehicle_params_for_car = vehicle_models[car_idx].p
-                if getattr(vehicle_params_for_car, "ros_kinematic", False):
-                    neutral_throttle = (
-                        vehicle_params_for_car.fr / vehicle_params_for_car.Ta
-                    )
-                else:
-                    throttle_gain = (
-                        vehicle_params_for_car.Ta
-                        - vehicle_params_for_car.Tb * max(state.vx, 0.0)
-                    )
-                    neutral_throttle = (  # maintain velocity
-                        vehicle_params_for_car.fr
-                        * GRAVITY
-                        * vehicle_params_for_car.MASS
-                        / max(throttle_gain, 1.0e-6)
-                    )
+                neutral_command = neutral_throttle(state.vx, vehicle_params_for_car)
                 actions[car_idx].throttle = max(
                     actions[car_idx].throttle,
-                    neutral_throttle + params.OFFROAD_THROTTLE_BOOST,
+                    neutral_command + params.OFFROAD_THROTTLE_BOOST,
                 )
 
             actions[car_idx].steer = float(np.clip(actions[car_idx].steer, -1.0, 1.0))
@@ -1069,166 +736,23 @@ def run_simulation(
         ego_policy = policies[ego_idx]
         ego_mpc = mpcs[ego_idx]
         ego_state = states[ego_idx]
-        ref_traj = ego_policy.last_ref_traj
-        ref_fx, ref_fy = np.nan, np.nan
-        ref_horizon_x = np.full(ego_mpc.horizon + 1, np.nan)
-        ref_horizon_y = np.full(ego_mpc.horizon + 1, np.nan)
-        raceline_horizon_x = np.full(ego_mpc.horizon + 1, np.nan)
-        raceline_horizon_y = np.full(ego_mpc.horizon + 1, np.nan)
-        if ref_traj is not None:
-            if ego_policy.last_ref_world_horizon is not None:
-                ref_horizon_x = ego_policy.last_ref_world_horizon[0].copy()
-                ref_horizon_y = ego_policy.last_ref_world_horizon[1].copy()
-                ref_fx, ref_fy = ref_horizon_x[0], ref_horizon_y[0]
-            else:
-                ref_fx, ref_fy = track.frenet_to_world(ref_traj[0, 0], ref_traj[1, 0])
-                for k in range(ego_mpc.horizon + 1):
-                    ref_horizon_x[k], ref_horizon_y[k] = track.frenet_to_world(ref_traj[0, k], ref_traj[1, k])
-
-            trace["ref_px"].append(ref_traj[0, 0])
-            trace["ref_py"].append(ref_traj[1, 0])
-            trace["ref_speed"].append(ref_traj[2, 0])
-            if ego_policy.last_raceline_world_horizon is not None:
-                raceline_horizon_x = ego_policy.last_raceline_world_horizon[0].copy()
-                raceline_horizon_y = ego_policy.last_raceline_world_horizon[1].copy()
-        else:
-            trace["ref_px"].append(np.nan)
-            trace["ref_py"].append(np.nan)
-            trace["ref_speed"].append(np.nan)
-
-        trace["time"].append(step * params.SIM_DT)
-        trace["x"].append(ego_state.x)
-        trace["y"].append(ego_state.y)
-        trace["psi"].append(ego_state.psi)
-        trace["vx"].append(ego_state.vx)
-        trace["vy"].append(ego_state.vy)
-        trace["omega"].append(ego_state.omega)
-        trace["car_x"].append([state.x for state in states])
-        trace["car_y"].append([state.y for state in states])
-        trace["car_psi"].append([state.psi for state in states])
-        trace["car_vx"].append([state.vx for state in states])
-        trace["car_vy"].append([state.vy for state in states])
-        trace["car_omega"].append([state.omega for state in states])
-        trace["car_px"].append(car_s)
-        trace["car_py"].append(car_e)
-        trace["car_throttle"].append([action.throttle for action in actions])
-        trace["car_steer"].append([action.steer for action in actions])
-        trace["car_mpc_loss"].append([mpc.last_loss for mpc in mpcs])
-        trace["car_mpc_track_loss"].append([mpc.last_track_loss for mpc in mpcs])
-        trace["car_mpc_action_loss"].append([mpc.last_action_loss for mpc in mpcs])
-        trace["car_mpc_velocity_loss"].append([mpc.last_velocity_loss for mpc in mpcs])
-        trace["car_mpc_heading_loss"].append([mpc.last_heading_loss for mpc in mpcs])
-        trace["car_mpc_violation_loss"].append(
-            [mpc.last_violation_loss for mpc in mpcs]
-        )
-        trace["car_mpc_max_track_slack"].append(
-            [
-                float(np.max(mpc.last_track_slack_plan))
-                if mpc.last_track_slack_plan is not None
-                and np.size(mpc.last_track_slack_plan)
-                else np.nan
-                for mpc in mpcs
-            ]
-        )
-        trace["car_mpc_max_collision_slack"].append(
-            [
-                float(np.max(mpc.last_collision_slack_plan))
-                if mpc.last_collision_slack_plan is not None
-                and np.size(mpc.last_collision_slack_plan)
-                else np.nan
-                for mpc in mpcs
-            ]
-        )
-        trace["car_mpc_solver_success"].append([mpc.last_solver_success for mpc in mpcs])
-        trace["car_mpc_solver_status"].append([mpc.last_solver_status for mpc in mpcs])
-        trace["car_mpc_recovery_active"].append([mpc.last_recovery_active for mpc in mpcs])
-        trace["car_mpc_recovery_reason"].append([mpc.last_recovery_reason for mpc in mpcs])
-        # TEMPORARY DIAGNOSTIC: one row per car, one column per MPC step.
-        for trace_key, component_name in (
-            ("car_ref_raceline_e", "raceline_e"),
-            ("car_ref_p_ot_front", "p_ot_front"),
-            ("car_ref_p_ot_rear", "p_ot_rear"),
-            ("car_ref_p_bl", "p_bl"),
-            ("car_ref_p_ref_e", "p_ref_e"),
-        ):
-            trace[trace_key].append(
-                [ref_component_snapshot(policy, component_name) for policy in policies]
-            )
-        trace["px"].append(car_s[ego_idx])
-        trace["py"].append(car_e[ego_idx])
-        trace["ref_x"].append(ref_fx)
-        trace["ref_y"].append(ref_fy)
-        trace["ref_raceline_s"].append(getattr(ego_policy, "last_raceline_s", np.nan))
-        trace["raceline_horizon_x"].append(raceline_horizon_x)
-        trace["raceline_horizon_y"].append(raceline_horizon_y)
-        trace["ref_horizon_x"].append(ref_horizon_x)
-        trace["ref_horizon_y"].append(ref_horizon_y)
-        trace["offroad"].append(abs(car_e[ego_idx]) > offroad_half_width)
-        trace["collision"].append(False)
-        trace["collision_overlap"].append(0.0)
-        trace["throttle"].append(actions[ego_idx].throttle)
-        trace["steer"].append(actions[ego_idx].steer)
-        trace["mpc_loss"].append(ego_mpc.last_loss)
-        trace["mpc_track_loss"].append(ego_mpc.last_track_loss)
-        trace["mpc_action_loss"].append(ego_mpc.last_action_loss)
-        trace["mpc_velocity_loss"].append(ego_mpc.last_velocity_loss)
-        trace["mpc_heading_loss"].append(ego_mpc.last_heading_loss)
-        trace["mpc_violation_loss"].append(ego_mpc.last_violation_loss)
-        trace["mpc_max_track_slack"].append(
-            float(np.max(ego_mpc.last_track_slack_plan))
-            if ego_mpc.last_track_slack_plan is not None
-            and np.size(ego_mpc.last_track_slack_plan)
-            else np.nan
-        )
-        trace["mpc_max_collision_slack"].append(
-            float(np.max(ego_mpc.last_collision_slack_plan))
-            if ego_mpc.last_collision_slack_plan is not None
-            and np.size(ego_mpc.last_collision_slack_plan)
-            else np.nan
-        )
-        trace["mpc_solver_success"].append(ego_mpc.last_solver_success)
-        trace["mpc_solver_status"].append(ego_mpc.last_solver_status)
-        trace["mpc_recovery_active"].append(ego_mpc.last_recovery_active)
-        trace["mpc_recovery_reason"].append(ego_mpc.last_recovery_reason)
-        trace["control_update"].append(control_update)
-        trace["policy_params"].append(getattr(ego_policy, "params", np.full(5, np.nan)).copy())
-        trace["policy_mode"].append(getattr(ego_policy, "current_mode", "fixed"))
-        trace["policy_reason"].append(getattr(ego_policy, "last_llm_reason", ""))
-        trace["policy_basis"].append(getattr(ego_policy, "last_llm_basis", ""))
-        trace["policy_assessment"].append(
-            json.dumps(getattr(ego_policy, "last_llm_assessment", {}), sort_keys=True)
-        )
-        trace["policy_required_assessment"].append(
-            json.dumps(getattr(ego_policy, "last_required_assessment", {}), sort_keys=True)
-        )
-        trace["policy_assessment_consistent"].append(
-            getattr(ego_policy, "last_assessment_consistent", True)
-        )
-        trace["car_policy_params"].append(
-            [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
-        )
-        trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
-        trace["car_policy_reason"].append([getattr(policy, "last_llm_reason", "") for policy in policies])
-        trace["car_policy_basis"].append([getattr(policy, "last_llm_basis", "") for policy in policies])
-        trace["car_policy_assessment"].append(
-            [json.dumps(getattr(policy, "last_llm_assessment", {}), sort_keys=True) for policy in policies]
-        )
-        trace["car_policy_required_assessment"].append(
-            [json.dumps(getattr(policy, "last_required_assessment", {}), sort_keys=True) for policy in policies]
-        )
-        trace["car_policy_assessment_consistent"].append(
-            [getattr(policy, "last_assessment_consistent", True) for policy in policies]
-        )
-        trace["car_policy_requested_mode"].append(
-            [getattr(policy, "last_llm_requested_mode", "") for policy in policies]
-        )
-        trace["car_safeguard_override"].append(
-            [getattr(policy, "last_safeguard_override", "") for policy in policies]
-        )
-        trace["car_offroad"].append([abs(error) > offroad_half_width for error in car_e])
-        trace["car_offroad_recovery_active"].append(offroad_recovery_active)
-        trace["car_offroad_recovery_heading_error"].append(
-            offroad_recovery_heading_error
+        ref_fx, ref_fy = record_simulation_step(
+            trace,
+            step=step,
+            track=track,
+            policies=policies,
+            mpcs=mpcs,
+            states=states,
+            actions=actions,
+            car_s=car_s,
+            car_e=car_e,
+            ego_idx=ego_idx,
+            track_half_width=track_half_width,
+            offroad_recovery_threshold=offroad_recovery_threshold,
+            control_update=control_update,
+            offroad_recovery_active=offroad_recovery_active,
+            offroad_recovery_heading_error=offroad_recovery_heading_error,
+            ref_component_snapshot=ref_component_snapshot,
         )
 
         if (step + 1) % ref_debug_sample_steps == 0 and ego_policy.last_ref_traj is not None:
@@ -1374,32 +898,46 @@ def run_simulation(
     for policy in policies:
         policy.flush_solver_warnings(sim_time=final_time)
 
-    # Save the latest five actual LLM calls per car. Padding keeps these as
-    # regular string arrays that np.load can read without allow_pickle=True.
-    raw_histories = [getattr(policy, "llm_raw_io_history", [])[-5:] for policy in policies]
+    # Save every actual LLM call. Padding keeps per-car histories rectangular
+    # when a race mixes LLM and non-LLM policies.
+    raw_histories = [getattr(policy, "llm_raw_io_history", []) for policy in policies]
+    max_raw_calls = max((len(history) for history in raw_histories), default=0)
     trace["llm_raw_call_indices"] = [
-        [-1] * (5 - len(history)) + [item["call"] for item in history]
+        [-1] * (max_raw_calls - len(history)) + [item["call"] for item in history]
         for history in raw_histories
     ]
     trace["llm_raw_prompts"] = [
-        [""] * (5 - len(history)) + [item["prompt"] for item in history]
+        [""] * (max_raw_calls - len(history)) + [item["prompt"] for item in history]
         for history in raw_histories
     ]
     trace["llm_raw_responses"] = [
-        [""] * (5 - len(history)) + [item["response"] for item in history]
+        [""] * (max_raw_calls - len(history)) + [item["response"] for item in history]
         for history in raw_histories
     ]
     trace["llm_raw_errors"] = [
-        [""] * (5 - len(history)) + [item["error"] for item in history]
+        [""] * (max_raw_calls - len(history)) + [item["error"] for item in history]
         for history in raw_histories
     ]
     trace["llm_raw_done_reasons"] = [
-        [""] * (5 - len(history)) + [item.get("done_reason", "") for item in history]
+        [""] * (max_raw_calls - len(history)) + [item.get("done_reason", "") for item in history]
         for history in raw_histories
     ]
     trace["llm_raw_eval_counts"] = [
-        [-1] * (5 - len(history)) + [item.get("eval_count", -1) for item in history]
+        [-1] * (max_raw_calls - len(history)) + [item.get("eval_count", -1) for item in history]
         for history in raw_histories
+    ]
+    trace["llm_raw_prompt_eval_counts"] = [
+        [-1] * (max_raw_calls - len(history))
+        + [item.get("prompt_eval_count", -1) for item in history]
+        for history in raw_histories
+    ]
+    trace["llm_raw_latency_seconds"] = [
+        [np.nan] * (max_raw_calls - len(history))
+        + [item.get("latency_seconds", np.nan) for item in history]
+        for history in raw_histories
+    ]
+    trace["car_policy_decision_counts"] = [
+        int(getattr(policy, "policy_decision_count", 0)) for policy in policies
     ]
 
     if save_trace:
@@ -1449,6 +987,46 @@ def run_simulation(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the default racer simulation scenario.")
     parser.add_argument(
+        "--policies",
+        nargs="+",
+        default=["LLM", "ibr", "ibr"],
+        help="One policy per car, e.g. --policies ibr ibr ibr.",
+    )
+    parser.add_argument(
+        "--ibr-implementation",
+        choices=["local_wang", "historical_strict"],
+        default="local_wang",
+        help="IBR solver implementation (default: local_wang).",
+    )
+    parser.add_argument(
+        "--ibr-se",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable sensitivity enhancement with config.IBR_SE_DEFAULT_WEIGHT. "
+            "Ordinary IBR without SE is the default."
+        ),
+    )
+    parser.add_argument(
+        "--ibr-sensitivity-weight",
+        type=float,
+        default=None,
+        metavar="ALPHA",
+        help="Explicit SE weight; 0 selects ordinary IBR and overrides --ibr-se.",
+    )
+    parser.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=3)
+    parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
+    parser.add_argument("--start-gap", type=float, default=None, metavar="METERS")
+    parser.add_argument(
+        "--initial-speeds",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="MPS",
+        help="Initial speed for each car, in the same order as --policies.",
+    )
+    parser.add_argument("--no-plot", action="store_true", help="Do not open the result plot.")
+    parser.add_argument(
         "--llm-safeguard",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1456,19 +1034,36 @@ if __name__ == "__main__":
     )
     cli_args = parser.parse_args()
 
+    if cli_args.ibr_sensitivity_weight is not None:
+        if cli_args.ibr_sensitivity_weight < 0.0:
+            parser.error("--ibr-sensitivity-weight must be non-negative")
+        params.IBR_SENSITIVITY_WEIGHT = cli_args.ibr_sensitivity_weight
+    elif cli_args.ibr_se:
+        params.IBR_SENSITIVITY_WEIGHT = params.IBR_SE_DEFAULT_WEIGHT
+    else:
+        params.IBR_SENSITIVITY_WEIGHT = 0.0
+
     # Options: "centerline", "alpharacer" (trained potential), "static_alpharacer",
     # "ibr", or "llm_alpharacer". "weighted_alpharacer" aliases "alpharacer".
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
-    # .venv/bin/python main.py --policies LLM ibr ib
+    # Ordinary IBR (default, no SE):
+    # .venv/bin/python simulation.py --policies ibr ibr ibr --no-plot
+    # Optional SE-IBR:
+    # .venv/bin/python simulation.py --policies ibr ibr ibr --ibr-se --no-plot
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".
-        policy_names=["LLM", "ibr", "ibr"],  # ego, oppo1, oppo2
+        policy_names=cli_args.policies,
         # policy_names=["LLM", "alpharacer", "alpharacer"],  # ego, oppo1, oppo2
         llm_model_names=["qwen2.5:7b", None, None],
-        vehicle_model_type="kinematic", ego_position=3,
+        vehicle_model_type="kinematic", ego_position=cli_args.ego_position,
+        ibr_implementation=cli_args.ibr_implementation,
+        total_time=cli_args.total_time,
+        start_gap=cli_args.start_gap,
+        initial_speeds=cli_args.initial_speeds,
+        show_plot=not cli_args.no_plot,
         llm_temperature = 0.0,
         llm_safeguard_enabled=False,
     )

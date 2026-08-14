@@ -6,6 +6,7 @@ import numpy as np
 from config import GRAVITY, params as sim_params
 from state import CarAction, CarState
 from track import RaceLine
+from vehicle_model import kinematic_frenet_step, minimum_reachable_speed, neutral_throttle
 
 from .base import BasePolicy
 from .utils import progress_delta, track_curvature_at, track_heading_error
@@ -25,18 +26,14 @@ class _StrictIBRSolver:
     """
 
     def __init__(
-        self, *, horizon=10, dt=0.1, iterations=3, wheelbase=0.36,
-        steer_scale=0.36, throttle_gain=20.0 / 4.65, friction=1.0,
+        self, *, vehicle_params, horizon=10, dt=0.1, iterations=3,
         mu=1.6, gravity=9.81, use_upstream_collision_expression=True,
         lateral_half_width=None,
     ):
+        self.p = vehicle_params
         self.horizon = int(horizon)
         self.dt = float(dt)
         self.iterations = int(iterations)
-        self.wheelbase = float(wheelbase)
-        self.steer_scale = float(steer_scale)
-        self.throttle_gain = float(throttle_gain)
-        self.friction = float(friction)
         self.mu = float(mu)
         self.gravity = float(gravity)
         self.use_upstream_collision_expression = bool(
@@ -48,17 +45,14 @@ class _StrictIBRSolver:
         self._build_solver()
 
     def _vehicle_dynamics(self, xk, uk, curvature):
-        s, e, psi, v = xk[0], xk[1], xk[2], xk[3]
-        a, delta = uk[0], uk[1]
-        denom = 1.0 - e * curvature
-        return cs.vertcat(
-            s + (v * cs.cos(psi)) / denom * self.dt,
-            e + v * cs.sin(psi) * self.dt,
-            psi + (
-                (v / self.wheelbase) * cs.tan(self.steer_scale * delta)
-                - v * curvature
-            ) * self.dt,
-            v + (self.throttle_gain * a - self.friction) * self.dt,
+        return kinematic_frenet_step(
+            xk,
+            uk,
+            curvature,
+            self.dt,
+            self.p,
+            curvature_mode="upstream_approx",
+            symbolic=True,
         )
 
     def _build_solver(self):
@@ -138,8 +132,9 @@ class _StrictIBRSolver:
         speed_start = friction_start + n
         collision_start = speed_start + n
         lateral_start = collision_start + n
-        lbg[friction_start:speed_start] = -self.mu * self.gravity * self.wheelbase
-        ubg[friction_start:speed_start] = self.mu * self.gravity * self.wheelbase
+        wheelbase = self.p.LF + self.p.LR
+        lbg[friction_start:speed_start] = -self.mu * self.gravity * wheelbase
+        ubg[friction_start:speed_start] = self.mu * self.gravity * wheelbase
         ubg[speed_start:collision_start] = 1.04 * float(target_speed)
         lbg[collision_start:lateral_start] = 0.04
         ubg[collision_start:lateral_start] = 500000.0
@@ -217,6 +212,11 @@ class _WangIBRSolver:
     where ``mu_j`` is the opponent collision-constraint multiplier from its
     latest best response.  Setting ``sensitivity_weight=0`` gives ordinary
     IBR with exactly the same dynamics, constraints, and iteration order.
+
+    EXPERIMENTAL: the local soft collision constraint makes its multiplier
+    depend directly on the slack penalty (lambda ~= 2*rho*slack when active).
+    Therefore positive sensitivity weights are not used in the primary paper
+    experiments unless that coupling is explicitly resolved and validated.
     """
 
     def __init__(
@@ -225,16 +225,9 @@ class _WangIBRSolver:
         horizon,
         dt,
         iterations,
-        wheelbase,
-        steer_scale,
-        throttle_gain,
-        throttle_speed_gain,
-        mass,
-        ros_kinematic,
-        friction,
+        vehicle_params,
         mu,
         gravity,
-        steer_bias,
         lateral_half_width,
         collision_longitudinal,
         collision_lateral,
@@ -242,6 +235,8 @@ class _WangIBRSolver:
         sensitivity_weight,
         track_slack_weight,
         collision_slack_weight,
+        allow_track_slack,
+        allow_collision_slack,
         progress_weight,
         lateral_weight,
         heading_weight,
@@ -251,23 +246,18 @@ class _WangIBRSolver:
         convergence_tolerance,
         max_steer_delta,
         max_speed,
+        speed_cap_mode,
+        raceline_speed_cap_factor,
         enforce_track_boundary,
         enforce_collision_avoidance,
         enforce_friction_speed_limit,
     ):
+        self.p = vehicle_params
         self.horizon = int(horizon)
         self.dt = float(dt)
         self.iterations = int(iterations)
-        self.wheelbase = float(wheelbase)
-        self.steer_scale = float(steer_scale)
-        self.throttle_gain = float(throttle_gain)
-        self.throttle_speed_gain = float(throttle_speed_gain)
-        self.mass = float(mass)
-        self.ros_kinematic = bool(ros_kinematic)
-        self.friction = float(friction)
         self.mu = float(mu)
         self.gravity = float(gravity)
-        self.steer_bias = float(steer_bias)
         self.lateral_half_width = float(lateral_half_width)
         self.collision_longitudinal = float(collision_longitudinal)
         self.collision_lateral = float(collision_lateral)
@@ -275,6 +265,8 @@ class _WangIBRSolver:
         self.sensitivity_weight = max(float(sensitivity_weight), 0.0)
         self.track_slack_weight = float(track_slack_weight)
         self.collision_slack_weight = float(collision_slack_weight)
+        self.allow_track_slack = bool(allow_track_slack)
+        self.allow_collision_slack = bool(allow_collision_slack)
         self.progress_weight = float(progress_weight)
         self.lateral_weight = float(lateral_weight)
         self.heading_weight = float(heading_weight)
@@ -284,34 +276,24 @@ class _WangIBRSolver:
         self.convergence_tolerance = max(float(convergence_tolerance), 0.0)
         self.max_steer_delta = max(float(max_steer_delta), 0.0)
         self.max_speed = float(max_speed)
+        self.speed_cap_mode = str(speed_cap_mode)
+        self.raceline_speed_cap_factor = float(raceline_speed_cap_factor)
+        if self.speed_cap_mode not in {"global", "raceline"}:
+            raise ValueError("IBR speed_cap_mode must be 'global' or 'raceline'")
         self.enforce_track_boundary = bool(enforce_track_boundary)
         self.enforce_collision_avoidance = bool(enforce_collision_avoidance)
         self.enforce_friction_speed_limit = bool(enforce_friction_speed_limit)
         self._build_solver()    # build CasADi solver for the IBR MPC problem
 
     def _vehicle_dynamics(self, xk, uk, curvature):
-        s = xk[0]
-        e = xk[1]
-        psi = xk[2]
-        v = xk[3]
-        a = uk[0]
-        delta = uk[1]
-        denom = 1.0 - e * curvature     # denominator for curvature correction
-        if self.ros_kinematic:
-            acceleration = self.throttle_gain * a - self.friction
-        else:
-            throttle_force = (
-                self.throttle_gain * a - self.throttle_speed_gain * a * v
-            )
-            acceleration = throttle_force / self.mass - self.friction * self.gravity
-        return cs.vertcat(
-            s + (v * cs.cos(psi)) / denom * self.dt,
-            e + v * cs.sin(psi) * self.dt,
-            psi + (
-                (v / self.wheelbase) * cs.tan(self.steer_scale * delta + self.steer_bias)
-                - (v * cs.cos(psi) * curvature) / denom
-            ) * self.dt,
-            v + acceleration * self.dt,
+        return kinematic_frenet_step(
+            xk,
+            uk,
+            curvature,
+            self.dt,
+            self.p,
+            curvature_mode="geometric",
+            symbolic=True,
         )
 
     def _build_solver(self):
@@ -321,6 +303,7 @@ class _WangIBRSolver:
         x0 = cs.MX.sym("x0", 4)
         curvature = cs.MX.sym("curvature", n)
         target_speed = cs.MX.sym("target_speed", 1)
+        neutral_control = cs.MX.sym("neutral_control", 2)
         opp_s = cs.MX.sym("opp_s", n + 1)
         opp_e = cs.MX.sym("opp_e", n + 1)
         se_gradient = cs.MX.sym("se_gradient", 2, n + 1)
@@ -331,17 +314,20 @@ class _WangIBRSolver:
 
         cost = 0
         g = [x[:, 0] - x0]  # constraint
-        r = np.diag([self.control_weight, self.control_weight])
+        identity = np.eye(2)
 
         for k in range(n):
             g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))  # kinematic constraints
             cost += self.lateral_weight * x[1, k] ** 2
             cost += self.heading_weight * x[2, k] ** 2
             cost += self.speed_weight * (x[3, k] - target_speed) ** 2
+            # Absolute effort is measured relative to the command that holds
+            # the reference speed and drives straight. This avoids treating
+            # drag compensation as strategically meaningful acceleration.
+            effort = u[:, k] - neutral_control
+            cost += self.control_weight * cs.mtimes([effort.T, identity, effort])
             du = u[:, k] - (u_prev if k == 0 else u[:, k - 1])
-            # Match MPCController's action regularization: penalize changes
-            # from the previously executed command, not absolute actuation.
-            cost += self.control_rate_weight * cs.mtimes([du.T, r, du])
+            cost += self.control_rate_weight * cs.mtimes([du.T, identity, du])
 
         cost += -self.progress_weight * (x[0, n] - x[0, 0])
         cost += self.track_slack_weight * cs.dot(track_slack, track_slack)
@@ -380,7 +366,7 @@ class _WangIBRSolver:
         )
         constraints = cs.vertcat(*g)
         params = cs.vertcat(
-            x0, curvature, target_speed, opp_s, opp_e,
+            x0, curvature, target_speed, neutral_control, opp_s, opp_e,
             cs.reshape(se_gradient, -1, 1), cs.reshape(se_anchor, -1, 1),
             u_prev,
         )
@@ -413,10 +399,7 @@ class _WangIBRSolver:
 
     def _neutral_throttle(self, speed):
         """Throttle that approximately maintains speed in MPC dynamics."""
-        if self.ros_kinematic:
-            return self.friction / max(self.throttle_gain, 1.0e-6)
-        gain = self.throttle_gain - self.throttle_speed_gain * max(float(speed), 0.0)
-        return self.friction * self.gravity * self.mass / max(gain, 1.0e-6)
+        return neutral_throttle(speed, self.p)
 
     def _solve_best_response(
         self, x0, opponent_plan, curvature, target_speed,
@@ -430,7 +413,7 @@ class _WangIBRSolver:
             x_init[:, 0] = np.asarray(x0, dtype=float)
         u_init = np.zeros((2, n))
         u_init[0, :] = np.clip(self._neutral_throttle(x_init[3, 0]), -1.0, 1.0)
-        u_init[1, :] = np.clip(-self.steer_bias / max(self.steer_scale, 1e-6), -1.0, 1.0)
+        u_init[1, :] = np.clip(-self.p.Sb / max(self.p.Sa, 1e-6), -1.0, 1.0)
         initial_track_slack = np.maximum(
             np.abs(x_init[1, 1:]) - self.lateral_half_width, 0.0
         ) + 1.0e-4
@@ -451,9 +434,13 @@ class _WangIBRSolver:
         if previous_control is None:
             previous_control = np.asarray([
                 self._neutral_throttle(x0[3]),
-                -self.steer_bias / max(self.steer_scale, 1e-6),
+                -self.p.Sb / max(self.p.Sa, 1e-6),
             ])
         previous_control = np.asarray(previous_control, dtype=float)
+        neutral_control = np.asarray(
+            [self._neutral_throttle(target_speed), -self.p.Sb / max(self.p.Sa, 1e-6)],
+            dtype=float,
+        )
         se_gradient = self._collision_sensitivity(
             x_init, opponent_plan, opponent_multipliers
         )
@@ -462,6 +449,7 @@ class _WangIBRSolver:
                 np.asarray(x0, dtype=float),
                 np.asarray(curvature, dtype=float),
                 np.array([float(target_speed)]),
+                neutral_control,
                 np.asarray(opponent_plan[0], dtype=float),
                 np.asarray(opponent_plan[1], dtype=float),
                 se_gradient.T.reshape(-1),
@@ -478,16 +466,27 @@ class _WangIBRSolver:
         collision_start = boundary_start + 2 * n
         steer_rate_start = collision_start + n
         if self.enforce_friction_speed_limit:
-            lbg[friction_start:speed_start] = -self.mu * self.gravity * self.wheelbase
-            ubg[friction_start:speed_start] = self.mu * self.gravity * self.wheelbase
+            wheelbase = self.p.LF + self.p.LR
+            lbg[friction_start:speed_start] = -self.mu * self.gravity * wheelbase
+            ubg[friction_start:speed_start] = self.mu * self.gravity * wheelbase
         else:
             lbg[friction_start:speed_start] = -np.inf
             ubg[friction_start:speed_start] = np.inf
-        # Raceline speed is a tracking target, not an instantaneously
-        # enforceable state bound.  Using it as a hard upper bound makes the
-        # NLP infeasible whenever the measured car enters a slower segment
-        # faster than it can physically decelerate in one control step.
-        ubg[speed_start:boundary_start] = self.max_speed
+        speed_cap = self.max_speed
+        if self.speed_cap_mode == "raceline":
+            # A raw v <= factor*v_ref bound can be infeasible when the measured
+            # car reaches a slower segment faster than it can brake in one
+            # discrete step.  Keep the desired cap, but never demand a next
+            # state below what full braking can physically reach.  Recomputing
+            # this bound each MPC update makes the cap tighten progressively.
+            speed_cap = min(
+                self.max_speed,
+                max(
+                    self.raceline_speed_cap_factor * float(target_speed),
+                    minimum_reachable_speed(x0[3], self.dt, self.p),
+                ),
+            )
+        ubg[speed_start:boundary_start] = speed_cap
         lbg[boundary_start:] = -np.inf
         ubg[boundary_start:] = 0.0
         if not self.enforce_track_boundary:
@@ -505,6 +504,13 @@ class _WangIBRSolver:
             ubx[u_start + 2 * k:u_start + 2 * k + 2] = [1.0, 1.0]
         slack_start = self.n_x + self.n_u
         lbx[slack_start:] = 0.0
+        track_slack_end = slack_start + self.n_track_slack
+        if not self.allow_track_slack:
+            ubx[slack_start:track_slack_end] = 0.0
+            initial_guess[slack_start:track_slack_end] = 0.0
+        if not self.allow_collision_slack:
+            ubx[track_slack_end:] = 0.0
+            initial_guess[track_slack_end:] = 0.0
 
         solution = self.solver(
             x0=initial_guess, lbx=lbx, ubx=ubx,
@@ -516,11 +522,40 @@ class _WangIBRSolver:
         opt = solution["x"].full().flatten()
         state_plan = opt[: self.n_x].reshape(n + 1, 4).T
         control_plan = opt[self.n_x : self.n_x + self.n_u].reshape(n, 2).T
+        collision_slack_start = self.n_x + self.n_u + self.n_track_slack
+        track_slack_plan = opt[
+            self.n_x + self.n_u : self.n_x + self.n_u + self.n_track_slack
+        ]
+        collision_slack_plan = opt[
+            collision_slack_start : collision_slack_start + self.n_collision_slack
+        ]
         # CasADi uses L = f + lam_g*g for our gamma <= 0 constraint, so the
         # non-negative collision multipliers are directly usable in Eq. (19).
         lam_g = solution["lam_g"].full().flatten()
         collision_multipliers = np.maximum(lam_g[collision_start:collision_start + n], 0.0)
-        return state_plan, control_plan, collision_multipliers
+        ds = (state_plan[0, 1:] - opponent_plan[0, 1:]) / self.collision_longitudinal
+        de = (state_plan[1, 1:] - opponent_plan[1, 1:]) / self.collision_lateral
+        raw_collision_constraint = (
+            1.0 - ds ** self.collision_exponent - de ** self.collision_exponent
+        )
+        diagnostics = {
+            "track_slack": track_slack_plan,
+            "collision_slack": collision_slack_plan,
+            "collision_multipliers": collision_multipliers,
+            "max_collision_constraint": float(np.max(raw_collision_constraint)),
+            "min_predicted_longitudinal_distance": float(
+                np.min(np.abs(state_plan[0, 1:] - opponent_plan[0, 1:]))
+            ),
+            "min_predicted_lateral_distance": float(
+                np.min(np.abs(state_plan[1, 1:] - opponent_plan[1, 1:]))
+            ),
+            "sensitivity_gradient_norm": float(np.linalg.norm(se_gradient)),
+            "sensitivity_loss": float(
+                -self.sensitivity_weight
+                * np.sum(se_gradient * (state_plan[:2, :] - x_init[:2, :]))
+            ),
+        }
+        return state_plan, control_plan, collision_multipliers, diagnostics
 
     def solve_pair(
         self, neighbor_x0, own_x0, neighbor_curvature, own_curvature,
@@ -540,18 +575,20 @@ class _WangIBRSolver:
         neighbor_control_plan = np.zeros((2, n))
         own_multipliers = np.zeros(n)
         neighbor_multipliers = np.zeros(n)
+        own_diagnostics = {}
+        neighbor_diagnostics = {}
 
         # Algorithm 1: complete ego/opponent rounds, followed by a final ego
         # solve so the executed command always reflects the latest opponent BR.
         for _ in range(self.iterations):
             previous_own = own_state_plan.copy()
-            own_state_plan, own_control_plan, own_multipliers = self._solve_best_response(
+            own_state_plan, own_control_plan, own_multipliers, own_diagnostics = self._solve_best_response(
                 own_x0, neighbor_state_plan[:2], own_curvature, own_speed,
                 initial_plan=own_state_plan,
                 opponent_multipliers=neighbor_multipliers,
                 previous_control=own_previous_control,
             )
-            neighbor_state_plan, neighbor_control_plan, neighbor_multipliers = self._solve_best_response(
+            neighbor_state_plan, neighbor_control_plan, neighbor_multipliers, neighbor_diagnostics = self._solve_best_response(
                 neighbor_x0, own_state_plan[:2], neighbor_curvature, neighbor_speed,
                 initial_plan=neighbor_state_plan,
                 opponent_multipliers=own_multipliers,
@@ -560,7 +597,7 @@ class _WangIBRSolver:
             if np.max(np.abs(own_state_plan[:2] - previous_own[:2])) <= self.convergence_tolerance:
                 break
 
-        own_state_plan, own_control_plan, own_multipliers = self._solve_best_response(
+        own_state_plan, own_control_plan, own_multipliers, own_diagnostics = self._solve_best_response(
             own_x0, neighbor_state_plan[:2], own_curvature, own_speed,
             initial_plan=own_state_plan,
             opponent_multipliers=neighbor_multipliers,
@@ -579,6 +616,8 @@ class _WangIBRSolver:
             "neighbor_control_plan": neighbor_control_plan,
             "neighbor_action": neighbor_u,
             "collision_multipliers": own_multipliers,
+            "diagnostics": own_diagnostics,
+            "neighbor_diagnostics": neighbor_diagnostics,
         }
 
 
@@ -643,13 +682,10 @@ class IteratedBestResponsePolicy(BasePolicy):
                 )
         if self.implementation == "historical_strict":
             self.ibr_solver = _StrictIBRSolver(
+                vehicle_params=self.mpc.p,
                 horizon=solver_horizon,
                 dt=self.mpc.dt,
                 iterations=sim_params.IBR_HISTORICAL_ITERATIONS,
-                wheelbase=self.mpc.p.LF + self.mpc.p.LR,
-                steer_scale=self.mpc.p.Sa,
-                throttle_gain=self.mpc.p.Ta,
-                friction=self.mpc.p.fr,
                 mu=sim_params.IBR_HISTORICAL_FRICTION_COEFFICIENT,
                 gravity=GRAVITY,
                 use_upstream_collision_expression=True,
@@ -658,17 +694,10 @@ class IteratedBestResponsePolicy(BasePolicy):
             self.iterations = self.ibr_solver.iterations
         else:
             self.ibr_solver = _WangIBRSolver(
+                vehicle_params=self.mpc.p,
                 horizon=solver_horizon,
                 dt=self.mpc.dt,
                 iterations=self.iterations,
-                wheelbase=self.mpc.p.LF + self.mpc.p.LR,
-                steer_scale=self.mpc.p.Sa,
-                steer_bias=self.mpc.p.Sb,
-                throttle_gain=self.mpc.p.Ta,
-                throttle_speed_gain=self.mpc.p.Tb,
-                mass=self.mpc.p.MASS,
-                ros_kinematic=self.mpc.p.ros_kinematic,
-                friction=self.mpc.p.fr,
                 lateral_half_width=float(lateral_half_width),
                 collision_longitudinal=collision_longitudinal,
                 collision_lateral=collision_lateral,
@@ -683,10 +712,14 @@ class IteratedBestResponsePolicy(BasePolicy):
                 convergence_tolerance=sim_params.IBR_CONVERGENCE_TOLERANCE,
                 track_slack_weight=self.mpc.track_slack_weight,
                 collision_slack_weight=self.mpc.collision_slack_weight,
+                allow_track_slack=sim_params.IBR_ALLOW_TRACK_SLACK,
+                allow_collision_slack=sim_params.IBR_ALLOW_COLLISION_SLACK,
                 gravity=GRAVITY,
                 mu=self.mpc.friction_coefficient,
                 max_steer_delta=self.mpc.max_steer_delta,
                 max_speed=self.mpc.max_speed,
+                speed_cap_mode=sim_params.IBR_SPEED_CAP_MODE,
+                raceline_speed_cap_factor=sim_params.IBR_RACELINE_SPEED_CAP_FACTOR,
                 enforce_track_boundary=self.mpc.enforce_track_boundary,
                 enforce_collision_avoidance=self.mpc.enforce_collision_avoidance,
                 enforce_friction_speed_limit=self.mpc.enforce_friction_speed_limit,
@@ -701,6 +734,7 @@ class IteratedBestResponsePolicy(BasePolicy):
         self._ibr_failure_count = 0
         self._ibr_failure_start_time = None
         self._ibr_last_failure = None
+        self.last_ibr_diagnostics = {}
 
     def _report_ibr_failure(self, exc, sim_time=None):
         self._ibr_failure_count += 1
@@ -829,6 +863,7 @@ class IteratedBestResponsePolicy(BasePolicy):
         self.mpc.last_recovery_active = False
         self.mpc.last_recovery_reason = ""
         self.mpc.last_control_plan = result["control_plan"]
+        self.last_ibr_diagnostics = dict(result.get("diagnostics", {}))
 
         if result["state_plan"] is not None:
             plan = result["state_plan"][:2, :]

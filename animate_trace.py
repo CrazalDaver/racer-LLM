@@ -227,16 +227,14 @@ def make_animation(
         if "track_half_width" in data.files
         else getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     )
-    offroad_tolerance = (
-        float(np.asarray(data["offroad_tolerance"]).item())
-        if "offroad_tolerance" in data.files
-        else getattr(params, "OFFROAD_TOLERANCE", 0.0)
-    )
-    offroad_half_width = (
-        float(np.asarray(data["offroad_half_width"]).item())
-        if "offroad_half_width" in data.files
-        else track_half_width + offroad_tolerance
-    )
+    if "offroad_recovery_threshold" in data.files:
+        offroad_half_width = float(
+            np.asarray(data["offroad_recovery_threshold"]).item()
+        )
+    elif "offroad_half_width" in data.files:  # compatibility with old traces
+        offroad_half_width = float(np.asarray(data["offroad_half_width"]).item())
+    else:
+        offroad_half_width = params.OFFROAD_RECOVERY_THRESHOLD
     offroad = data["offroad"] if "offroad" in data.files else np.abs(py) > offroad_half_width
     car_offroad = data["car_offroad"] if "car_offroad" in data.files else None
     collision = data["collision"] if "collision" in data.files else np.zeros_like(offroad, dtype=bool)

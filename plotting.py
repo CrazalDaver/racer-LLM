@@ -219,7 +219,7 @@ def plot_simulation_results(
     heading_track_weight=None,
 ):
     half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
-    offroad_half_width = half_width + getattr(params, "OFFROAD_TOLERANCE", 0.0)
+    offroad_half_width = params.OFFROAD_RECOVERY_THRESHOLD
     dt = params.SIM_DT
 
     fig, axes = plt.subplots(4, 2, figsize=(14, 17), constrained_layout=True)
@@ -459,14 +459,21 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         if "track_half_width" in data.files
         else track_width / 2.0
     )
-    offroad_tolerance = float(np.asarray(data["offroad_tolerance"]).item()) if "offroad_tolerance" in data.files else 0.0
+    if "offroad_recovery_threshold" in data.files:
+        offroad_recovery_threshold = float(
+            np.asarray(data["offroad_recovery_threshold"]).item()
+        )
+    elif "offroad_half_width" in data.files:  # compatibility with old traces
+        offroad_recovery_threshold = float(np.asarray(data["offroad_half_width"]).item())
+    else:
+        offroad_recovery_threshold = 0.55
     track_length = float(np.asarray(data["track_length"]).item()) if "track_length" in data.files else None
     params = SimpleNamespace(
         DT=dt,
         SIM_DT=dt,
         TRACK_WIDTH=track_width,
         TRACK_HALF_WIDTH=track_half_width,
-        OFFROAD_TOLERANCE=offroad_tolerance,
+        OFFROAD_RECOVERY_THRESHOLD=offroad_recovery_threshold,
     )
     velocity_track_weight = (
         float(np.asarray(data["velocity_track_weight"]).item())

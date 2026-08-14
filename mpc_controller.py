@@ -1,4 +1,5 @@
 from config import GRAVITY
+from vehicle_model import kinematic_global_step
 
 import numpy as np
 import casadi as cs
@@ -137,45 +138,12 @@ class MPCController:
         self._build_problem()
 
     def _vehicle_dynamics(self, xk, uk):
-        x, y, psi, v = xk[0], xk[1], xk[2], xk[3]
-        target_vel = uk[0]
-        target_steer = uk[1]
-        wheelbase = self.p.LF + self.p.LR
-        actual_steer = target_steer * self.p.Sa + self.p.Sb
-        if getattr(self.p, "ros_kinematic", False):
-            acceleration = target_vel * self.p.Ta - self.p.fr
-        else:
-            throttle_force = target_vel * self.p.Ta - target_vel * self.p.Tb * v
-            acceleration = throttle_force / self.p.MASS - self.p.fr * GRAVITY
-
-        return cs.vertcat(
-            x + v * cs.cos(psi) * self.dt,
-            y + v * cs.sin(psi) * self.dt,
-            psi + (v / wheelbase) * cs.tan(actual_steer) * self.dt,
-            v + acceleration * self.dt,
+        return kinematic_global_step(
+            xk, uk, self.dt, self.p, symbolic=True
         )
 
     def _vehicle_dynamics_np(self, xk, uk):
-        x, y, psi, v = xk[0], xk[1], xk[2], xk[3]
-        target_vel = uk[0]
-        target_steer = uk[1]
-        wheelbase = self.p.LF + self.p.LR
-        actual_steer = target_steer * self.p.Sa + self.p.Sb
-        if getattr(self.p, "ros_kinematic", False):
-            acceleration = target_vel * self.p.Ta - self.p.fr
-        else:
-            throttle_force = target_vel * self.p.Ta - target_vel * self.p.Tb * v
-            acceleration = throttle_force / self.p.MASS - self.p.fr * GRAVITY
-
-        return np.array(
-            [
-                x + v * np.cos(psi) * self.dt,
-                y + v * np.sin(psi) * self.dt,
-                psi + (v / wheelbase) * np.tan(actual_steer) * self.dt,
-                v + acceleration * self.dt,
-            ],
-            dtype=float,
-        )
+        return kinematic_global_step(xk, uk, self.dt, self.p)
 
     def _make_x0_mpc(self, x0):
         return np.array([x0[0], x0[1], wrap_angle(x0[2]), max(x0[3], 0.0)], dtype=float)

@@ -135,7 +135,12 @@ class SimParams:
     # It progressively limits steering at high speed using a friction proxy.
     MPC_ENFORCE_FRICTION_SPEED_LIMIT = True
     MPC_FRICTION_COEFFICIENT = 1.6
-    OFFROAD_TOLERANCE = 0.05
+    # Numerical-simulator recovery threshold.  This is deliberately separate
+    # from TRACK_HALF_WIDTH: the alpha-RACER paper defines recovery outside the
+    # track boundary, while the released Berlin simulation uses |e| > 0.55 m.
+    # Keeping the implementation threshold explicit avoids presenting the
+    # difference as a geometric "tolerance" derived by the model.
+    OFFROAD_RECOVERY_THRESHOLD = 0.55
     # Released alpha-RACER numerical-simulation recovery, calibrated per
     # CONTROL_DT.  For overshoot d, the upstream code applies:
     #   v *= exp(-3 d)
@@ -258,11 +263,27 @@ class SimParams:
     IBR_SENSITIVITY_WEIGHT = 0.0
     IBR_SE_DEFAULT_WEIGHT = 0.05
     IBR_PROGRESS_WEIGHT = 10.0
+    # IBR objective audit (2026-08): progress is the Wang-style racing
+    # objective. The lateral term is the only retained local execution
+    # regularizer: the six-scenario ablation found that q_e*e^2 removed
+    # boundary violations without reducing progress or collision performance.
+    # Heading and speed tracking were not needed and remain disabled.
     IBR_LATERAL_WEIGHT = 0.4
-    IBR_HEADING_WEIGHT = 0.3
-    IBR_SPEED_WEIGHT = 0.15
-    IBR_CONTROL_WEIGHT = 0.15
-    IBR_CONTROL_RATE_WEIGHT = 0.4
+    IBR_HEADING_WEIGHT = 0.0
+    IBR_SPEED_WEIGHT = 0.0
+    IBR_CONTROL_WEIGHT = 0.05
+    IBR_CONTROL_RATE_WEIGHT = 0.10
+    # Main baseline uses the shared global 5 m/s state bound. ``raceline`` is
+    # an ablation targeting the historical 1.04 * local-raceline-speed cap;
+    # its next-step bound is relaxed only as much as physical braking requires.
+    IBR_SPEED_CAP_MODE = "global"  # "global" or "raceline"
+    IBR_RACELINE_SPEED_CAP_FACTOR = 1.04
+    # Wang et al. use hard constraints. In this discrete three-car simulator,
+    # full-run ablations showed that hard track constraints enter a recovery
+    # infeasibility loop and hard pairwise collision constraints fail during a
+    # closing pack. Keep both feasibility slacks explicit and measurable.
+    IBR_ALLOW_TRACK_SLACK = True
+    IBR_ALLOW_COLLISION_SLACK = True
     IBR_CONVERGENCE_TOLERANCE = 1.0e-3
     # Historical local port kept three alternating solves and the upstream
     # friction proxy while taking vehicle geometry/actuation from local MPC.

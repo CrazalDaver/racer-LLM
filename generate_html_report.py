@@ -269,6 +269,7 @@ def generate_report(
     animation_interval=30,
     animation_dpi=80,
     plot_dpi=110,
+    include_animation=True,
 ):
     paths = [Path(path).expanduser().resolve() for path in result_paths]
     missing = [str(path) for path in paths if not path.is_file()]
@@ -332,16 +333,24 @@ def generate_report(
             figure.savefig(plot_path, dpi=plot_dpi, bbox_inches="tight")
             plt.close(figure)
 
-            print(f"[{index}/{len(trace_jobs)}] Animating {display_name} ...")
-            gif_path = temp_dir / f"animation_{index}.gif"
-            make_animation(
-                trace_path,
-                stride=animation_stride,
-                interval=animation_interval,
-                save_path=gif_path,
-                dpi=animation_dpi,
-            )
             escaped_name = html.escape(display_name)
+            if include_animation:
+                print(f"[{index}/{len(trace_jobs)}] Animating {display_name} ...")
+                gif_path = temp_dir / f"animation_{index}.gif"
+                make_animation(
+                    trace_path,
+                    stride=animation_stride,
+                    interval=animation_interval,
+                    save_path=gif_path,
+                    dpi=animation_dpi,
+                )
+                right_content = (
+                    f'<img src="{_data_uri(gif_path, "image/gif")}" '
+                    f'alt="Animation for {escaped_name}">'
+                    "<figcaption>Simulation animation</figcaption>"
+                )
+            else:
+                right_content = "<p>Animation generation disabled.</p>"
             rows.append(
                 {
                     "name": escaped_name,
@@ -349,11 +358,7 @@ def generate_report(
                     "description": _trace_description(trace_path),
                     "plot": _data_uri(plot_path, "image/png"),
                     "plot_caption": "Simulation diagnostics",
-                    "right_content": (
-                        f'<img src="{_data_uri(gif_path, "image/gif")}" '
-                        f'alt="Animation for {escaped_name}">'
-                        "<figcaption>Simulation animation</figcaption>"
-                    ),
+                    "right_content": right_content,
                 }
             )
 
@@ -478,6 +483,7 @@ def parse_args():
     parser.add_argument("--interval", type=int, default=30, help="GIF frame interval in ms.")
     parser.add_argument("--animation-dpi", type=int, default=80)
     parser.add_argument("--plot-dpi", type=int, default=110)
+    parser.add_argument("--no-animation", action="store_true")
     return parser.parse_args()
 
 
@@ -496,4 +502,5 @@ if __name__ == "__main__":
         animation_interval=args.interval,
         animation_dpi=args.animation_dpi,
         plot_dpi=args.plot_dpi,
+        include_animation=not args.no_animation,
     )
