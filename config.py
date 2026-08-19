@@ -240,7 +240,10 @@ class SimParams:
     ALPHARACER_WEIGHT_PATH = POTENTIAL_FUNCTION_WEIGHT_PATH  # backward-compatible name
     ALPHARACER_WEIGHT_SEARCH_POINTS = POTENTIAL_FUNCTION_SEARCH_POINTS
     ALPHARACER_WEIGHT_SEARCH_ITERS = POTENTIAL_FUNCTION_SEARCH_ITERS
-    LLM_POLICY_PARAMS = np.array([1.0, 1.0, 1.0, 1.0, 1.0])  # q, zeta, s1, s2, s3
+    # Valid neutral starting point in canonical paper coordinates.  Match the
+    # local alpha-RACER initializer so direct-parameter LLM experiments do not
+    # begin from out-of-range s1/s2 values before the first successful call.
+    LLM_POLICY_PARAMS = np.array([2.0, 0.95**2, 0.30, 0.20, 0.00])
     SELF_PLAY_RL_MODEL_PATH = "self_play_rl_policy.zip"  # Created by: python self_play_rl.py
     SELF_PLAY_RL_BACKEND = "sb3"  # Paper-compatible Stable-Baselines3 PPO checkpoint.
     SELF_PLAY_RL_STRICT_LOAD = True  # Do not silently replace a missing trained PPO with the heuristic fallback.
@@ -264,14 +267,17 @@ class SimParams:
     IBR_SE_DEFAULT_WEIGHT = 0.05
     IBR_PROGRESS_WEIGHT = 10.0
     # IBR objective audit (2026-08): progress is the Wang-style racing
-    # objective. The lateral term is the only retained local execution
-    # regularizer: the six-scenario ablation found that q_e*e^2 removed
-    # boundary violations without reducing progress or collision performance.
-    # Heading and speed tracking were not needed and remain disabled.
-    IBR_LATERAL_WEIGHT = 0.4
+    # objective. Across six scenarios, the released alpha-RACER IBR's 10*e^4
+    # lateral form eliminated recorded off-road time without materially
+    # reducing progress. Heading and speed tracking were not needed.
+    IBR_LATERAL_WEIGHT = 10.0
+    IBR_LATERAL_EXPONENT = 4
     IBR_HEADING_WEIGHT = 0.0
     IBR_SPEED_WEIGHT = 0.0
-    IBR_CONTROL_WEIGHT = 0.05
+    IBR_CONTROL_WEIGHT = 0.0
+    # ``neutral`` penalizes deviation from straight, speed-holding commands;
+    # ``zero`` reproduces the released alpha-RACER IBR's ||u||^2 form.
+    IBR_CONTROL_REFERENCE = "neutral"  # inactive while IBR_CONTROL_WEIGHT == 0
     IBR_CONTROL_RATE_WEIGHT = 0.10
     # Main baseline uses the shared global 5 m/s state bound. ``raceline`` is
     # an ablation targeting the historical 1.04 * local-raceline-speed cap;
@@ -289,6 +295,17 @@ class SimParams:
     # friction proxy while taking vehicle geometry/actuation from local MPC.
     IBR_HISTORICAL_ITERATIONS = 3
     IBR_HISTORICAL_FRICTION_COEFFICIENT = 1.6
+
+    # Five-parameter IBR oracle. Each best response searches canonical paper
+    # coordinates (q, zeta, s1, s2, s3), while candidate actions and
+    # trajectories are always produced by the shared alpha-RACER/LLM MPC.
+    # This is intentionally slower than the learned potential policy and is
+    # primarily an offline/reference baseline rather than a real-time method.
+    PARAMETER_IBR_ROUNDS = 2
+    PARAMETER_IBR_SEARCH_POINTS = 3
+    PARAMETER_IBR_SEARCH_PASSES = 1
+    PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = 1.0
+    PARAMETER_IBR_CONVERGENCE_TOLERANCE = 1.0e-3
 
 
 params = SimParams()

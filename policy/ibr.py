@@ -8,11 +8,24 @@ from state import CarAction, CarState
 from track import RaceLine
 from vehicle_model import kinematic_frenet_step, minimum_reachable_speed, neutral_throttle
 
+from .alpha_model import ALPHA_PARAMETER_BOUNDS
 from .base import BasePolicy
+from .mpc import MPCPolicy
 from .utils import progress_delta, track_curvature_at, track_heading_error
 
 
 IBR_IMPLEMENTATIONS = ("local_wang", "historical_strict")
+
+
+class _IBRPolicyMixin:
+    """Shared marker and scheduling helpers for the two IBR policy levels."""
+
+    ibr_level = None
+
+    def _ibr_update_due(self, sim_time, last_update_time, interval):
+        if sim_time is None or last_update_time is None:
+            return True
+        return sim_time >= last_update_time + interval - 1.0e-9
 
 
 class _StrictIBRSolver:
@@ -239,9 +252,11 @@ class _WangIBRSolver:
         allow_collision_slack,
         progress_weight,
         lateral_weight,
+        lateral_exponent,
         heading_weight,
         speed_weight,
         control_weight,
+        control_reference,
         control_rate_weight,
         convergence_tolerance,
         max_steer_delta,
@@ -269,9 +284,15 @@ class _WangIBRSolver:
         self.allow_collision_slack = bool(allow_collision_slack)
         self.progress_weight = float(progress_weight)
         self.lateral_weight = float(lateral_weight)
+        self.lateral_exponent = int(lateral_exponent)
+        if self.lateral_exponent not in {2, 4}:
+            raise ValueError("IBR lateral_exponent must be 2 or 4")
         self.heading_weight = float(heading_weight)
         self.speed_weight = float(speed_weight)
         self.control_weight = float(control_weight)
+        self.control_reference = str(control_reference)
+        if self.control_reference not in {"neutral", "zero"}:
+            raise ValueError("IBR control_reference must be 'neutral' or 'zero'")
         self.control_rate_weight = float(control_rate_weight)
         self.convergence_tolerance = max(float(convergence_tolerance), 0.0)
         self.max_steer_delta = max(float(max_steer_delta), 0.0)
@@ -318,13 +339,17 @@ class _WangIBRSolver:
 
         for k in range(n):
             g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))  # kinematic constraints
-            cost += self.lateral_weight * x[1, k] ** 2
+            cost += self.lateral_weight * x[1, k] ** self.lateral_exponent
             cost += self.heading_weight * x[2, k] ** 2
             cost += self.speed_weight * (x[3, k] - target_speed) ** 2
             # Absolute effort is measured relative to the command that holds
             # the reference speed and drives straight. This avoids treating
             # drag compensation as strategically meaningful acceleration.
-            effort = u[:, k] - neutral_control
+            effort = (
+                u[:, k] - neutral_control
+                if self.control_reference == "neutral"
+                else u[:, k]
+            )
             cost += self.control_weight * cs.mtimes([effort.T, identity, effort])
             du = u[:, k] - (u_prev if k == 0 else u[:, k - 1])
             cost += self.control_rate_weight * cs.mtimes([du.T, identity, du])
@@ -621,7 +646,7 @@ class _WangIBRSolver:
         }
 
 
-class IteratedBestResponsePolicy(BasePolicy):
+class TrajectoryIBRPolicy(_IBRPolicyMixin, BasePolicy):
     """
     Selectable IBR baseline policy.
 
@@ -635,6 +660,8 @@ class IteratedBestResponsePolicy(BasePolicy):
     with local vehicle parameters and hard track bounds. It also does not
     support SE and exists only as a historical implementation comparison.
     """
+
+    ibr_level = "trajectory"
 
     def __init__(
         self,
@@ -705,9 +732,11 @@ class IteratedBestResponsePolicy(BasePolicy):
                 sensitivity_weight=self.sensitivity_weight,
                 progress_weight=sim_params.IBR_PROGRESS_WEIGHT,
                 lateral_weight=sim_params.IBR_LATERAL_WEIGHT,
+                lateral_exponent=sim_params.IBR_LATERAL_EXPONENT,
                 heading_weight=sim_params.IBR_HEADING_WEIGHT,
                 speed_weight=sim_params.IBR_SPEED_WEIGHT,
                 control_weight=sim_params.IBR_CONTROL_WEIGHT,
+                control_reference=sim_params.IBR_CONTROL_REFERENCE,
                 control_rate_weight=sim_params.IBR_CONTROL_RATE_WEIGHT,
                 convergence_tolerance=sim_params.IBR_CONVERGENCE_TOLERANCE,
                 track_slack_weight=self.mpc.track_slack_weight,
@@ -903,6 +932,167 @@ class IteratedBestResponsePolicy(BasePolicy):
         return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
 
 
+class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
+    """Iterated best response in the paper's five-parameter policy space.
+
+    Unlike :class:`TrajectoryIBRPolicy`, this policy never optimizes throttle
+    or steering directly.  A best-response step searches
+    ``theta=(q, zeta, s1, s2, s3)`` and evaluates every candidate by solving
+    the same raceline-reference MPC used by alpha-RACER and the LLM policies.
+    The candidate score is independent of the MPC's tunable tracking weight:
+    predicted progress minus the MPC's existing track/collision slack costs.
+    This makes candidates with different ``q`` comparable.
+    """
+
+    ibr_level = "parameter"
+    PARAM_BOUNDS = ALPHA_PARAMETER_BOUNDS
+
+    def __init__(
+        self,
+        *args,
+        search_points=3,
+        search_passes=1,
+        update_interval_seconds=1.0,
+        initial_params=None,
+        convergence_tolerance=1.0e-3,
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            params=(
+                np.asarray(sim_params.ALPHARACER_INITIAL_PARAMS, dtype=float)
+                if initial_params is None
+                else np.asarray(initial_params, dtype=float)
+            ),
+            **kwargs,
+        )
+        if self.params.shape != (5,):
+            raise ValueError("ParameterIBRPolicy initial_params must contain q, zeta, s1, s2, s3")
+        bounds = np.asarray(self.PARAM_BOUNDS, dtype=float)
+        self.params = np.clip(self.params, bounds[:, 0], bounds[:, 1])
+        self.search_points = max(2, int(search_points))
+        self.search_passes = max(1, int(search_passes))
+        self.update_interval_seconds = max(float(update_interval_seconds), 0.0)
+        self.convergence_tolerance = max(float(convergence_tolerance), 0.0)
+        self.last_parameter_ibr_update_time = None
+        self.last_parameter_ibr_score = -np.inf
+        self.last_parameter_ibr_diagnostics = {}
+        self.predicted_frenet_plan = None
+        self.current_mode = "parameter_ibr"
+
+    def update_due(self, sim_time):
+        return self._ibr_update_due(
+            sim_time,
+            self.last_parameter_ibr_update_time,
+            self.update_interval_seconds,
+        )
+
+    def _world_plan_to_frenet(self, world_plan, initial_s):
+        plan = np.zeros((2, world_plan.shape[1]), dtype=float)
+        s_hint = float(initial_s)
+        for k in range(world_plan.shape[1]):
+            wrapped_s, lateral_e = self.track.project(
+                float(world_plan[0, k]),
+                float(world_plan[1, k]),
+                s_hint=s_hint,
+                search_radius=8.0,
+                psi_hint=float(world_plan[2, k]),
+                max_heading_error=math.pi / 2.0,
+            )
+            s_hint += progress_delta(wrapped_s, s_hint, self.track.total_length)
+            plan[:, k] = [s_hint, lateral_e]
+        return plan
+
+    def _evaluate_candidate(self, candidate, state, current_s, opponents):
+        """Solve the shared MPC once and return an invariant rollout score."""
+        self.params = np.asarray(candidate, dtype=float).copy()
+        ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
+        self.mpc.solve(
+            state.to_array(),
+            ref_traj,
+            self.last_feasible_u,
+            q_weight=float(self.params[0]),
+            opponents=opponents,
+            current_s=current_s,
+        )
+        world_plan = np.asarray(self.mpc.last_state_plan, dtype=float).copy()
+        frenet_plan = self._world_plan_to_frenet(world_plan, current_s)
+        predicted_progress = float(frenet_plan[0, -1] - frenet_plan[0, 0])
+        track_slack_cost = self.mpc.track_slack_weight * float(
+            np.sum(np.square(self.mpc.last_track_slack_plan))
+        )
+        collision_slack_cost = self.mpc.collision_slack_weight * float(
+            np.sum(np.square(self.mpc.last_collision_slack_plan))
+        )
+        score = predicted_progress - track_slack_cost - collision_slack_cost
+        return score, frenet_plan, {
+            "predicted_progress": predicted_progress,
+            "track_slack_cost": track_slack_cost,
+            "collision_slack_cost": collision_slack_cost,
+        }
+
+    def best_response(self, state, current_s, opponents):
+        """Coordinate search for one agent while opponent plans stay fixed."""
+        bounds = np.asarray(self.PARAM_BOUNDS, dtype=float)
+        best = np.clip(np.asarray(self.params, dtype=float), bounds[:, 0], bounds[:, 1])
+        best_score = -np.inf
+        best_plan = None
+        best_diagnostics = {}
+
+        # Evaluate the warm start first, then update one parameter at a time.
+        try:
+            best_score, best_plan, best_diagnostics = self._evaluate_candidate(
+                best, state, current_s, opponents
+            )
+        except Exception:
+            pass
+
+        for _ in range(self.search_passes):
+            for dim in range(5):
+                values = np.unique(np.concatenate((
+                    np.linspace(bounds[dim, 0], bounds[dim, 1], self.search_points),
+                    np.array([best[dim]]),
+                )))
+                dimension_best = best.copy()
+                dimension_score = best_score
+                dimension_plan = best_plan
+                dimension_diagnostics = best_diagnostics
+                for value in values:
+                    candidate = best.copy()
+                    candidate[dim] = value
+                    try:
+                        score, plan, diagnostics = self._evaluate_candidate(
+                            candidate, state, current_s, opponents
+                        )
+                    except Exception:
+                        continue
+                    if score > dimension_score:
+                        dimension_best = candidate
+                        dimension_score = score
+                        dimension_plan = plan
+                        dimension_diagnostics = diagnostics
+                best = dimension_best
+                best_score = dimension_score
+                best_plan = dimension_plan
+                best_diagnostics = dimension_diagnostics
+
+        if best_plan is None:
+            raise RuntimeError("all parameter-space IBR candidate MPC solves failed")
+        self.params = best
+        self.predicted_frenet_plan = best_plan
+        self.last_parameter_ibr_score = float(best_score)
+        self.last_parameter_ibr_diagnostics = {
+            **best_diagnostics,
+            "score": float(best_score),
+            "params": best.copy(),
+        }
+        return best.copy(), best_plan.copy()
+
+
+# Backward-compatible public name used by existing scripts and imports.
+IteratedBestResponsePolicy = TrajectoryIBRPolicy
+
+
 def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
     best_idx = None
     best_abs_delta = np.inf
@@ -917,10 +1107,101 @@ def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
     return best_idx
 
 
-def plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=None):
-    # main loop to plan IBR actions for all policies that are IteratedBestResponsePolicy
+def _constant_velocity_frenet_plan(policy, state, current_s, current_e):
+    horizon = policy.mpc.horizon
+    plan = np.zeros((2, horizon + 1), dtype=float)
+    plan[0, 0] = float(current_s)
+    plan[1, :] = float(current_e)
+    for k in range(horizon):
+        plan[0, k + 1] = plan[0, k] + max(float(state.vx), 0.0) * policy.mpc.dt
+    return plan
+
+
+def _parameter_ibr_opponents(policy_idx, policies, states, car_s, car_e, plans):
+    opponents = []
+    for other_idx, state in enumerate(states):
+        if other_idx == policy_idx:
+            continue
+        plan = plans[other_idx]
+        opponents.append({
+            "car_idx": other_idx,
+            "px": float(car_s[other_idx]),
+            "py": float(car_e[other_idx]),
+            "vx": max(float(state.vx), 0.0),
+            "vy": float(state.vy),
+            "omega": float(state.omega),
+            "psi": float(state.psi),
+            "state": state,
+            "px_plan": plan[0].copy(),
+            "py_plan": plan[1].copy(),
+        })
+    return opponents
+
+
+def plan_parameter_ibr_policy_params(policies, states, car_s, car_e, sim_time=None):
+    """Alternate best responses in theta while all cars retain the shared MPC."""
+    indices = [
+        idx for idx, policy in enumerate(policies)
+        if isinstance(policy, ParameterIBRPolicy) and policy.update_due(sim_time)
+    ]
+    if not indices:
+        return
+
+    plans = []
     for idx, policy in enumerate(policies):
-        if not isinstance(policy, IteratedBestResponsePolicy):
+        cached = getattr(policy, "predicted_frenet_plan", None)
+        expected_length = policy.mpc.horizon + 1
+        if cached is not None and cached.shape == (2, expected_length):
+            plan = np.asarray(cached, dtype=float).copy()
+            # Re-anchor stale warm starts at the newly measured Frenet state.
+            plan[0] += float(car_s[idx]) - plan[0, 0]
+            plan[1] += float(car_e[idx]) - plan[1, 0]
+        else:
+            plan = _constant_velocity_frenet_plan(
+                policy, states[idx], car_s[idx], car_e[idx]
+            )
+        plans.append(plan)
+
+    rounds = max(1, int(sim_params.PARAMETER_IBR_ROUNDS))
+    for _ in range(rounds):
+        max_change = 0.0
+        for idx in indices:
+            policy = policies[idx]
+            previous = policy.params.copy()
+            opponents = _parameter_ibr_opponents(
+                idx, policies, states, car_s, car_e, plans
+            )
+            params_opt, plan_opt = policy.best_response(
+                states[idx], car_s[idx], opponents
+            )
+            plans[idx] = plan_opt
+            span = np.maximum(
+                policy.PARAM_BOUNDS[:, 1] - policy.PARAM_BOUNDS[:, 0], 1.0e-12
+            )
+            max_change = max(
+                max_change,
+                float(np.max(np.abs(params_opt - previous) / span)),
+            )
+        if max_change <= min(
+            policies[idx].convergence_tolerance for idx in indices
+        ):
+            break
+
+    for idx in indices:
+        policies[idx].predicted_frenet_plan = plans[idx]
+        policies[idx].last_parameter_ibr_update_time = sim_time
+
+
+def plan_ibr_joint_actions(policies, states, car_s, car_e, sim_time=None):
+    # Parameter-level IBR only updates theta here; its inherited MPCPolicy
+    # computes the actual action later in the ordinary per-policy control loop.
+    plan_parameter_ibr_policy_params(
+        policies, states, car_s, car_e, sim_time=sim_time
+    )
+
+    # Trajectory-level IBR directly caches the next low-level action.
+    for idx, policy in enumerate(policies):
+        if not isinstance(policy, TrajectoryIBRPolicy):
             continue
         if (
             policy._ibr_cached_action is not None

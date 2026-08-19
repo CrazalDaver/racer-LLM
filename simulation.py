@@ -12,6 +12,7 @@ from policy import (
     ExplicitRuleLLMPolicy,
     IteratedBestResponsePolicy,
     LLMAlphaRacerPolicy,
+    ParameterIBRPolicy,
     RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
     StaticAlphaRacerPolicy,
@@ -98,6 +99,10 @@ def _normalize_policy_name(policy_name):
         "selfplay_rl": "self_play_rl",
 
         "ibr": "ibr",
+        "parameter_ibr": "parameter_ibr",
+        "param_ibr": "parameter_ibr",
+        "ibr_parameters": "parameter_ibr",
+        "ibr_params": "parameter_ibr",
 
         "center": "centerline",
         "center_line": "centerline",
@@ -314,6 +319,21 @@ def create_policy(
             ),
             raceline=raceline,
             max_speed=params.MAX_RACELINE_SPEED,
+        )
+    if policy_type == "parameter_ibr":
+        return ParameterIBRPolicy(
+            track,
+            mpc,
+            car_idx=car_idx,
+            policy_name=policy_type,
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
+            initial_params=params.ALPHARACER_INITIAL_PARAMS,
+            search_points=params.PARAMETER_IBR_SEARCH_POINTS,
+            search_passes=params.PARAMETER_IBR_SEARCH_PASSES,
+            update_interval_seconds=params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS,
+            convergence_tolerance=params.PARAMETER_IBR_CONVERGENCE_TOLERANCE,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")
 
@@ -990,7 +1010,10 @@ if __name__ == "__main__":
         "--policies",
         nargs="+",
         default=["LLM", "ibr", "ibr"],
-        help="One policy per car, e.g. --policies ibr ibr ibr.",
+        help=(
+            "One policy per car, e.g. --policies ibr ibr ibr or "
+            "--policies parameter_ibr parameter_ibr parameter_ibr."
+        ),
     )
     parser.add_argument(
         "--ibr-implementation",
@@ -1013,6 +1036,11 @@ if __name__ == "__main__":
         default=None,
         metavar="ALPHA",
         help="Explicit SE weight; 0 selects ordinary IBR and overrides --ibr-se.",
+    )
+    parser.add_argument("--parameter-ibr-rounds", type=int, default=None, metavar="N")
+    parser.add_argument("--parameter-ibr-search-points", type=int, default=None, metavar="N")
+    parser.add_argument(
+        "--parameter-ibr-update-interval", type=float, default=None, metavar="SECONDS"
     )
     parser.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
@@ -1042,9 +1070,22 @@ if __name__ == "__main__":
         params.IBR_SENSITIVITY_WEIGHT = params.IBR_SE_DEFAULT_WEIGHT
     else:
         params.IBR_SENSITIVITY_WEIGHT = 0.0
+    if cli_args.parameter_ibr_rounds is not None:
+        if cli_args.parameter_ibr_rounds < 1:
+            parser.error("--parameter-ibr-rounds must be at least 1")
+        params.PARAMETER_IBR_ROUNDS = cli_args.parameter_ibr_rounds
+    if cli_args.parameter_ibr_search_points is not None:
+        if cli_args.parameter_ibr_search_points < 2:
+            parser.error("--parameter-ibr-search-points must be at least 2")
+        params.PARAMETER_IBR_SEARCH_POINTS = cli_args.parameter_ibr_search_points
+    if cli_args.parameter_ibr_update_interval is not None:
+        if cli_args.parameter_ibr_update_interval < 0.0:
+            parser.error("--parameter-ibr-update-interval must be non-negative")
+        params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = cli_args.parameter_ibr_update_interval
 
     # Options: "centerline", "alpharacer" (trained potential), "static_alpharacer",
-    # "ibr", or "llm_alpharacer". "weighted_alpharacer" aliases "alpharacer".
+    # "ibr", "parameter_ibr", or "llm_alpharacer". "weighted_alpharacer"
+    # aliases "alpharacer".
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
@@ -1052,6 +1093,8 @@ if __name__ == "__main__":
     # .venv/bin/python simulation.py --policies ibr ibr ibr --no-plot
     # Optional SE-IBR:
     # .venv/bin/python simulation.py --policies ibr ibr ibr --ibr-se --no-plot
+    # Five-parameter IBR using the same low-level MPC as alpha-RACER/LLM:
+    # .venv/bin/python simulation.py --policies parameter_ibr parameter_ibr parameter_ibr --no-plot
     run_simulation(
         v0 = 0,
         # track_name="modena",  # Change this directly to "modena" or "rounded_rectangle".

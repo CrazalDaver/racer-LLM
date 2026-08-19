@@ -1,5 +1,11 @@
 from .alpha_racer import AlphaRacerPolicy, plan_alpharacer_policy_params
-from .ibr import IteratedBestResponsePolicy, plan_ibr_joint_actions
+from .ibr import (
+    IteratedBestResponsePolicy,
+    ParameterIBRPolicy,
+    TrajectoryIBRPolicy,
+    plan_ibr_joint_actions,
+    plan_parameter_ibr_policy_params,
+)
 from .llm import (
     ExplicitRuleLLMPolicy,
     LLMAlphaRacerPolicy,
@@ -16,6 +22,8 @@ __all__ = [
     "BasePolicy",
     "CenterLinePolicy",
     "IteratedBestResponsePolicy",
+    "ParameterIBRPolicy",
+    "TrajectoryIBRPolicy",
     "ExplicitRuleLLMPolicy",
     "LLMAlphaRacerPolicy",
     "MPCPolicy",
@@ -25,6 +33,7 @@ __all__ = [
     "StaticAlphaRacerPolicy",
     "angle_delta",
     "plan_alpharacer_policy_params",
+    "plan_parameter_ibr_policy_params",
     "plan_ibr_joint_actions",
     "progress_delta",
     "track_curvature_at",

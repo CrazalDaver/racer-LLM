@@ -55,6 +55,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.response_format = self._resolve_response_format(output_mode, model_name)
         self.safeguard_enabled = bool(safeguard_enabled)
         self.prompt_variant = str(prompt_variant)
+        if self.response_format == "params" and self.prompt_variant == "raw":
+            self.prompt_variant = "direct_params_effect_aware"
         if self.response_format not in {"mode", "params"}:
             raise ValueError(f"Unknown LLM response format: {output_mode}")
         self.llm_decision_history = []

@@ -76,6 +76,8 @@ def create_simulation_trace(
         "car_llm_system_prompts": [
             str(getattr(policy, "system_prompt", "")) for policy in policies
         ],
+        "llm_parameter_names": list(params.ALPHARACER_PARAMETER_NAMES),
+        "llm_parameter_bounds": np.asarray(params.ALPHARACER_PARAMETER_BOUNDS).copy(),
         "llm_update_interval_seconds": (
             params.LLM_UPDATE_INTERVAL_SECONDS
             if llm_update_interval_seconds is None
@@ -91,6 +93,10 @@ def create_simulation_trace(
         "vehicle_model": vehicle_model_type,
         "velocity_track_weight": mpc_velocity_track_weight,
         "heading_track_weight": params.HEADING_TRACK_WEIGHT,
+        "parameter_ibr_rounds": params.PARAMETER_IBR_ROUNDS,
+        "parameter_ibr_search_points": params.PARAMETER_IBR_SEARCH_POINTS,
+        "parameter_ibr_search_passes": params.PARAMETER_IBR_SEARCH_PASSES,
+        "parameter_ibr_update_interval_seconds": params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS,
     })
     return trace
 
@@ -272,6 +278,15 @@ def record_simulation_step(
     trace["car_policy_params"].append(
         [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
     )
+    trace["car_parameter_ibr_score"].append(
+        [getattr(policy, "last_parameter_ibr_score", np.nan) for policy in policies]
+    )
+    trace["car_parameter_ibr_predicted_progress"].append([
+        getattr(policy, "last_parameter_ibr_diagnostics", {}).get(
+            "predicted_progress", np.nan
+        )
+        for policy in policies
+    ])
     trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
     trace["car_policy_reason"].append([getattr(policy, "last_llm_reason", "") for policy in policies])
     trace["car_policy_basis"].append([getattr(policy, "last_llm_basis", "") for policy in policies])
@@ -490,6 +505,14 @@ def save_simulation_trace(trace, track, params):
         car_llm_system_prompts=np.asarray(
             trace.get("car_llm_system_prompts", []), dtype=str
         ),
+        llm_parameter_names=np.asarray(
+            trace.get("llm_parameter_names", params.ALPHARACER_PARAMETER_NAMES),
+            dtype=str,
+        ),
+        llm_parameter_bounds=np.asarray(
+            trace.get("llm_parameter_bounds", params.ALPHARACER_PARAMETER_BOUNDS),
+            dtype=float,
+        ),
         llm_raw_call_indices=np.asarray(trace.get("llm_raw_call_indices", []), dtype=int),
         llm_raw_prompts=np.asarray(trace.get("llm_raw_prompts", []), dtype=str),
         llm_raw_responses=np.asarray(trace.get("llm_raw_responses", []), dtype=str),
@@ -506,6 +529,12 @@ def save_simulation_trace(trace, track, params):
             trace.get("car_policy_decision_counts", []), dtype=int
         ),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
+        car_parameter_ibr_score=np.asarray(
+            trace.get("car_parameter_ibr_score", []), dtype=float
+        ),
+        car_parameter_ibr_predicted_progress=np.asarray(
+            trace.get("car_parameter_ibr_predicted_progress", []), dtype=float
+        ),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
         car_policy_basis=np.asarray(trace.get("car_policy_basis", []), dtype=str),
@@ -601,6 +630,7 @@ def save_simulation_trace(trace, track, params):
         ibr_se_enabled=np.asarray(params.IBR_SENSITIVITY_WEIGHT > 0.0),
         ibr_progress_weight=np.asarray(params.IBR_PROGRESS_WEIGHT),
         ibr_lateral_weight=np.asarray(params.IBR_LATERAL_WEIGHT),
+        ibr_lateral_exponent=np.asarray(params.IBR_LATERAL_EXPONENT),
         ibr_heading_weight=np.asarray(params.IBR_HEADING_WEIGHT),
         ibr_allow_track_slack=np.asarray(params.IBR_ALLOW_TRACK_SLACK),
         ibr_allow_collision_slack=np.asarray(params.IBR_ALLOW_COLLISION_SLACK),
@@ -610,8 +640,24 @@ def save_simulation_trace(trace, track, params):
             params.IBR_RACELINE_SPEED_CAP_FACTOR
         ),
         ibr_control_weight=np.asarray(params.IBR_CONTROL_WEIGHT),
+        ibr_control_reference=np.asarray(params.IBR_CONTROL_REFERENCE),
         ibr_control_rate_weight=np.asarray(params.IBR_CONTROL_RATE_WEIGHT),
         ibr_convergence_tolerance=np.asarray(params.IBR_CONVERGENCE_TOLERANCE),
+        parameter_ibr_rounds=np.asarray(
+            trace.get("parameter_ibr_rounds", params.PARAMETER_IBR_ROUNDS)
+        ),
+        parameter_ibr_search_points=np.asarray(
+            trace.get("parameter_ibr_search_points", params.PARAMETER_IBR_SEARCH_POINTS)
+        ),
+        parameter_ibr_search_passes=np.asarray(
+            trace.get("parameter_ibr_search_passes", params.PARAMETER_IBR_SEARCH_PASSES)
+        ),
+        parameter_ibr_update_interval_seconds=np.asarray(
+            trace.get(
+                "parameter_ibr_update_interval_seconds",
+                params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS,
+            )
+        ),
         llm_update_interval_seconds=np.asarray(
             trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
         ),

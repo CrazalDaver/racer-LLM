@@ -781,13 +781,14 @@ def _add_case_args(parser):
     group.add_argument("--name", default=None)
     group.add_argument(
         "--suite",
-        choices=["llm-baselines", "llm-vs-ibr", "ibr-speed-cap"],
+        choices=["llm-baselines", "llm-vs-ibr", "llm-params", "ibr-speed-cap"],
         default=None,
         help=(
             "llm-baselines runs raw LLM, explicit-rule LLM, rule-only, "
             "alpha-RACER, and IBR against two alpha-RACER opponents; "
             "llm-vs-ibr runs the three LLM/rule candidates against two IBR "
-            "opponents. Every candidate is tested at all three positions."
+            "opponents; llm-params runs a direct five-parameter LLM against "
+            "both opponent types. Every candidate is tested at all three positions."
         ),
     )
 
@@ -863,6 +864,27 @@ def _add_sim_args(parser):
             "that tightens toward 1.04 times local raceline speed."
         ),
     )
+    group.add_argument(
+        "--parameter-ibr-rounds",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Complete joint five-parameter best-response rounds per update.",
+    )
+    group.add_argument(
+        "--parameter-ibr-search-points",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Grid candidates per parameter dimension (minimum 2).",
+    )
+    group.add_argument(
+        "--parameter-ibr-update-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Simulation-time interval between five-parameter IBR updates.",
+    )
     group.add_argument("--rl-model-path", default=None)
     group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
     group.add_argument("--rl-strict-load", action="store_true")
@@ -901,6 +923,18 @@ if __name__ == "__main__":
         params.IBR_SENSITIVITY_WEIGHT = 0.0
     if args.ibr_speed_cap is not None:
         params.IBR_SPEED_CAP_MODE = args.ibr_speed_cap
+    if args.parameter_ibr_rounds is not None:
+        if args.parameter_ibr_rounds < 1:
+            raise ValueError("--parameter-ibr-rounds must be at least 1")
+        params.PARAMETER_IBR_ROUNDS = args.parameter_ibr_rounds
+    if args.parameter_ibr_search_points is not None:
+        if args.parameter_ibr_search_points < 2:
+            raise ValueError("--parameter-ibr-search-points must be at least 2")
+        params.PARAMETER_IBR_SEARCH_POINTS = args.parameter_ibr_search_points
+    if args.parameter_ibr_update_interval is not None:
+        if args.parameter_ibr_update_interval < 0.0:
+            raise ValueError("--parameter-ibr-update-interval must be non-negative")
+        params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = args.parameter_ibr_update_interval
     shared_sweep_kwargs = dict(
         trials_per_position=1,
         ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
@@ -926,7 +960,7 @@ if __name__ == "__main__":
         self_play_rl_action_order=args.rl_action_order,
     )
 
-    if args.suite in {"llm-baselines", "llm-vs-ibr", "ibr-speed-cap"}:
+    if args.suite in {"llm-baselines", "llm-vs-ibr", "llm-params", "ibr-speed-cap"}:
         if args.suite == "llm-baselines":
             suite_dir = Path("result/llm_baseline_suite")
             # All candidates face the same two alpha-RACER opponents. For the
@@ -944,6 +978,17 @@ if __name__ == "__main__":
                 "raw_llm_vs_ibr": ["llm_alpharacer", "ibr", "ibr"],
                 "explicit_rule_llm_vs_ibr": ["llm_explicit_rules", "ibr", "ibr"],
                 "rule_only_vs_ibr": ["rule_based", "ibr", "ibr"],
+            }
+        elif args.suite == "llm-params":
+            # Keep the initial direct-parameter results intact; the current
+            # prompt re-evaluates all five mathematical effects each call.
+            suite_dir = Path("result/llm_params_effect_aware_suite")
+            # This suite removes the hand-written four-mode presets: the LLM
+            # directly returns canonical (q, zeta, s1, s2, s3) coordinates.
+            shared_sweep_kwargs["llm_output_mode"] = "params"
+            candidates = {
+                "param_llm_vs_alpharacer": ["llm_alpharacer", "alpharacer", "alpharacer"],
+                "param_llm_vs_ibr": ["llm_alpharacer", "ibr", "ibr"],
             }
         else:
             suite_dir = Path("result/ibr_speed_cap_suite")
@@ -964,14 +1009,21 @@ if __name__ == "__main__":
             sweep_paths.append(sweep_path)
         report_path = suite_dir / "report.html"
     else:
-        sweep_output_path = Path("result/position_sweep_summary.json")
+        if args.name:
+            custom_dir = Path("result") / _slug(args.name)
+            custom_dir.mkdir(parents=True, exist_ok=True)
+            sweep_output_path = custom_dir / "summary.json"
+            report_path = custom_dir / "report.html"
+        else:
+            sweep_output_path = Path("result/position_sweep_summary.json")
+            report_path = Path("result/position_sweep_report.html")
         run_position_sweep(
             policy_names=args.policies or ["LLM", "ibr", "ibr"],
             output_path=sweep_output_path,
+            keep_npz=bool(args.name),
             **shared_sweep_kwargs,
         )
         sweep_paths = [sweep_output_path]
-        report_path = Path("result/position_sweep_report.html")
 
     generate_report(
         sweep_paths,

@@ -24,15 +24,33 @@ The user message is a code-generated numerical observation:
   and current setting.
 
 Parameters:
-- q: reference tracking weight.
-- zeta: reference speed integration.
-- s1: overtaking interaction amplitude.
-- s2: longitudinal interaction decay.
-- s3: blocking strength.
+- q: reference-trajectory tracking weight. Larger values make the MPC follow
+  the generated reference more strongly; smaller values allow more deviation.
+- zeta: reference-horizon progression factor. Larger values place future
+  reference points farther ahead and encourage progress. It is not a direct
+  throttle command or a new physical speed limit.
+- s1: maximum lateral interaction amplitude. Larger values request a larger
+  lateral passing/avoidance offset near another car.
+- s2: longitudinal interaction decay rate. Larger values make passing and
+  blocking offsets disappear over a shorter longitudinal distance; smaller
+  values make them act from farther away.
+- s3: blocking response strength to a faster rear car. Zero disables this
+  response; larger values move the reference toward the rear car's lane more
+  strongly when the blocking conditions apply.
 
 Infer the racing situation from the numerical observation and road preview.
 Choose parameters whose physical effects best fit the situation, and do not
 invent vehicles, gaps, road geometry, or risks absent from the observation.
+Re-evaluate all five parameters from the current observation.
+current_parameters are provided only for continuity: keep a current value only
+when its effect remains appropriate. Prefer a meaningful supported change over
+an arbitrary tiny numerical change.
+
+Remember the directions exactly: increasing q strengthens reference tracking;
+increasing s2 shortens the longitudinal interaction range; increasing s3
+strengthens blocking. The exact minimum and maximum values are valid choices.
+Use s3=0 when blocking should be disabled rather than inventing a near-zero
+value.
 
 Respect parameter_bounds and return only the JSON required by the response
 schema. Give a short basis label for the decisive consideration and a factual

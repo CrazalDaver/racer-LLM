@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import numpy as np
 
+from config import params as sim_params
 from track import load_centerline_csv, load_raceline_csv
 
 
@@ -68,6 +69,104 @@ def _mode_runs(modes):
             current = mode
     runs.append((current, start, len(modes)))
     return runs
+
+
+def _plot_direct_parameter_histograms(ax, decisions, bounds):
+    """Show compact discrete frequencies, with one sample per LLM call."""
+    names = ("q", "zeta", "s1", "s2", "s3")
+    rounding_digits = (2, 3, 3, 3, 3)
+    decisions = np.asarray(decisions, dtype=float)
+    bounds = np.asarray(bounds, dtype=float)
+    ax.set_axis_off()
+    ax.set_title(
+        f"Direct LLM parameter choices ({len(decisions)} decisions)",
+        pad=10,
+    )
+    positions = (
+        (0.03, 0.55, 0.28, 0.34),
+        (0.36, 0.55, 0.28, 0.34),
+        (0.69, 0.55, 0.28, 0.34),
+        (0.19, 0.08, 0.28, 0.34),
+        (0.53, 0.08, 0.28, 0.34),
+    )
+    for idx, (name, position, digits) in enumerate(
+        zip(names, positions, rounding_digits)
+    ):
+        inset = ax.inset_axes(position)
+        values = decisions[:, idx]
+        values = values[np.isfinite(values)]
+        lo, hi = bounds[idx]
+        if values.size:
+            # Preserve the LLM's discrete choices instead of smoothing them
+            # into values it never emitted. Rounding only removes irrelevant
+            # floating-point precision before exact frequency counting.
+            span = max(hi - lo, 1.0e-9)
+            rounded = np.round(values, digits)
+            choices, counts = np.unique(rounded, return_counts=True)
+            separations = np.diff(choices)
+            positive_separations = separations[separations > 0.0]
+            width = 0.018 * span
+            if positive_separations.size:
+                width = min(width, 0.65 * float(np.min(positive_separations)))
+            width = max(width, 0.006 * span)
+            color = f"C{idx}"
+            inset.bar(
+                choices,
+                counts,
+                width=width,
+                color=color,
+                alpha=0.72,
+                edgecolor="black",
+                linewidth=0.55,
+            )
+            mean = float(np.mean(values))
+            inset.axvline(mean, color="black", linestyle="--", linewidth=1.0)
+            inset.text(
+                0.97,
+                0.93,
+                f"mean={mean:.3g}",
+                transform=inset.transAxes,
+                ha="right",
+                va="top",
+                fontsize=7,
+            )
+        inset.set_xlim(lo, hi)
+        inset.set_ylim(bottom=0.0)
+        inset.set_title(name, fontsize=9, pad=1)
+        inset.tick_params(axis="both", labelsize=7)
+        inset.locator_params(axis="y", nbins=3, integer=True)
+        inset.grid(axis="y", alpha=0.2)
+
+
+def _direct_parameter_decisions(data, ego_index=0):
+    """Recover one parameter vector per direct-parameter LLM call."""
+    if "car_llm_prompt_variants" not in data.files:
+        return None
+    variants = _string_list(data["car_llm_prompt_variants"])
+    if ego_index >= len(variants) or not variants[ego_index].startswith("direct_params"):
+        return None
+    if "policy_params" not in data.files:
+        return None
+
+    params_history = np.asarray(data["policy_params"], dtype=float)
+    if params_history.ndim != 2 or params_history.shape[1] != 5:
+        return None
+    control_update = (
+        np.asarray(data["control_update"], dtype=bool)
+        if "control_update" in data.files
+        else np.ones(len(params_history), dtype=bool)
+    )
+    control_params = params_history[control_update]
+    if "llm_raw_call_indices" in data.files:
+        call_indices = np.asarray(data["llm_raw_call_indices"], dtype=int)
+        if call_indices.ndim == 2 and ego_index < call_indices.shape[0]:
+            # Call indices are one-based policy-control calls in the trace.
+            selected = call_indices[ego_index]
+            selected = selected[selected > 0] - 1
+            selected = selected[selected < len(control_params)]
+            if selected.size:
+                return control_params[selected]
+    return control_params
 
 
 def compute_lap_stats(time, progress, track_length):
@@ -217,6 +316,8 @@ def plot_simulation_results(
     trajectory_time_mark_interval=5.0,
     velocity_track_weight=None,
     heading_track_weight=None,
+    direct_param_decisions=None,
+    parameter_bounds=None,
 ):
     half_width = getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)
     offroad_half_width = params.OFFROAD_RECOVERY_THRESHOLD
@@ -312,7 +413,15 @@ def plot_simulation_results(
     policy_mode_history = _string_list(policy_mode_history)
     policy_params_history = _as_optional_array(policy_params_history)
     uses_llm = any("llm" in name for name in policy_names) or any(mode in {"stable", "push", "overtake", "block", "custom"} for mode in policy_mode_history)
-    if uses_llm and policy_mode_history:
+    if direct_param_decisions is not None and len(direct_param_decisions):
+        if parameter_bounds is None:
+            parameter_bounds = sim_params.ALPHARACER_PARAMETER_BOUNDS
+        _plot_direct_parameter_histograms(
+            ax,
+            direct_param_decisions,
+            parameter_bounds,
+        )
+    elif uses_llm and policy_mode_history:
         mode_colors = {
             "stable": "tab:blue",
             "push": "tab:green",
@@ -485,6 +594,12 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         if "heading_track_weight" in data.files
         else None
     )
+    direct_param_decisions = _direct_parameter_decisions(data)
+    parameter_bounds = (
+        np.asarray(data["llm_parameter_bounds"], dtype=float)
+        if "llm_parameter_bounds" in data.files
+        else np.asarray(list(sim_params.LLM_PARAMETER_BOUNDS.values()), dtype=float)
+    )
 
     track_csv = _scalar_string(data["track_csv"]) if "track_csv" in data.files else "track_csv/berlin_2018.csv"
     raceline_csv = (
@@ -545,6 +660,8 @@ def plot_trace_npz(trace_path="simulation_trace.npz"):
         velocity_dt_multiplier=1,
         velocity_track_weight=velocity_track_weight,
         heading_track_weight=heading_track_weight,
+        direct_param_decisions=direct_param_decisions,
+        parameter_bounds=parameter_bounds,
     )
 
 
