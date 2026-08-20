@@ -950,8 +950,8 @@ class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
     def __init__(
         self,
         *args,
-        search_points=3,
-        search_passes=1,
+        search_points=5,
+        search_passes=2,
         update_interval_seconds=1.0,
         initial_params=None,
         convergence_tolerance=1.0e-3,
@@ -970,7 +970,7 @@ class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
             raise ValueError("ParameterIBRPolicy initial_params must contain q, zeta, s1, s2, s3")
         bounds = np.asarray(self.PARAM_BOUNDS, dtype=float)
         self.params = np.clip(self.params, bounds[:, 0], bounds[:, 1])
-        self.search_points = max(2, int(search_points))
+        self.search_points = max(3, int(search_points))
         self.search_passes = max(1, int(search_passes))
         self.update_interval_seconds = max(float(update_interval_seconds), 0.0)
         self.convergence_tolerance = max(float(convergence_tolerance), 0.0)
@@ -1032,12 +1032,25 @@ class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
         }
 
     def best_response(self, state, current_s, opponents):
-        """Coordinate search for one agent while opponent plans stay fixed."""
+        """Approximate one best response with bounded coarse-to-fine search.
+
+        Each sweep fixes four canonical parameters and searches the fifth in
+        a neighborhood of the current warm start.  The neighborhood initially
+        spans half of that parameter's allowed range and is halved after every
+        sweep.  Explicit lower/upper-bound candidates keep the local search
+        able to discover solutions near either end of the canonical range.
+
+        This is still a coordinate best response, but unlike the earlier
+        min/mid/max grid it can return progressively finer parameter values.
+        """
         bounds = np.asarray(self.PARAM_BOUNDS, dtype=float)
+        spans = bounds[:, 1] - bounds[:, 0]
         best = np.clip(np.asarray(self.params, dtype=float), bounds[:, 0], bounds[:, 1])
         best_score = -np.inf
         best_plan = None
         best_diagnostics = {}
+        candidate_evaluations = 0
+        failed_evaluations = 0
 
         # Evaluate the warm start first, then update one parameter at a time.
         try:
@@ -1047,12 +1060,17 @@ class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
         except Exception:
             pass
 
-        for _ in range(self.search_passes):
+        for search_pass in range(self.search_passes):
+            radius_fraction = 0.5 ** (search_pass + 1)
             for dim in range(5):
-                values = np.unique(np.concatenate((
-                    np.linspace(bounds[dim, 0], bounds[dim, 1], self.search_points),
-                    np.array([best[dim]]),
-                )))
+                radius = radius_fraction * spans[dim]
+                local_values = best[dim] + np.linspace(
+                    -radius, radius, self.search_points
+                )
+                values = np.unique(np.clip(np.concatenate((
+                    local_values,
+                    np.array([bounds[dim, 0], best[dim], bounds[dim, 1]]),
+                )), bounds[dim, 0], bounds[dim, 1]))
                 dimension_best = best.copy()
                 dimension_score = best_score
                 dimension_plan = best_plan
@@ -1060,11 +1078,13 @@ class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
                 for value in values:
                     candidate = best.copy()
                     candidate[dim] = value
+                    candidate_evaluations += 1
                     try:
                         score, plan, diagnostics = self._evaluate_candidate(
                             candidate, state, current_s, opponents
                         )
                     except Exception:
+                        failed_evaluations += 1
                         continue
                     if score > dimension_score:
                         dimension_best = candidate
@@ -1085,6 +1105,11 @@ class ParameterIBRPolicy(_IBRPolicyMixin, MPCPolicy):
             **best_diagnostics,
             "score": float(best_score),
             "params": best.copy(),
+            "search_method": "coarse_to_fine_coordinate",
+            "search_points": self.search_points,
+            "search_passes": self.search_passes,
+            "candidate_evaluations": candidate_evaluations,
+            "failed_evaluations": failed_evaluations,
         }
         return best.copy(), best_plan.copy()
 

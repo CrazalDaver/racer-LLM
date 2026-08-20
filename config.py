@@ -296,14 +296,14 @@ class SimParams:
     IBR_HISTORICAL_ITERATIONS = 3
     IBR_HISTORICAL_FRICTION_COEFFICIENT = 1.6
 
-    # Five-parameter IBR oracle. Each best response searches canonical paper
+    # Five-parameter IBR diagnostic. Each best response searches canonical
     # coordinates (q, zeta, s1, s2, s3), while candidate actions and
     # trajectories are always produced by the shared alpha-RACER/LLM MPC.
     # This is intentionally slower than the learned potential policy and is
     # primarily an offline/reference baseline rather than a real-time method.
     PARAMETER_IBR_ROUNDS = 2
-    PARAMETER_IBR_SEARCH_POINTS = 3
-    PARAMETER_IBR_SEARCH_PASSES = 1
+    PARAMETER_IBR_SEARCH_POINTS = 5
+    PARAMETER_IBR_SEARCH_PASSES = 2
     PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = 1.0
     PARAMETER_IBR_CONVERGENCE_TOLERANCE = 1.0e-3
 

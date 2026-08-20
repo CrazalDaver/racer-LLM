@@ -1075,8 +1075,8 @@ if __name__ == "__main__":
             parser.error("--parameter-ibr-rounds must be at least 1")
         params.PARAMETER_IBR_ROUNDS = cli_args.parameter_ibr_rounds
     if cli_args.parameter_ibr_search_points is not None:
-        if cli_args.parameter_ibr_search_points < 2:
-            parser.error("--parameter-ibr-search-points must be at least 2")
+        if cli_args.parameter_ibr_search_points < 3:
+            parser.error("--parameter-ibr-search-points must be at least 3")
         params.PARAMETER_IBR_SEARCH_POINTS = cli_args.parameter_ibr_search_points
     if cli_args.parameter_ibr_update_interval is not None:
         if cli_args.parameter_ibr_update_interval < 0.0:

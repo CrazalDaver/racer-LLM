@@ -876,7 +876,7 @@ def _add_sim_args(parser):
         type=int,
         default=None,
         metavar="N",
-        help="Grid candidates per parameter dimension (minimum 2).",
+        help="Local candidates per parameter in coarse-to-fine search (minimum 3).",
     )
     group.add_argument(
         "--parameter-ibr-update-interval",
@@ -928,8 +928,8 @@ if __name__ == "__main__":
             raise ValueError("--parameter-ibr-rounds must be at least 1")
         params.PARAMETER_IBR_ROUNDS = args.parameter_ibr_rounds
     if args.parameter_ibr_search_points is not None:
-        if args.parameter_ibr_search_points < 2:
-            raise ValueError("--parameter-ibr-search-points must be at least 2")
+        if args.parameter_ibr_search_points < 3:
+            raise ValueError("--parameter-ibr-search-points must be at least 3")
         params.PARAMETER_IBR_SEARCH_POINTS = args.parameter_ibr_search_points
     if args.parameter_ibr_update_interval is not None:
         if args.parameter_ibr_update_interval < 0.0:
