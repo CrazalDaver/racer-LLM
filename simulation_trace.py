@@ -287,6 +287,19 @@ def record_simulation_step(
         )
         for policy in policies
     ])
+    for field in (
+        "progress_reward",
+        "lateral_cost",
+        "control_rate_cost",
+        "track_slack_cost",
+        "collision_slack_cost",
+    ):
+        trace[f"car_parameter_ibr_{field}"].append([
+            getattr(policy, "last_parameter_ibr_diagnostics", {}).get(
+                field, np.nan
+            )
+            for policy in policies
+        ])
     trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
     trace["car_policy_reason"].append([getattr(policy, "last_llm_reason", "") for policy in policies])
     trace["car_policy_basis"].append([getattr(policy, "last_llm_basis", "") for policy in policies])
@@ -327,8 +340,6 @@ def record_simulation_step(
         "max_collision_constraint",
         "min_predicted_longitudinal_distance",
         "min_predicted_lateral_distance",
-        "sensitivity_gradient_norm",
-        "sensitivity_loss",
     )
     for field in diagnostic_fields:
         trace[f"car_ibr_{field}"].append(
@@ -337,17 +348,6 @@ def record_simulation_step(
                 for policy in policies
             ]
         )
-    trace["car_ibr_max_collision_multiplier"].append(
-        [
-            float(np.max(diagnostics["collision_multipliers"]))
-            if (diagnostics := getattr(policy, "last_ibr_diagnostics", {})).get(
-                "collision_multipliers"
-            ) is not None
-            and np.size(diagnostics["collision_multipliers"])
-            else np.nan
-            for policy in policies
-        ]
-    )
     trace["car_ibr_max_collision_slack"].append(
         [
             float(np.max(diagnostics["collision_slack"]))
@@ -418,15 +418,6 @@ def save_simulation_trace(trace, track, params):
         ),
         car_ibr_min_predicted_lateral_distance=np.asarray(
             trace["car_ibr_min_predicted_lateral_distance"], dtype=float
-        ),
-        car_ibr_sensitivity_gradient_norm=np.asarray(
-            trace["car_ibr_sensitivity_gradient_norm"], dtype=float
-        ),
-        car_ibr_sensitivity_loss=np.asarray(
-            trace["car_ibr_sensitivity_loss"], dtype=float
-        ),
-        car_ibr_max_collision_multiplier=np.asarray(
-            trace["car_ibr_max_collision_multiplier"], dtype=float
         ),
         car_ibr_max_collision_slack=np.asarray(
             trace["car_ibr_max_collision_slack"], dtype=float
@@ -535,6 +526,21 @@ def save_simulation_trace(trace, track, params):
         car_parameter_ibr_predicted_progress=np.asarray(
             trace.get("car_parameter_ibr_predicted_progress", []), dtype=float
         ),
+        car_parameter_ibr_progress_reward=np.asarray(
+            trace.get("car_parameter_ibr_progress_reward", []), dtype=float
+        ),
+        car_parameter_ibr_lateral_cost=np.asarray(
+            trace.get("car_parameter_ibr_lateral_cost", []), dtype=float
+        ),
+        car_parameter_ibr_control_rate_cost=np.asarray(
+            trace.get("car_parameter_ibr_control_rate_cost", []), dtype=float
+        ),
+        car_parameter_ibr_track_slack_cost=np.asarray(
+            trace.get("car_parameter_ibr_track_slack_cost", []), dtype=float
+        ),
+        car_parameter_ibr_collision_slack_cost=np.asarray(
+            trace.get("car_parameter_ibr_collision_slack_cost", []), dtype=float
+        ),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
         car_policy_basis=np.asarray(trace.get("car_policy_basis", []), dtype=str),
@@ -575,7 +581,7 @@ def save_simulation_trace(trace, track, params):
         ),
         initial_speeds=np.asarray(trace.get("initial_speeds", []), dtype=float),
         track_csv=np.asarray(params.TRACK_CSV),
-        raceline_csv=np.asarray(params.RACELINE_CSV),
+        raceline_csv=np.asarray(trace.get("raceline_csv", params.RACELINE_CSV)),
         track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),
         track_width=np.asarray(params.TRACK_WIDTH),
         track_half_width=np.asarray(getattr(params, "TRACK_HALF_WIDTH", params.TRACK_WIDTH / 2.0)),
@@ -626,8 +632,6 @@ def save_simulation_trace(trace, track, params):
         ibr_implementation=np.asarray(
             trace.get("ibr_implementation", params.IBR_IMPLEMENTATION)
         ),
-        ibr_sensitivity_weight=np.asarray(params.IBR_SENSITIVITY_WEIGHT),
-        ibr_se_enabled=np.asarray(params.IBR_SENSITIVITY_WEIGHT > 0.0),
         ibr_progress_weight=np.asarray(params.IBR_PROGRESS_WEIGHT),
         ibr_lateral_weight=np.asarray(params.IBR_LATERAL_WEIGHT),
         ibr_lateral_exponent=np.asarray(params.IBR_LATERAL_EXPONENT),

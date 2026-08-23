@@ -218,7 +218,7 @@ In short, one best-response update is
   \theta_i^{\ell+1}
   \in\arg\min_{\theta_i} f_i(\theta_i,\theta_{-i}^{\ell}).
 \]
-The current solver is \code{policy/ibr.py::\_WangIBRSolver}, selected by
+The current solver is \code{policy/ibr/trajectory\_ibr.py::\_WangIBRSolver}, selected by
 \code{IBR\_IMPLEMENTATION=local\_wang}. It does not copy Wang's low-level
 solver. Instead, it uses the state and controls already used in this project:
 \[
@@ -275,28 +275,6 @@ compressed pack. Once the solver fails, fallback control can move the car even
 farther away and cause a failure loop. Slack magnitude and activation are now
 saved in the NPZ and JSON results, so this numerical mechanism can be reported
 rather than hidden.
-
-\subsection{Why SE is currently off}
-
-Wang's sensitivity enhancement tries to estimate how the opponent's optimum
-changes when the ego trajectory changes. It differentiates the opponent's KKT
-conditions. Roughly, an active collision constraint with a large multiplier
-means that the ego may be able to force the opponent to yield. This adds more
-information than ordinary IBR, where the other trajectory is frozen during one
-best-response solve.
-
-We implemented this as an option, but left its default weight at zero. The
-problem is that Wang derives the sensitivity from a hard collision constraint,
-whereas the local problem sometimes needs collision slack. When this slack is
-active, its multiplier is approximately
-\[
-  \lambda_c\approx2\rho_c\epsilon_c.
-\]
-This makes the SE scale depend on the numerical slack penalty $\rho_c$, not
-only on strategic interaction. Earlier tests with SE weights 0, 0.01, 0.05,
-and 0.10 also produced almost identical progress and very small sensitivity
-loss. SE therefore remains in the code for optional experiments, but ordinary
-IBR is the version used as the baseline.
 
 \subsection{Tests used to choose the current objective}
 

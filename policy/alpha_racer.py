@@ -10,7 +10,7 @@ except ImportError:
 
 from state import CarState
 
-from .alpha_model import (
+from .alpha_network import (
     ALPHA_PARAMETER_BOUNDS,
     SimpleNeuralNetwork,
     build_alpha_input,

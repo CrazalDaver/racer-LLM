@@ -20,7 +20,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from config import params
-from policy.alpha_model import (
+from policy.alpha_network import (
     ALPHA_INPUT_SIZE,
     ALPHA_PARAMETER_BOUNDS,
     ALPHA_VALUE_HIDDEN_SIZES,

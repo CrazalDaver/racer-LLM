@@ -797,6 +797,12 @@ def _add_sim_args(parser):
     group = parser.add_argument_group("simulation")
     group.add_argument("--vehicle-model", choices=["kinematic", "kinetic", "kinetics", "dbm"], default=None)
     group.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
+    group.add_argument(
+        "--raceline-csv",
+        type=Path,
+        default=None,
+        help="Override the track's registered raceline CSV for this experiment.",
+    )
     group.add_argument("--start-gap", type=float, default=None, metavar="METERS")
     group.add_argument(
         "--initial-speeds",
@@ -837,23 +843,10 @@ def _add_sim_args(parser):
         choices=["local_wang", "historical_strict"],
         default="local_wang",
         help=(
-            "IBR solver: local_wang uses local dynamics and supports SE; "
+            "IBR solver: local_wang uses local dynamics; "
             "historical_strict is the locally adapted alpha-RACER IBR "
             "(default: local_wang)."
         ),
-    )
-    group.add_argument(
-        "--ibr-se",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable SE-IBR using config.IBR_SE_DEFAULT_WEIGHT (default: ordinary IBR).",
-    )
-    group.add_argument(
-        "--ibr-sensitivity-weight",
-        type=float,
-        default=None,
-        metavar="ALPHA",
-        help="Set Wang SE-IBR alpha explicitly; 0 selects ordinary IBR.",
     )
     group.add_argument(
         "--ibr-speed-cap",
@@ -913,14 +906,6 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     params.IBR_IMPLEMENTATION = args.ibr_implementation
-    if args.ibr_sensitivity_weight is not None:
-        if args.ibr_sensitivity_weight < 0.0:
-            raise ValueError("--ibr-sensitivity-weight must be non-negative")
-        params.IBR_SENSITIVITY_WEIGHT = args.ibr_sensitivity_weight
-    elif args.ibr_se is True:
-        params.IBR_SENSITIVITY_WEIGHT = params.IBR_SE_DEFAULT_WEIGHT
-    elif args.ibr_se is False:
-        params.IBR_SENSITIVITY_WEIGHT = 0.0
     if args.ibr_speed_cap is not None:
         params.IBR_SPEED_CAP_MODE = args.ibr_speed_cap
     if args.parameter_ibr_rounds is not None:
@@ -940,6 +925,7 @@ if __name__ == "__main__":
         ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
         vehicle_model_type=args.vehicle_model or "kinematic",
         total_time=args.total_time,
+        raceline_csv=args.raceline_csv,
         start_gap=args.start_gap,
         initial_speeds=args.initial_speeds,
         static_policy_params=args.static_params,

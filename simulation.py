@@ -311,7 +311,6 @@ def create_policy(
             car_idx=car_idx,
             policy_name=policy_type,
             iterations=params.IBR_ITERATIONS,
-            sensitivity_weight=params.IBR_SENSITIVITY_WEIGHT,
             implementation=(
                 params.IBR_IMPLEMENTATION
                 if ibr_implementation is None
@@ -342,6 +341,7 @@ def run_simulation(
     policy_type="centerline",
     track_name=None,
     track_scale=None,
+    raceline_csv=None,
     save_trace=True,
     show_plot=True,
     num_cars=None,
@@ -382,7 +382,8 @@ def run_simulation(
         params.TRACK_SCALE = float(track_scale)
 
     waypoints = load_centerline_csv(params.TRACK_CSV, scale=params.TRACK_SCALE)
-    raceline = load_raceline_csv(params.RACELINE_CSV, scale=params.TRACK_SCALE)
+    selected_raceline = params.RACELINE_CSV if raceline_csv is None else str(raceline_csv)
+    raceline = load_raceline_csv(selected_raceline, scale=params.TRACK_SCALE)
     track = Track(waypoints)
 
     if num_cars is None and policy_names is not None:
@@ -592,6 +593,7 @@ def run_simulation(
         vehicle_model_type=vehicle_model_type,
         mpc_velocity_track_weight=mpc_velocity_track_weight,
     )
+    trace["raceline_csv"] = selected_raceline
     ref_component_horizon = max(mpc.horizon for mpc in mpcs) + 1
 
     def ref_component_snapshot(policy, name):
@@ -1021,22 +1023,6 @@ if __name__ == "__main__":
         default="local_wang",
         help="IBR solver implementation (default: local_wang).",
     )
-    parser.add_argument(
-        "--ibr-se",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Enable sensitivity enhancement with config.IBR_SE_DEFAULT_WEIGHT. "
-            "Ordinary IBR without SE is the default."
-        ),
-    )
-    parser.add_argument(
-        "--ibr-sensitivity-weight",
-        type=float,
-        default=None,
-        metavar="ALPHA",
-        help="Explicit SE weight; 0 selects ordinary IBR and overrides --ibr-se.",
-    )
     parser.add_argument("--parameter-ibr-rounds", type=int, default=None, metavar="N")
     parser.add_argument("--parameter-ibr-search-points", type=int, default=None, metavar="N")
     parser.add_argument(
@@ -1044,6 +1030,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
+    parser.add_argument(
+        "--raceline-csv",
+        default=None,
+        metavar="CSV",
+        help="Override the registered track raceline without changing config.py.",
+    )
     parser.add_argument("--start-gap", type=float, default=None, metavar="METERS")
     parser.add_argument(
         "--initial-speeds",
@@ -1062,14 +1054,6 @@ if __name__ == "__main__":
     )
     cli_args = parser.parse_args()
 
-    if cli_args.ibr_sensitivity_weight is not None:
-        if cli_args.ibr_sensitivity_weight < 0.0:
-            parser.error("--ibr-sensitivity-weight must be non-negative")
-        params.IBR_SENSITIVITY_WEIGHT = cli_args.ibr_sensitivity_weight
-    elif cli_args.ibr_se:
-        params.IBR_SENSITIVITY_WEIGHT = params.IBR_SE_DEFAULT_WEIGHT
-    else:
-        params.IBR_SENSITIVITY_WEIGHT = 0.0
     if cli_args.parameter_ibr_rounds is not None:
         if cli_args.parameter_ibr_rounds < 1:
             parser.error("--parameter-ibr-rounds must be at least 1")
@@ -1089,10 +1073,8 @@ if __name__ == "__main__":
     # You can also pass per-car policies, e.g. policy_names=["alpha", "IBR", "IBR"].
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
-    # Ordinary IBR (default, no SE):
+    # Wang-style trajectory IBR:
     # .venv/bin/python simulation.py --policies ibr ibr ibr --no-plot
-    # Optional SE-IBR:
-    # .venv/bin/python simulation.py --policies ibr ibr ibr --ibr-se --no-plot
     # Five-parameter IBR using the same low-level MPC as alpha-RACER/LLM:
     # .venv/bin/python simulation.py --policies parameter_ibr parameter_ibr parameter_ibr --no-plot
     run_simulation(
@@ -1104,6 +1086,7 @@ if __name__ == "__main__":
         vehicle_model_type="kinematic", ego_position=cli_args.ego_position,
         ibr_implementation=cli_args.ibr_implementation,
         total_time=cli_args.total_time,
+        raceline_csv=cli_args.raceline_csv,
         start_gap=cli_args.start_gap,
         initial_speeds=cli_args.initial_speeds,
         show_plot=not cli_args.no_plot,

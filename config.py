@@ -49,11 +49,12 @@ class DynamicParams:
             raise ValueError(f"Unknown vehicle model: {vehicle_model_type}")
 
     def _use_kinematic_baseline(self):
-        # Match the alpha-RACER ROS kinematic baseline while using the larger
-        # steering scale needed by the current raceline curvature.
+        # Match the released alpha-RACER ROS MPC prediction model.  Earlier
+        # local revisions used Sa=0.80 as a raceline-tracking workaround,
+        # which more than doubled the modeled steering authority.
         self.LF = 0.11
         self.LR = 0.23
-        self.Sa = 0.80 # 
+        self.Sa = 0.34
         self.Sb = 0.0
         self.Ta = 20.0 / 4.65
         self.Tb = 0.0
@@ -251,20 +252,16 @@ class SimParams:
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
     SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
     # IBR_IMPLEMENTATION choices:
-    #   local_wang      Wang-style IBR/SE-IBR using this project's dynamics,
+    #   local_wang      Wang-style IBR using this project's dynamics,
     #                   constraints, action definition, and MPC timing.
-    #   historical_strict restored local _StrictIBRSolver used from commit
+    #   historical_strict restores the local strict solver used from commit
     #                   5ab4f74 onward: upstream objective plus local vehicle
     #                   parameters, hard track bounds, and own-action recovery.
-    # SE is intentionally available only for local_wang.
     IBR_IMPLEMENTATION = "local_wang"
     # local_wang uses complete ego/opponent rounds and finishes with a final
-    # ego solve. IBR_SENSITIVITY_WEIGHT=0 is ordinary IBR; positive values
-    # enable the sensitivity-enhanced loss from Wang et al. (2019).
+    # ego solve.
     IBR_HORIZON = 10
     IBR_ITERATIONS = 2
-    IBR_SENSITIVITY_WEIGHT = 0.0
-    IBR_SE_DEFAULT_WEIGHT = 0.05
     IBR_PROGRESS_WEIGHT = 10.0
     # IBR objective audit (2026-08): progress is the Wang-style racing
     # objective. Across six scenarios, the released alpha-RACER IBR's 10*e^4

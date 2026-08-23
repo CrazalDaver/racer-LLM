@@ -86,14 +86,6 @@ a small number of rounds:
   \in\arg\min_{\theta_i} f_i(\theta_i,\theta_{-i}^{\ell}).
 \]
 
-Wang's sensitivity-enhanced IBR (SE-IBR) additionally estimates how an
-opponent's optimum will change in response to the ego trajectory. The response
-is obtained by differentiating the opponent's KKT conditions. Intuitively, an
-active collision constraint with a large multiplier indicates that changing the
-ego trajectory may force the opponent to yield. This gives the ego more
-information than ordinary IBR, which treats the current opponent trajectory as
-fixed during each solve.
-
 The original Wang implementation and our platform differ substantially in
 trajectory parameterization, collision constraints, and dynamics. The recent
 implementation therefore follows the alternating best-response idea using our
@@ -243,7 +235,7 @@ different gaps, or different tracks.
 
 \subsection{What was implemented}
 
-The main solver is \code{policy/ibr.py::\_WangIBRSolver}, selected by
+The main solver is \code{policy/ibr/trajectory\_ibr.py::\_WangIBRSolver}, selected by
 \code{IBR\_IMPLEMENTATION=local\_wang}. Its state is
 \[
   x_i=[s_i,e_i,\Delta\psi_i,v_i]^\top,
@@ -277,28 +269,6 @@ port. It is not the primary baseline because it preserves brittle hard
 constraints, an apparent collision-expression error from the released code, and
 an ad hoc heading correction.
 
-\subsection{Why SE is not used in the main baseline}
-
-SE was implemented as an optional experiment, but the default sensitivity
-weight is now zero.
-
-The main issue is the interpretation of collision multipliers. Wang's SE term is
-derived from the KKT conditions of the original hard-constrained trajectory
-problem. Our local collision constraint has nonnegative slack with a quadratic
-penalty. When collision slack is active, its multiplier is approximately
-\[
-  \lambda_c\approx2\rho_c\epsilon_c.
-\]
-The multiplier therefore depends strongly on the engineering choice of slack
-penalty $\rho_c$. A sensitivity term using this multiplier can change scale when
-we tune numerical feasibility, even if the strategic interaction is unchanged.
-
-Tests with SE weights 0, 0.01, 0.05, and 0.10 produced almost identical final
-progress. The calculated sensitivity loss was also very small. SE therefore
-added theoretical and tuning complexity without a clear benefit in the current
-platform. It remains optional exploratory code but is not planned for the main
-comparison.
-
 \subsection{Short validation run}
 
 Three ordinary 10 s IBR races were run with each ego start position. Their final
@@ -331,10 +301,7 @@ but it should not yet be described as satisfying the real-time deadline.
 \begin{itemize}
   \item Use the local $\alpha$-RACER checkpoint as the main learned
   non-LLM baseline, while retaining the released checkpoint for reference.
-  \item Freeze \code{local\_wang} with sensitivity weight zero as the main IBR
-  configuration.
-  \item Keep SE outside the primary experiments unless a later result gives a
-  clear reason to revisit the multiplier/slack coupling.
+  \item Freeze \code{local\_wang} as the main trajectory IBR configuration.
   \item Do not weaken IBR merely because the current LLM car is slower. First
   inspect the LLM-selected parameters, reference speed, and avoidance behavior.
   \item Record both the nominal track-boundary violation $|e|>0.44$ m and the

@@ -1,4 +1,4 @@
-"""Shared alpha-RACER model and feature definitions.
+"""Shared alpha-RACER network and feature definitions.
 
 Keeping these definitions outside the online policy makes locally trained
 checkpoints structurally identical to the models used at inference time.
