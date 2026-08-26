@@ -365,6 +365,10 @@ class SelfPlayRLPolicy(BasePolicy):
         self.mpc.last_action_loss = np.nan
         self.mpc.last_velocity_loss = np.nan
         self.mpc.last_heading_loss = np.nan
+        self.mpc.last_terminal_viability_loss = np.nan
+        self.mpc.last_terminal_viability_violation = np.nan
+        self.mpc.last_stall_debt_loss = np.nan
+        self.mpc.last_stall_debt_deficit = np.nan
         self.mpc.last_violation_loss = np.nan
         self.mpc.last_track_slack_plan = None
         self.mpc.last_collision_slack_plan = None

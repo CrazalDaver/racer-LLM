@@ -5,6 +5,7 @@ import numpy as np
 from collision import oriented_rectangle_overlap_cost
 from config import duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
+from mpc_upstream_simple import UpstreamSimpleMPCController
 from plotting import plot_simulation_results
 from policy import (
     AlphaRacerPolicy,
@@ -371,6 +372,10 @@ def run_simulation(
     initial_lateral_offsets=None,
     initial_speeds=None,
     velocity_track_weight=None,
+    terminal_viability_weight=None,
+    stall_debt_max_weight=None,
+    track_slack_weight=None,
+    mpc_formulation=None,
     horizon=None,
     ego_position=1,
     total_time=None,
@@ -447,6 +452,46 @@ def run_simulation(
     mpc_velocity_track_weight = (
         params.VELOCITY_TRACK_WEIGHT if velocity_track_weight is None else float(velocity_track_weight)
     )
+    if mpc_velocity_track_weight < 0.0:
+        raise ValueError("velocity_track_weight must be non-negative")
+    mpc_terminal_viability_weight = (
+        params.MPC_TERMINAL_VIABILITY_WEIGHT
+        if terminal_viability_weight is None
+        else float(terminal_viability_weight)
+    )
+    if mpc_terminal_viability_weight < 0.0:
+        raise ValueError("terminal_viability_weight must be non-negative")
+    mpc_stall_debt_max_weight = (
+        params.MPC_STALL_DEBT_MAX_WEIGHT
+        if stall_debt_max_weight is None
+        else float(stall_debt_max_weight)
+    )
+    if mpc_stall_debt_max_weight < 0.0:
+        raise ValueError("stall_debt_max_weight must be non-negative")
+    mpc_track_slack_weight = (
+        params.MPC_TRACK_SLACK_WEIGHT
+        if track_slack_weight is None
+        else float(track_slack_weight)
+    )
+    if mpc_track_slack_weight < 0.0:
+        raise ValueError("track_slack_weight must be non-negative")
+    resolved_mpc_formulation = (
+        params.MPC_FORMULATION if mpc_formulation is None else str(mpc_formulation)
+    )
+    controller_types = {
+        "constrained_local": MPCController,
+        "upstream_simple": UpstreamSimpleMPCController,
+    }
+    if resolved_mpc_formulation not in controller_types:
+        raise ValueError(
+            "mpc_formulation must be one of "
+            f"{sorted(controller_types)}, got {resolved_mpc_formulation!r}"
+        )
+    controller_type = controller_types[resolved_mpc_formulation]
+    if resolved_mpc_formulation == "upstream_simple":
+        # The detachable profile intentionally excludes velocity tracking,
+        # irrespective of the constrained controller's configured default.
+        mpc_velocity_track_weight = 0.0
 
     mpcs = []
     policies = []
@@ -459,7 +504,7 @@ def run_simulation(
             if horizon is None and policy_name == "ibr"
             else mpc_horizon
         )
-        mpc = MPCController(
+        mpc = controller_type(
             dt=params.MPC_DT,
             horizon=car_mpc_horizon,
             Q=params.Q,
@@ -472,6 +517,15 @@ def run_simulation(
             max_state_speed=params.MAX_STATE_SPEED,
             velocity_track_weight=mpc_velocity_track_weight,
             heading_track_weight=params.HEADING_TRACK_WEIGHT,
+            terminal_viability_weight=mpc_terminal_viability_weight,
+            stall_debt_max_weight=mpc_stall_debt_max_weight,
+            stall_debt_base_weight=params.MPC_STALL_DEBT_BASE_WEIGHT,
+            stall_debt_activation_seconds=params.MPC_STALL_DEBT_ACTIVATION_SECONDS,
+            stall_debt_exponential_time_scale=params.MPC_STALL_DEBT_EXPONENTIAL_TIME_SCALE,
+            stall_debt_speed_threshold=params.MPC_STALL_DEBT_SPEED_THRESHOLD,
+            stall_debt_progress_rate_threshold=params.MPC_STALL_DEBT_PROGRESS_RATE_THRESHOLD,
+            stall_debt_recovery_decay_rate=params.MPC_STALL_DEBT_RECOVERY_DECAY_RATE,
+            stall_debt_minimum_horizon_progress=params.MPC_STALL_DEBT_MINIMUM_HORIZON_PROGRESS,
             track_length=track.total_length,
             min_longitudinal_separation=params.MPC_MIN_LONGITUDINAL_SEPARATION,
             min_lateral_separation=params.MPC_MIN_LATERAL_SEPARATION,
@@ -479,10 +533,11 @@ def run_simulation(
             collision_superellipse_exponent=params.MPC_COLLISION_SUPERELLIPSE_EXPONENT,
             enforce_track_boundary=params.MPC_ENFORCE_TRACK_BOUNDARY,
             enforce_collision_avoidance=params.MPC_ENFORCE_COLLISION_AVOIDANCE,
-            track_slack_weight=params.MPC_TRACK_SLACK_WEIGHT,
+            track_slack_weight=mpc_track_slack_weight,
             collision_slack_weight=params.MPC_COLLISION_SLACK_WEIGHT,
             enforce_friction_speed_limit=params.MPC_ENFORCE_FRICTION_SPEED_LIMIT,
             friction_coefficient=params.MPC_FRICTION_COEFFICIENT,
+            track=track,
         )
         mpcs.append(mpc)
         policies.append(
@@ -592,8 +647,13 @@ def run_simulation(
         initial_speeds=initial_speeds,
         vehicle_model_type=vehicle_model_type,
         mpc_velocity_track_weight=mpc_velocity_track_weight,
+        mpc_terminal_viability_weight=mpc_terminal_viability_weight,
+        mpc_stall_debt_max_weight=mpc_stall_debt_max_weight,
+        mpc_track_slack_weight=mpc_track_slack_weight,
     )
     trace["raceline_csv"] = selected_raceline
+    trace["mpc_horizon"] = int(mpc_horizon)
+    trace["mpc_formulation"] = resolved_mpc_formulation
     ref_component_horizon = max(mpc.horizon for mpc in mpcs) + 1
 
     def ref_component_snapshot(policy, name):
@@ -613,6 +673,7 @@ def run_simulation(
             f"half_width={params.TRACK_HALF_WIDTH:g}, "
             f"policies={resolved_policy_names}, ego_start_position={ego_position}/{num_cars}, "
             f"vehicle_model={vehicle_model_type}, "
+            f"mpc_formulation={resolved_mpc_formulation}, "
             f"timing=sim:{params.SIM_DT:g}s/control:{params.CONTROL_DT:g}s/"
             f"mpc:{params.MPC_DT:g}s"
         )
@@ -643,6 +704,8 @@ def run_simulation(
     early_stop_reason = ""
     last_step = -1
     held_actions = [CarAction(throttle=0.0, steer=0.0) for _ in range(num_cars)]
+    low_speed_boundary_timers = np.zeros(num_cars, dtype=float)
+    low_speed_boundary_recovery_latched = np.zeros(num_cars, dtype=bool)
     for step in progress_iter:
         last_step = step
         car_s = []
@@ -701,6 +764,7 @@ def run_simulation(
         # Apply off-track recovery to all cars when happens
         offroad_recovery_active = []
         offroad_recovery_heading_error = []
+        low_speed_boundary_recovery_active = []
         recovery_dt_ratio = params.SIM_DT / params.CONTROL_DT
 
         for car_idx, state in enumerate(states):
@@ -709,45 +773,97 @@ def run_simulation(
             heading_error = track_heading_error(track, state.psi, car_s[car_idx])
             offroad_recovery_active.append(active)
             offroad_recovery_heading_error.append(heading_error if active else 0.0)
-            if not active:
-                continue
 
-            overshoot = abs(e) - offroad_recovery_threshold
-            speed_factor = np.exp(
-                -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
-            )
+            if active:
+                overshoot = abs(e) - offroad_recovery_threshold
+                speed_factor = np.exp(
+                    -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
+                )
 
-            # off-road penalty on velocity
-            state.vx *= speed_factor
-            state.vy *= speed_factor
+                # Released alpha-RACER recovery outside |e| = 0.55 m.  This
+                # older mechanism modifies state as well as the command.
+                state.vx *= speed_factor
+                state.vy *= speed_factor
+                heading_blend = 1.0 - np.exp(
+                    -params.OFFROAD_HEADING_REALIGN_STRENGTH
+                    * overshoot
+                    * recovery_dt_ratio
+                )
+                state.psi = np.arctan2(
+                    np.sin(state.psi + heading_blend * heading_error),
+                    np.cos(state.psi + heading_blend * heading_error),
+                )
+                steer_blend = 1.0 - np.exp(
+                    -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
+                )
+                inward_steer = -np.sign(e) * params.OFFROAD_INWARD_STEER
+                actions[car_idx].steer += (
+                    inward_steer - actions[car_idx].steer
+                ) * steer_blend
+                if abs(heading_error) > params.OFFROAD_LARGE_HEADING_ERROR:
+                    actions[car_idx].throttle += params.OFFROAD_THROTTLE_BOOST
+                if state.vx < params.OFFROAD_LOW_SPEED_THRESHOLD:
+                    vehicle_params_for_car = vehicle_models[car_idx].p
+                    neutral_command = neutral_throttle(state.vx, vehicle_params_for_car)
+                    actions[car_idx].throttle = max(
+                        actions[car_idx].throttle,
+                        neutral_command + params.OFFROAD_THROTTLE_BOOST,
+                    )
 
-            # mandatory heading realignment when off-road
-            heading_blend = 1.0 - np.exp(
-                -params.OFFROAD_HEADING_REALIGN_STRENGTH
-                * overshoot
-                * recovery_dt_ratio
+            # A narrow, policy-independent escape for the local kinematic
+            # model's zero-speed equilibrium.  It is deliberately action-only:
+            # no position, heading, or velocity is teleported.  Once latched,
+            # recovery continues until the car is both moving and back inside
+            # the smaller exit boundary.
+            near_boundary = (
+                abs(e)
+                >= params.LOW_SPEED_BOUNDARY_TRIGGER_FRACTION * track_half_width
             )
-            state.psi = np.arctan2(
-                np.sin(state.psi + heading_blend * heading_error),
-                np.cos(state.psi + heading_blend * heading_error),
+            nearly_stopped = abs(state.vx) <= params.LOW_SPEED_BOUNDARY_TRIGGER_SPEED
+            eligible = (
+                params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED
+                and step * params.SIM_DT >= params.LOW_SPEED_BOUNDARY_MIN_SIM_TIME
+                and near_boundary
+                and nearly_stopped
             )
+            if not low_speed_boundary_recovery_latched[car_idx]:
+                low_speed_boundary_timers[car_idx] = (
+                    low_speed_boundary_timers[car_idx] + params.SIM_DT
+                    if eligible
+                    else 0.0
+                )
+                if (
+                    low_speed_boundary_timers[car_idx]
+                    >= params.LOW_SPEED_BOUNDARY_TRIGGER_SECONDS
+                ):
+                    low_speed_boundary_recovery_latched[car_idx] = True
+            else:
+                recovered = (
+                    abs(e)
+                    <= params.LOW_SPEED_BOUNDARY_EXIT_FRACTION * track_half_width
+                    and state.vx >= params.LOW_SPEED_BOUNDARY_EXIT_SPEED
+                )
+                if recovered:
+                    low_speed_boundary_recovery_latched[car_idx] = False
+                    low_speed_boundary_timers[car_idx] = 0.0
 
-            # mandatory inward steering when off-road
-            steer_blend = 1.0 - np.exp(
-                -params.OFFROAD_STRENGTH * overshoot * recovery_dt_ratio
+            low_speed_active = bool(
+                low_speed_boundary_recovery_latched[car_idx]
             )
-            inward_steer = -np.sign(e) * params.OFFROAD_INWARD_STEER
-            actions[car_idx].steer += (
-                inward_steer - actions[car_idx].steer
-            ) * steer_blend
-            if abs(heading_error) > params.OFFROAD_LARGE_HEADING_ERROR:
-                actions[car_idx].throttle += params.OFFROAD_THROTTLE_BOOST
-            if state.vx < params.OFFROAD_LOW_SPEED_THRESHOLD:
+            low_speed_boundary_recovery_active.append(low_speed_active)
+            if low_speed_active:
                 vehicle_params_for_car = vehicle_models[car_idx].p
                 neutral_command = neutral_throttle(state.vx, vehicle_params_for_car)
                 actions[car_idx].throttle = max(
                     actions[car_idx].throttle,
                     neutral_command + params.OFFROAD_THROTTLE_BOOST,
+                )
+                inward_with_heading = (
+                    -e / track_half_width
+                    + params.LOW_SPEED_BOUNDARY_HEADING_GAIN * heading_error
+                )
+                actions[car_idx].steer = float(
+                    np.clip(inward_with_heading, -1.0, 1.0)
                 )
 
             actions[car_idx].steer = float(np.clip(actions[car_idx].steer, -1.0, 1.0))
@@ -774,6 +890,9 @@ def run_simulation(
             control_update=control_update,
             offroad_recovery_active=offroad_recovery_active,
             offroad_recovery_heading_error=offroad_recovery_heading_error,
+            low_speed_boundary_recovery_active=(
+                low_speed_boundary_recovery_active
+            ),
             ref_component_snapshot=ref_component_snapshot,
         )
 
@@ -1031,6 +1150,43 @@ if __name__ == "__main__":
     parser.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
     parser.add_argument(
+        "--mpc-velocity-track-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help="Override the shared MPC reference-speed tracking weight.",
+    )
+    parser.add_argument(
+        "--mpc-terminal-viability-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help=(
+            "Enable the optional terminal turning-room audit term; "
+            "0 (the default) disables it."
+        ),
+    )
+    parser.add_argument(
+        "--mpc-stall-debt-max-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help="Enable the detachable history-dependent MPC anti-stall audit.",
+    )
+    parser.add_argument(
+        "--mpc-track-slack-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help="Override the quadratic MPC track-boundary slack weight.",
+    )
+    parser.add_argument(
+        "--mpc-formulation",
+        choices=["constrained_local", "upstream_simple"],
+        default=None,
+        help="Select the local constrained or detachable upstream-style MPC.",
+    )
+    parser.add_argument(
         "--raceline-csv",
         default=None,
         metavar="CSV",
@@ -1052,7 +1208,33 @@ if __name__ == "__main__":
         default=None,
         help="Enable or disable validation/correction of LLM policy modes.",
     )
+    parser.add_argument(
+        "--low-speed-boundary-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable the sustained low-speed boundary escape.",
+    )
     cli_args = parser.parse_args()
+
+    if cli_args.low_speed_boundary_recovery is not None:
+        params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = (
+            cli_args.low_speed_boundary_recovery
+        )
+    if (
+        cli_args.mpc_terminal_viability_weight is not None
+        and cli_args.mpc_terminal_viability_weight < 0.0
+    ):
+        parser.error("--mpc-terminal-viability-weight must be non-negative")
+    if (
+        cli_args.mpc_stall_debt_max_weight is not None
+        and cli_args.mpc_stall_debt_max_weight < 0.0
+    ):
+        parser.error("--mpc-stall-debt-max-weight must be non-negative")
+    if (
+        cli_args.mpc_track_slack_weight is not None
+        and cli_args.mpc_track_slack_weight < 0.0
+    ):
+        parser.error("--mpc-track-slack-weight must be non-negative")
 
     if cli_args.parameter_ibr_rounds is not None:
         if cli_args.parameter_ibr_rounds < 1:
@@ -1089,6 +1271,11 @@ if __name__ == "__main__":
         raceline_csv=cli_args.raceline_csv,
         start_gap=cli_args.start_gap,
         initial_speeds=cli_args.initial_speeds,
+        velocity_track_weight=cli_args.mpc_velocity_track_weight,
+        terminal_viability_weight=cli_args.mpc_terminal_viability_weight,
+        stall_debt_max_weight=cli_args.mpc_stall_debt_max_weight,
+        track_slack_weight=cli_args.mpc_track_slack_weight,
+        mpc_formulation=cli_args.mpc_formulation,
         show_plot=not cli_args.no_plot,
         llm_temperature = 0.0,
         llm_safeguard_enabled=False,

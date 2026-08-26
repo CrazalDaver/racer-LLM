@@ -67,6 +67,7 @@ def kinematic_frenet_step(
     vehicle_params,
     *,
     curvature_mode="geometric",
+    minimum_denominator=0.05,
     symbolic=False,
 ):
     """Euler step for Frenet state ``[s, e, psi_error, v]``.
@@ -82,7 +83,22 @@ def kinematic_frenet_step(
     wheelbase = vehicle_params.LF + vehicle_params.LR
     steer = steering_angle(steering_command, vehicle_params)
     acceleration = longitudinal_acceleration(throttle, speed, vehicle_params)
-    denominator = 1.0 - e * curvature
+    raw_denominator = 1.0 - e * curvature
+    # Frenet coordinates are singular at 1-kappa*e=0.  The nominal track
+    # boundary stays on the valid side for the registered tracks, but a soft
+    # track constraint can temporarily predict beyond it.  A smooth lower
+    # bound keeps those recovery iterates finite without changing ordinary
+    # in-bound dynamics.
+    if curvature_mode == "geometric":
+        margin = float(minimum_denominator)
+        smoothing = 1.0e-4
+        denominator = 0.5 * (
+            raw_denominator
+            + margin
+            + trig.sqrt((raw_denominator - margin) ** 2 + smoothing**2)
+        )
+    else:
+        denominator = raw_denominator
     path_heading_rate = (
         speed * curvature
         if curvature_mode == "upstream_approx"
@@ -143,6 +159,13 @@ class DynamicBicycleModel:
         return np.array([dx, dy, dpsi, dvx, dvy, domega])
 
     def step(self, state, target_vel, target_steer):
+        # The released numerical OffroadCar environment clips longitudinal
+        # input to [0, 1] and steering to [-1, 1] immediately before its DBM
+        # step.  Keep that plant-side behavior here; the shared policy action
+        # interface remains [-1, 1] for kinematic experiments.
+        target_vel = float(np.clip(target_vel, 0.0, 1.0))
+        target_steer = float(np.clip(target_steer, -1.0, 1.0))
+
         def f(s, tv, ts):
             return self._dbm_dxdt(s, tv, ts)
 

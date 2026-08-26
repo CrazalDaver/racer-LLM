@@ -105,6 +105,7 @@ def make_mpc(track, vehicle_params, horizon):
         collision_slack_weight=params.MPC_COLLISION_SLACK_WEIGHT,
         enforce_friction_speed_limit=params.MPC_ENFORCE_FRICTION_SPEED_LIMIT,
         friction_coefficient=params.MPC_FRICTION_COEFFICIENT,
+        track=track,
     )
 
 

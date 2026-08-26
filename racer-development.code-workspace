@@ -1,0 +1,9 @@
+{
+  "folders": [
+    {"name": "racer-LLM", "path": "."},
+    {"name": "alpha-RACER (upstream)", "path": "../alpha-RACER"}
+  ],
+  "settings": {
+    "python.terminal.activateEnvironment": true
+  }
+}

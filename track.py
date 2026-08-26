@@ -213,6 +213,36 @@ class Track(ProjectablePath):
         dx, dy = self.tangents[idx]
         return math.atan2(dy, dx)
 
+    def curvature_profile(self, sample_step: float = 0.05, heading_window: float = 0.25):
+        """Return a periodic, numerically smoothed centerline curvature table.
+
+        The registered centerlines are polylines, so differentiating their
+        piecewise-constant segment headings would produce impulses at every
+        vertex.  A centered heading difference over ``heading_window`` is the
+        same geometric estimate already used by the trajectory IBR, while the
+        dense uniform grid makes it suitable for CasADi interpolation.
+
+        The endpoint is included and repeats the curvature at ``s=0`` so the
+        table is explicitly periodic.
+        """
+        sample_step = float(sample_step)
+        heading_window = float(heading_window)
+        if sample_step <= 0.0 or heading_window <= 0.0:
+            raise ValueError("curvature sampling distances must be positive")
+        sample_count = max(2, int(math.ceil(self.total_length / sample_step)))
+        progress = np.linspace(0.0, self.total_length, sample_count + 1)
+        curvature = np.empty_like(progress)
+        for idx, s in enumerate(progress[:-1]):
+            _, _, psi_before = self.interpolate(s - heading_window)
+            _, _, psi_after = self.interpolate(s + heading_window)
+            heading_delta = math.atan2(
+                math.sin(psi_after - psi_before),
+                math.cos(psi_after - psi_before),
+            )
+            curvature[idx] = heading_delta / (2.0 * heading_window)
+        curvature[-1] = curvature[0]
+        return progress, curvature
+
 
 def create_test_track(num_points=300, radius=14.0):
     t = np.linspace(0, 2 * np.pi, num_points)

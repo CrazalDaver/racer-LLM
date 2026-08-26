@@ -1,5 +1,6 @@
 from config import GRAVITY
-from vehicle_model import kinematic_global_step
+from vehicle_model import kinematic_frenet_step
+from mpc_stall_debt import StallDebtSettings, StallDebtTracker
 
 import numpy as np
 import casadi as cs
@@ -11,11 +12,15 @@ def wrap_angle(angle):
 
 class MPCController:
     """
-    Minimal alpha-RACER style MPC tracker.
+    Shared four-state Frenet kinematic MPC tracker.
 
-    The MPC prediction model is kinematic [x, y, psi, v], matching the
-    controller in car_ros2/mpc_controller.py. The simulation model remains DBM.
+    The simulator remains Cartesian, but the optimization state is
+    ``[s, e, psi_error, v]``.  This directly represents the paper's
+    longitudinal/lateral tracking and track constraint instead of projecting
+    symbolic Cartesian predictions through a future reference cross-section.
     """
+
+    _instance_counter = 0
 
     def __init__(
         self,
@@ -32,6 +37,15 @@ class MPCController:
         max_state_speed=5.0,
         velocity_track_weight=0.0,
         heading_track_weight=0.0,
+        terminal_viability_weight=0.0,
+        stall_debt_max_weight=0.0,
+        stall_debt_base_weight=10.0,
+        stall_debt_activation_seconds=0.5,
+        stall_debt_exponential_time_scale=0.5,
+        stall_debt_speed_threshold=0.10,
+        stall_debt_progress_rate_threshold=0.05,
+        stall_debt_recovery_decay_rate=2.0,
+        stall_debt_minimum_horizon_progress=0.50,
         track_length=None,
         min_longitudinal_separation=0.36,
         min_lateral_separation=0.20,
@@ -43,6 +57,7 @@ class MPCController:
         collision_slack_weight=1.0e3,
         enforce_friction_speed_limit=True,
         friction_coefficient=1.6,
+        track=None,
     ):
         self.dt = dt
         self.horizon = horizon
@@ -60,6 +75,17 @@ class MPCController:
         self.max_speed = max_state_speed
         self.velocity_track_weight = velocity_track_weight
         self.heading_track_weight = heading_track_weight
+        self.terminal_viability_weight = float(terminal_viability_weight)
+        self.stall_debt = StallDebtTracker(StallDebtSettings(
+            max_weight=float(stall_debt_max_weight),
+            base_weight=float(stall_debt_base_weight),
+            activation_seconds=float(stall_debt_activation_seconds),
+            exponential_time_scale=float(stall_debt_exponential_time_scale),
+            speed_threshold=float(stall_debt_speed_threshold),
+            progress_rate_threshold=float(stall_debt_progress_rate_threshold),
+            recovery_decay_rate=float(stall_debt_recovery_decay_rate),
+            minimum_horizon_progress=float(stall_debt_minimum_horizon_progress),
+        ))
         self.track_length = None if track_length is None else float(track_length)
         self.min_longitudinal_separation = float(min_longitudinal_separation)
         self.min_lateral_separation = float(min_lateral_separation)
@@ -71,12 +97,17 @@ class MPCController:
         self.collision_slack_weight = float(collision_slack_weight)
         self.enforce_friction_speed_limit = bool(enforce_friction_speed_limit)
         self.friction_coefficient = float(friction_coefficient)
+        if track is None:
+            raise ValueError("Frenet MPC requires the project Track instance")
+        self.track = track
         if self.min_longitudinal_separation <= 0.0 or self.min_lateral_separation <= 0.0:
             raise ValueError("MPC collision separations must be positive")
         if self.collision_superellipse_exponent < 2 or self.collision_superellipse_exponent % 2:
             raise ValueError("collision_superellipse_exponent must be an even integer >= 2")
         if self.track_slack_weight < 0.0 or self.collision_slack_weight < 0.0:
             raise ValueError("MPC slack weights must be non-negative")
+        if self.terminal_viability_weight < 0.0:
+            raise ValueError("MPC terminal viability weight must be non-negative")
         if self.friction_coefficient <= 0.0:
             raise ValueError("MPC friction coefficient must be positive")
         self.last_loss = np.nan
@@ -84,7 +115,13 @@ class MPCController:
         self.last_action_loss = np.nan
         self.last_velocity_loss = np.nan
         self.last_heading_loss = np.nan
+        self.last_terminal_viability_loss = np.nan
+        self.last_terminal_viability_violation = np.nan
+        self.last_stall_debt_loss = 0.0
+        self.last_stall_debt_deficit = 0.0
         self.last_violation_loss = np.nan
+        self.last_track_slack_loss = np.nan
+        self.last_collision_slack_loss = np.nan
         self.last_track_slack_plan = None
         self.last_collision_slack_plan = None
         self.last_solver_success = True
@@ -98,9 +135,46 @@ class MPCController:
         self.last_opponent_active = None
         self.n_states = 4
         self.n_controls = 2
+        wheelbase = float(self.p.LF + self.p.LR)
+        steering_angles = (
+            float(self.p.Sa * (-1.0) + self.p.Sb),
+            float(self.p.Sa * 1.0 + self.p.Sb),
+        )
+        self.maximum_vehicle_curvature = max(
+            abs(np.tan(angle) / wheelbase) for angle in steering_angles
+        )
+
+        curvature_s, curvature = self.track.curvature_profile()
+        self.max_abs_curvature = float(np.max(np.abs(curvature)))
+        self.minimum_nominal_frenet_denominator = float(
+            1.0 - self.max_abs_curvature * self.track_constraint_half_width
+        )
+        length = float(self.track.total_length)
+        # Three periodic copies let a short unwrapped MPC horizon cross the
+        # start/finish seam without a symbolic modulo operation.
+        extended_s = np.concatenate((
+            curvature_s[:-1] - length,
+            curvature_s,
+            curvature_s[1:] + length,
+        ))
+        extended_curvature = np.concatenate((
+            curvature[:-1], curvature, curvature[1:],
+        ))
+        instance_id = MPCController._instance_counter
+        MPCController._instance_counter += 1
+        self._curvature_grid = extended_s
+        self._curvature_values = extended_curvature
+        self.curvature_fn = cs.interpolant(
+            f"centerline_curvature_{instance_id}",
+            "bspline",
+            [extended_s],
+            extended_curvature,
+        )
 
         # Define optimization variables and parameters
-        self.X = cs.SX.sym("X", self.n_states, self.horizon + 1) # state trajectory: (x, y, psi, v) for each timestep
+        self.X = cs.SX.sym(
+            "X", self.n_states, self.horizon + 1
+        )  # Frenet state trajectory: (s, e, heading_error, v)
         self.U = cs.SX.sym("U", self.n_controls, self.horizon) # control trajectory
         # Non-negative violation variables soften only track and collision
         # safety constraints. Dynamics, state bounds and control limits remain
@@ -112,8 +186,8 @@ class MPCController:
             self.horizon,
         )
         self.x0 = cs.SX.sym("x0", self.n_states, 1) # initial state
-        # reference trajectory 
-        # (x_ref, y_ref, cos(psi_ref), sin(psi_ref), x_center, y_center, tangent_x, tangent_y)
+        # Reference rows remain width-eight for trace/backward compatibility;
+        # the Frenet solver uses [s_ref, e_ref, v_ref].
         self.ref = cs.SX.sym("ref", 8, self.horizon + 1)    
         self.u_prev = cs.SX.sym("u_prev", self.n_controls, 1) # previous control input for rate penalty
         self.q_weight = cs.SX.sym("q_weight", 1) 
@@ -134,19 +208,69 @@ class MPCController:
             "opponent_active",
             self.max_constrained_opponents,
         )
+        self.stall_debt_weight = cs.SX.sym("stall_debt_weight", 1)
 
         self._build_problem()
 
+    def update_stall_debt(self, current_s, speed, sim_time):
+        """Update history once per completed closed-loop control interval."""
+        return self.stall_debt.update(current_s, speed, sim_time)
+
     def _vehicle_dynamics(self, xk, uk):
-        return kinematic_global_step(
-            xk, uk, self.dt, self.p, symbolic=True
+        return kinematic_frenet_step(
+            xk,
+            uk,
+            self.curvature_fn(xk[0]),
+            self.dt,
+            self.p,
+            curvature_mode="geometric",
+            symbolic=True,
         )
 
     def _vehicle_dynamics_np(self, xk, uk):
-        return kinematic_global_step(xk, uk, self.dt, self.p)
+        curvature = float(np.interp(
+            float(xk[0]), self._curvature_grid, self._curvature_values
+        ))
+        return kinematic_frenet_step(
+            xk,
+            uk,
+            curvature,
+            self.dt,
+            self.p,
+            curvature_mode="geometric",
+        )
 
-    def _make_x0_mpc(self, x0):
-        return np.array([x0[0], x0[1], wrap_angle(x0[2]), max(x0[3], 0.0)], dtype=float)
+    def _make_x0_mpc(self, x0, current_s):
+        current_s = float(current_s)
+        _, lateral_e = self.track.project(
+            float(x0[0]),
+            float(x0[1]),
+            s_hint=current_s,
+            search_radius=2.0,
+            psi_hint=float(x0[2]),
+            max_heading_error=np.pi / 2.0,
+        )
+        _, _, center_heading = self.track.interpolate(current_s)
+        heading_error = wrap_angle(float(x0[2]) - center_heading)
+        return np.array(
+            [
+                current_s % self.track.total_length,
+                lateral_e,
+                heading_error,
+                max(float(x0[3]), 0.0),
+            ],
+            dtype=float,
+        )
+
+    def _localize_reference(self, ref_traj, current_s):
+        """Align an unwrapped policy reference with the MPC's local lap."""
+        localized = np.asarray(ref_traj, dtype=float).copy()
+        anchor = float(current_s) % self.track.total_length
+        for k in range(localized.shape[1]):
+            localized[0, k] = anchor + self._progress_delta(
+                float(ref_traj[0, k]), float(current_s)
+            )
+        return localized
 
     def _progress_delta(self, s_a, s_b):
         if self.track_length is None:
@@ -237,6 +361,7 @@ class MPCController:
                 opponent_s.T.reshape(-1, 1),
                 opponent_e.T.reshape(-1, 1),
                 opponent_active.reshape(-1, 1),
+                np.array([[self.stall_debt.weight]], dtype=float),
             ]
         )
 
@@ -248,6 +373,8 @@ class MPCController:
             velocity_loss,
             heading_loss,
             violation_loss,
+            track_slack_loss,
+            collision_slack_loss,
         ) = self.loss_fn(x_opt, p_val)
         self.last_loss = float(loss)
         self.last_track_loss = float(track_loss)
@@ -255,6 +382,14 @@ class MPCController:
         self.last_velocity_loss = float(velocity_loss)
         self.last_heading_loss = float(heading_loss)
         self.last_violation_loss = float(violation_loss)
+        self.last_track_slack_loss = float(track_slack_loss)
+        self.last_collision_slack_loss = float(collision_slack_loss)
+        viability_loss, viability_violation = self.terminal_viability_fn(x_opt, p_val)
+        self.last_terminal_viability_loss = float(viability_loss)
+        self.last_terminal_viability_violation = float(viability_violation)
+        stall_loss, stall_deficit = self.stall_debt_fn(x_opt, p_val)
+        self.last_stall_debt_loss = float(stall_loss)
+        self.last_stall_debt_deficit = float(stall_deficit)
 
     def evaluate_fallback_loss(
         self,
@@ -265,8 +400,20 @@ class MPCController:
         opponents=None,
         current_s=None,
     ):
-        x0_mpc = self._make_x0_mpc(x0)
-        U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
+        if current_s is None:
+            raise ValueError("current_s is required by the Frenet MPC")
+        ref_traj = self._localize_reference(ref_traj, current_s)
+        x0_mpc = self._make_x0_mpc(x0, current_s)
+        if (
+            self.last_control_plan is not None
+            and np.shape(self.last_control_plan) == (self.n_controls, self.horizon)
+        ):
+            U_guess = np.column_stack((
+                self.last_control_plan[:, 1:],
+                self.last_control_plan[:, -1],
+            ))
+        else:
+            U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
         X_guess = np.zeros((self.n_states, self.horizon + 1))
         X_guess[:, 0] = x0_mpc
         for k in range(self.horizon):
@@ -280,6 +427,11 @@ class MPCController:
         )
         self.last_track_slack_plan = track_slack_guess.copy()
         self.last_collision_slack_plan = collision_slack_guess.copy()
+        self.last_state_plan = X_guess.copy()
+        self.last_state_plan[0] += float(current_s) - (
+            float(current_s) % self.track.total_length
+        )
+        self.last_control_plan = U_guess.copy()
         x_eval = np.concatenate(
             [
                 X_guess.T.reshape(-1),
@@ -306,9 +458,69 @@ class MPCController:
         action_cost = 0
         velocity_cost = 0
         heading_cost = 0
-        violation_cost = (
-            self.track_slack_weight * cs.sumsqr(self.track_slack)
-            + self.collision_slack_weight * cs.sumsqr(self.collision_slack)
+        track_slack_cost = self.track_slack_weight * cs.sumsqr(self.track_slack)
+        collision_slack_cost = (
+            self.collision_slack_weight * cs.sumsqr(self.collision_slack)
+        )
+        violation_cost = track_slack_cost + collision_slack_cost
+
+        # Optional terminal turning-room surrogate.  It asks whether the final
+        # predicted pose has enough lateral room to turn an outward heading
+        # back toward the track, using the bicycle model's maximum curvature.
+        # This is a local audit term (not part of Wang or alpha-RACER), and a
+        # zero weight leaves the production objective unchanged.
+        terminal_heading = cs.atan2(
+            cs.sin(self.X[2, self.horizon]), cs.cos(self.X[2, self.horizon])
+        )
+        smooth_eps = 1.0e-8
+        smooth_positive = lambda value: 0.5 * (
+            value + cs.sqrt(value * value + smooth_eps)
+        )
+        outward_left = smooth_positive(terminal_heading)
+        outward_right = smooth_positive(-terminal_heading)
+        left_turning_room = (1.0 - cs.cos(outward_left)) / self.maximum_vehicle_curvature
+        right_turning_room = (1.0 - cs.cos(outward_right)) / self.maximum_vehicle_curvature
+        left_violation = smooth_positive(
+            self.X[1, self.horizon] + left_turning_room - self.track_constraint_half_width
+        )
+        right_violation = smooth_positive(
+            -self.X[1, self.horizon] + right_turning_room - self.track_constraint_half_width
+        )
+        terminal_viability_violation = cs.sqrt(
+            left_violation * left_violation + right_violation * right_violation
+        )
+        terminal_viability_cost = (
+            self.terminal_viability_weight
+            * terminal_viability_violation
+            * terminal_viability_violation
+        )
+        # A history-dependent weight penalizes making too little progress over
+        # this horizon.  With weight zero this expression is identically zero.
+        # The ordinary 0.44 m soft constraint remains intact: its quadratic
+        # slack cost can trade against stall debt, while progressively making
+        # excursions toward the 0.55 m simulator recovery threshold expensive.
+        # Penalize lag behind a linearly increasing progress schedule at every
+        # prediction step.  A terminal-only target permits receding-horizon
+        # procrastination: every solve can postpone motion to its final steps
+        # while repeatedly executing a neutral first action.
+        schedule_deficit_squares = 0
+        for k in range(1, self.horizon + 1):
+            scheduled_progress = (
+                self.stall_debt.settings.minimum_horizon_progress
+                * k
+                / self.horizon
+            )
+            step_deficit = smooth_positive(
+                scheduled_progress - (self.X[0, k] - self.X[0, 0])
+            )
+            schedule_deficit_squares += step_deficit * step_deficit
+        smooth_progress_deficit = cs.sqrt(
+            2.0 * schedule_deficit_squares / (self.horizon + 1)
+        )
+        stall_debt_cost = (
+            self.stall_debt_weight
+            * smooth_progress_deficit
+            * smooth_progress_deficit
         )
         # initial state constraint
         g_eq = [self.X[:, 0] - self.x0]
@@ -321,18 +533,19 @@ class MPCController:
         # inequality constraints for track boundaries and control rate limits
         g_ineq = []
         for k in range(self.horizon + 1):
-            # ref: 0:p_ref_x, 1:p_ref_y, 2:ref_speed, 3:psi_ref, 4:center_x, 5:center_y, 6:-sin psi(norm_x), 7:cos psi (norm_y)
-            dx = self.X[0, k] - self.ref[4, k]
-            dy = self.X[1, k] - self.ref[5, k]
-            tangent_x = self.ref[7, k]
-            tangent_y = -self.ref[6, k]
-            car_px = self.ref[0, k] + dx * tangent_x + dy * tangent_y
-            car_py = dx * self.ref[6, k] + dy * self.ref[7, k]
-            pos_err = cs.vertcat(car_px - self.ref[0, k], car_py - self.ref[1, k])
+            # X=[s,e,psi_error,v], so the paper's Frenet position error is
+            # represented directly; no Cartesian projection approximation is
+            # involved in either tracking or safety constraints.
+            car_px = self.X[0, k]
+            car_py = self.X[1, k]
+            pos_err = cs.vertcat(
+                car_px - self.ref[0, k],
+                car_py - self.ref[1, k],
+            )
             track_cost += self.q_weight * (pos_err.T @ self.Q @ pos_err)
             speed_err = self.X[3, k] - self.ref[2, k]
             velocity_cost += self.velocity_track_weight * speed_err * speed_err
-            heading_err = cs.atan2(cs.sin(self.X[2, k] - self.ref[3, k]), cs.cos(self.X[2, k] - self.ref[3, k]))
+            heading_err = cs.atan2(cs.sin(self.X[2, k]), cs.cos(self.X[2, k]))
             heading_cost += self.heading_track_weight * heading_err * heading_err
 
             # Track boundary constraints for predicted future states. The
@@ -341,10 +554,7 @@ class MPCController:
             # would make recovery problems immediately infeasible.
             if k >= 1:
                 if self.enforce_track_boundary:
-                    lateral_e = (
-                        (self.X[0, k] - self.ref[4, k]) * self.ref[6, k]
-                        + (self.X[1, k] - self.ref[5, k]) * self.ref[7, k]
-                    )
+                    lateral_e = self.X[1, k]
 
                     # Enforce the MPC track boundary constraint (1f). The
                     # supplied half-width is the geometric point-mass bound.
@@ -396,7 +606,15 @@ class MPCController:
                 g_ineq.append(lateral_proxy - lateral_limit)
                 g_ineq.append(-lateral_proxy - lateral_limit)
 
-        cost = track_cost + action_cost + velocity_cost + heading_cost + violation_cost
+        cost = (
+            track_cost
+            + action_cost
+            + velocity_cost
+            + heading_cost
+            + violation_cost
+            + terminal_viability_cost
+            + stall_debt_cost
+        )
         self.g = cs.vertcat(*g_eq, *g_ineq)
         self.x_opt = cs.vertcat(
             cs.reshape(self.X, -1, 1),
@@ -412,6 +630,7 @@ class MPCController:
             cs.reshape(self.opponent_s, -1, 1),
             cs.reshape(self.opponent_e, -1, 1),
             self.opponent_active,
+            self.stall_debt_weight,
         )
 
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
@@ -427,7 +646,19 @@ class MPCController:
                 velocity_cost,
                 heading_cost,
                 violation_cost,
+                track_slack_cost,
+                collision_slack_cost,
             ],
+        )
+        self.terminal_viability_fn = cs.Function(
+            "mpc_terminal_viability",
+            [self.x_opt, self.p_opt],
+            [terminal_viability_cost, terminal_viability_violation],
+        )
+        self.stall_debt_fn = cs.Function(
+            "mpc_stall_debt",
+            [self.x_opt, self.p_opt],
+            [stall_debt_cost, smooth_progress_deficit],
         )
         
         self.n_x = self.n_states * (self.horizon + 1)
@@ -462,10 +693,8 @@ class MPCController:
             current_s=current_s,
         )
         for k in range(1, self.horizon + 1):
-            dx = X_guess[0, k] - ref_traj[4, k]
-            dy = X_guess[1, k] - ref_traj[5, k]
-            car_s = ref_traj[0, k] + dx * ref_traj[7, k] - dy * ref_traj[6, k]
-            car_e = dx * ref_traj[6, k] + dy * ref_traj[7, k]
+            car_s = X_guess[0, k]
+            car_e = X_guess[1, k]
             if self.enforce_track_boundary:
                 track_slack[k - 1] = max(
                     abs(car_e) - self.track_constraint_half_width,
@@ -495,9 +724,26 @@ class MPCController:
         opponents=None,
         current_s=None,
     ):
-        x0_mpc = self._make_x0_mpc(x0)
-        X_guess = np.tile(x0_mpc.reshape(-1, 1), (1, self.horizon + 1))
-        U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
+        if current_s is None:
+            raise ValueError("current_s is required by the Frenet MPC")
+        ref_traj = self._localize_reference(ref_traj, current_s)
+        x0_mpc = self._make_x0_mpc(x0, current_s)
+        if (
+            self.last_control_plan is not None
+            and np.shape(self.last_control_plan) == (self.n_controls, self.horizon)
+        ):
+            U_guess = np.column_stack((
+                self.last_control_plan[:, 1:],
+                self.last_control_plan[:, -1],
+            ))
+        else:
+            U_guess = np.tile(u_prev.reshape(-1, 1), (1, self.horizon))
+        X_guess = np.zeros((self.n_states, self.horizon + 1))
+        X_guess[:, 0] = x0_mpc
+        for k in range(self.horizon):
+            X_guess[:, k + 1] = self._vehicle_dynamics_np(
+                X_guess[:, k], U_guess[:, k]
+            )
         p_val = self._make_p_val(
             x0_mpc,
             ref_traj,
@@ -568,6 +814,9 @@ class MPCController:
         x_opt = sol["x"].full().flatten()
         self._store_loss_parts(x_opt, p_val)
         self.last_state_plan = x_opt[:self.n_x].reshape(self.horizon + 1, self.n_states).T
+        # Diagnostics and Parameter-IBR use continuous race progress, whereas
+        # the NLP is localized to the current lap for periodic interpolation.
+        self.last_state_plan[0] += float(current_s) - (float(current_s) % self.track.total_length)
         u_end = self.n_x + self.n_u
         u_opt = x_opt[self.n_x:u_end].reshape(self.horizon, self.n_controls).T
         track_slack_end = u_end + self.n_track_slack

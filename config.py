@@ -45,8 +45,36 @@ class DynamicParams:
 
         if model_type in {"kinematic", "kinetic", "kinetics"}:
             self._use_kinematic_baseline()
-        elif model_type != "dbm":
+        elif model_type == "dbm":
+            self._use_upstream_numerical_dbm()
+        else:
             raise ValueError(f"Unknown vehicle model: {vehicle_model_type}")
+
+    def _use_upstream_numerical_dbm(self):
+        """Match alpha-RACER's numerical-race DBM instantiation.
+
+        ``multi_car_comp_blocking.py`` overrides the model class defaults with
+        Sa=0.34, Sb=0, Ta=20, Tb=0, mu=0.5 and delay=1.  Keeping these values
+        explicit prevents a DBM ablation from silently using the unrelated
+        library defaults above.  The local simulator integrates this plant at
+        SIM_DT; the upstream experiment used DT=0.1 s.
+        """
+        self.LF = 0.11
+        self.LR = 0.23
+        self.MASS = 4.65
+        self.Iz = 0.1
+        self.Ta = 20.0
+        self.Tb = 0.0
+        self.Sa = 0.34
+        self.Sb = 0.0
+        self.mu = 0.5
+        self.Cf = 1.0
+        self.Cr = 1.0
+        self.Bf = 60.0
+        self.Br = 60.0
+        self.hcom = 0.0
+        self.fr = 0.1
+        self.delay = 1
 
     def _use_kinematic_baseline(self):
         # Match the released alpha-RACER ROS MPC prediction model.  Earlier
@@ -157,15 +185,48 @@ class SimParams:
     # neutral throttle plus the upstream +0.2 boost so an aligned car cannot
     # remain trapped at the zero-acceleration equilibrium.
     OFFROAD_LOW_SPEED_THRESHOLD = 0.3
+    # Simulator-wide escape from the zero-speed equilibrium near a boundary.
+    # Unlike OFFROAD_RECOVERY_THRESHOLD, this does not alter vehicle state.  It
+    # only overrides the command after the car has remained nearly stationary
+    # near the nominal boundary for a sustained period.  The separate entry
+    # and exit thresholds provide hysteresis and prevent rapid toggling.
+    # Disabled by default while evaluating the MPC objective change.  It can
+    # still be enabled explicitly for a controlled recovery ablation.
+    LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = False
+    LOW_SPEED_BOUNDARY_TRIGGER_FRACTION = 0.90
+    LOW_SPEED_BOUNDARY_EXIT_FRACTION = 0.85
+    LOW_SPEED_BOUNDARY_TRIGGER_SPEED = 0.05
+    LOW_SPEED_BOUNDARY_EXIT_SPEED = 0.30
+    LOW_SPEED_BOUNDARY_TRIGGER_SECONDS = 0.50
+    LOW_SPEED_BOUNDARY_MIN_SIM_TIME = 1.0
+    LOW_SPEED_BOUNDARY_HEADING_GAIN = 0.50
     MPC_DT = 0.1
+    # Optional detachable comparison profile.  ``constrained_local`` remains
+    # the default and preserves all existing experiments.
+    MPC_FORMULATION = "constrained_local"
 
     MPC_HORIZON = 10
 
     Q = np.diag([1.0, 1.0])
     R = np.diag([1.0, 1.0]) #* 1e-6
 
-    VELOCITY_TRACK_WEIGHT = 0.0 # weight for velocity tracking in MPC cost
+    # Optional ablation.  The default paper-core objective advances through
+    # longitudinal position references without an additional speed-profile
+    # term; use the CLI override when explicitly testing velocity tracking.
+    VELOCITY_TRACK_WEIGHT = 0.0
     HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost
+    # Optional terminal turning-room surrogate used only in the hairpin audit.
+    # Zero preserves the ordinary MPC objective exactly.
+    MPC_TERMINAL_VIABILITY_WEIGHT = 0.0
+    # Detachable shared-MPC anti-stagnation audit; zero disables it.
+    MPC_STALL_DEBT_MAX_WEIGHT = 0.0
+    MPC_STALL_DEBT_BASE_WEIGHT = 10.0
+    MPC_STALL_DEBT_ACTIVATION_SECONDS = 0.5
+    MPC_STALL_DEBT_EXPONENTIAL_TIME_SCALE = 0.5
+    MPC_STALL_DEBT_SPEED_THRESHOLD = 0.10
+    MPC_STALL_DEBT_PROGRESS_RATE_THRESHOLD = 0.05
+    MPC_STALL_DEBT_RECOVERY_DECAY_RATE = 2.0
+    MPC_STALL_DEBT_MINIMUM_HORIZON_PROGRESS = 0.50
 
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0

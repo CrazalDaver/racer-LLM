@@ -47,7 +47,21 @@ def _jsonable(value):
 
 def _npz_contents(data):
     """Convert every array in an open NpzFile to JSON-compatible values."""
-    return {name: _jsonable(data[name]) for name in data.files}
+    # Full MPC horizons are retained in the accompanying NPZ.  Duplicating
+    # them into summary.json (and then report.html) makes even a short sweep
+    # unnecessarily large; scalar objective histories remain in JSON.
+    npz_only = {
+        "car_mpc_predicted_state_plan",
+        "car_mpc_predicted_control_plan",
+        "car_mpc_reference_plan",
+        "car_mpc_track_slack_plan",
+        "car_mpc_collision_slack_plan",
+    }
+    return {
+        name: _jsonable(data[name])
+        for name in data.files
+        if name not in npz_only
+    }
 
 
 def _trace_safety_summary(data):
@@ -60,6 +74,16 @@ def _trace_safety_summary(data):
             return [None] * car_count
         active = np.asarray(data[key], dtype=bool)
         return _jsonable(np.sum(active, axis=0) * sim_dt)
+
+    def trigger_count_by_car(key):
+        if key not in data.files:
+            return [None] * car_count
+        active = np.asarray(data[key], dtype=bool)
+        if active.shape[0] == 0:
+            return [0] * car_count
+        starts = active.copy()
+        starts[1:] &= ~active[:-1]
+        return _jsonable(np.sum(starts, axis=0))
 
     def activation_fraction(key, threshold=0.0):
         if key not in data.files:
@@ -104,6 +128,12 @@ def _trace_safety_summary(data):
         ),
         "offroad_recovery_seconds_by_car": time_by_car(
             "car_offroad_recovery_active"
+        ),
+        "low_speed_boundary_recovery_seconds_by_car": time_by_car(
+            "car_low_speed_boundary_recovery_active"
+        ),
+        "low_speed_boundary_recovery_triggers_by_car": trigger_count_by_car(
+            "car_low_speed_boundary_recovery_active"
         ),
         "mpc_recovery_seconds_by_car": time_by_car("car_mpc_recovery_active"),
         "max_track_slack_by_car": max_by_car("car_mpc_max_track_slack"),
@@ -798,6 +828,53 @@ def _add_sim_args(parser):
     group.add_argument("--vehicle-model", choices=["kinematic", "kinetic", "kinetics", "dbm"], default=None)
     group.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
     group.add_argument(
+        "--mpc-velocity-track-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help="Override the shared MPC reference-speed tracking weight.",
+    )
+    group.add_argument(
+        "--mpc-horizon",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override the prediction horizon in 0.1 s MPC steps; "
+            "N=10, 15, and 20 correspond to 1.0, 1.5, and 2.0 s."
+        ),
+    )
+    group.add_argument(
+        "--mpc-terminal-viability-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help=(
+            "Enable the optional terminal turning-room audit term; "
+            "0 (the default) disables it."
+        ),
+    )
+    group.add_argument(
+        "--mpc-stall-debt-max-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help="Enable the detachable history-dependent MPC anti-stall audit.",
+    )
+    group.add_argument(
+        "--mpc-track-slack-weight",
+        type=float,
+        default=None,
+        metavar="WEIGHT",
+        help="Override the quadratic MPC track-boundary slack weight.",
+    )
+    group.add_argument(
+        "--mpc-formulation",
+        choices=["constrained_local", "upstream_simple"],
+        default=None,
+        help="Select the local constrained or simplified upstream-style MPC.",
+    )
+    group.add_argument(
         "--raceline-csv",
         type=Path,
         default=None,
@@ -837,6 +914,12 @@ def _add_sim_args(parser):
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable or disable validation/correction of LLM policy modes.",
+    )
+    group.add_argument(
+        "--low-speed-boundary-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable the sustained low-speed boundary escape.",
     )
     group.add_argument(
         "--ibr-implementation",
@@ -920,6 +1003,29 @@ if __name__ == "__main__":
         if args.parameter_ibr_update_interval < 0.0:
             raise ValueError("--parameter-ibr-update-interval must be non-negative")
         params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = args.parameter_ibr_update_interval
+    if args.low_speed_boundary_recovery is not None:
+        params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = (
+            args.low_speed_boundary_recovery
+        )
+    if args.mpc_formulation is not None:
+        params.MPC_FORMULATION = args.mpc_formulation
+    if args.mpc_horizon is not None and args.mpc_horizon < 2:
+        raise ValueError("--mpc-horizon must be at least 2")
+    if (
+        args.mpc_terminal_viability_weight is not None
+        and args.mpc_terminal_viability_weight < 0.0
+    ):
+        raise ValueError("--mpc-terminal-viability-weight must be non-negative")
+    if (
+        args.mpc_stall_debt_max_weight is not None
+        and args.mpc_stall_debt_max_weight < 0.0
+    ):
+        raise ValueError("--mpc-stall-debt-max-weight must be non-negative")
+    if (
+        args.mpc_track_slack_weight is not None
+        and args.mpc_track_slack_weight < 0.0
+    ):
+        raise ValueError("--mpc-track-slack-weight must be non-negative")
     shared_sweep_kwargs = dict(
         trials_per_position=1,
         ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
@@ -928,6 +1034,12 @@ if __name__ == "__main__":
         raceline_csv=args.raceline_csv,
         start_gap=args.start_gap,
         initial_speeds=args.initial_speeds,
+        velocity_track_weight=args.mpc_velocity_track_weight,
+        terminal_viability_weight=args.mpc_terminal_viability_weight,
+        stall_debt_max_weight=args.mpc_stall_debt_max_weight,
+        track_slack_weight=args.mpc_track_slack_weight,
+        horizon=args.mpc_horizon,
+        mpc_formulation=params.MPC_FORMULATION,
         static_policy_params=args.static_params,
         alpharacer_params=args.alpha_params,
         alpharacer_weight_path=args.alpharacer_weight,

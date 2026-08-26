@@ -12,6 +12,7 @@ result/
 # Local manuscript reminders; intentionally not part of the repository.
 PAPER_NOTES.local.md
 EXPERIMENT_TODO.local.md
+MPC_STALL_INVESTIGATION.local.md
 
 # Unity replay generated files (keep unity/Assets, Packages, ProjectSettings).
 unity/Library/

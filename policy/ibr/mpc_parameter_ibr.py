@@ -1,7 +1,5 @@
 """Five-parameter IBR evaluated through the shared alpha-RACER MPC."""
 
-import math
-
 import numpy as np
 
 from config import params as sim_params
@@ -72,22 +70,6 @@ class ParameterIBRPolicy(MPCPolicy):
             - 1.0e-9
         )
 
-    def _world_plan_to_frenet(self, world_plan, initial_s):
-        plan = np.zeros((2, world_plan.shape[1]), dtype=float)
-        s_hint = float(initial_s)
-        for k in range(world_plan.shape[1]):
-            wrapped_s, lateral_e = self.track.project(
-                float(world_plan[0, k]),
-                float(world_plan[1, k]),
-                s_hint=s_hint,
-                search_radius=8.0,
-                psi_hint=float(world_plan[2, k]),
-                max_heading_error=math.pi / 2.0,
-            )
-            s_hint += progress_delta(wrapped_s, s_hint, self.track.total_length)
-            plan[:, k] = [s_hint, lateral_e]
-        return plan
-
     def _evaluate_candidate(self, candidate, state, current_s, opponents):
         """Solve MPC once and evaluate the shared local IBR race objective."""
         self.params = np.asarray(candidate, dtype=float).copy()
@@ -100,9 +82,8 @@ class ParameterIBRPolicy(MPCPolicy):
             opponents=opponents,
             current_s=current_s,
         )
-        world_plan = np.asarray(self.mpc.last_state_plan, dtype=float).copy()
+        frenet_plan = np.asarray(self.mpc.last_state_plan, dtype=float)[:2].copy()
         control_plan = np.asarray(self.mpc.last_control_plan, dtype=float).copy()
-        frenet_plan = self._world_plan_to_frenet(world_plan, current_s)
         predicted_progress = float(frenet_plan[0, -1] - frenet_plan[0, 0])
         lateral_cost = sim_params.IBR_LATERAL_WEIGHT * float(
             np.sum(

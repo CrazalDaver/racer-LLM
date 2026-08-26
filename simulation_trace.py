@@ -25,6 +25,9 @@ def create_simulation_trace(
     initial_speeds,
     vehicle_model_type,
     mpc_velocity_track_weight,
+    mpc_terminal_viability_weight,
+    mpc_stall_debt_max_weight,
+    mpc_track_slack_weight,
 ):
     trace = SimulationTrace({
         "policy_names": resolved_policy_names,
@@ -91,8 +94,12 @@ def create_simulation_trace(
         "initial_lateral_offsets": initial_lateral_offsets.copy(),
         "initial_speeds": initial_speeds.copy(),
         "vehicle_model": vehicle_model_type,
+        "mpc_state_coordinates": "frenet",
         "velocity_track_weight": mpc_velocity_track_weight,
         "heading_track_weight": params.HEADING_TRACK_WEIGHT,
+        "terminal_viability_weight": mpc_terminal_viability_weight,
+        "stall_debt_max_weight": mpc_stall_debt_max_weight,
+        "track_slack_weight": mpc_track_slack_weight,
         "parameter_ibr_rounds": params.PARAMETER_IBR_ROUNDS,
         "parameter_ibr_search_points": params.PARAMETER_IBR_SEARCH_POINTS,
         "parameter_ibr_search_passes": params.PARAMETER_IBR_SEARCH_PASSES,
@@ -131,6 +138,7 @@ def record_simulation_step(
     control_update,
     offroad_recovery_active,
     offroad_recovery_heading_error,
+    low_speed_boundary_recovery_active,
     ref_component_snapshot,
 ):
     """Record one pre-integration simulation snapshot and return its reference point."""
@@ -143,6 +151,23 @@ def record_simulation_step(
     ref_horizon_y = np.full(ego_mpc.horizon + 1, np.nan)
     raceline_horizon_x = np.full(ego_mpc.horizon + 1, np.nan)
     raceline_horizon_y = np.full(ego_mpc.horizon + 1, np.nan)
+
+    # MPC horizons can differ in mixed-policy races.  Pad every diagnostic to
+    # the largest horizon so NPZ arrays remain numeric rather than ragged
+    # object arrays.
+    max_horizon = max(mpc.horizon for mpc in mpcs)
+
+    def padded_plan(source, rows, columns):
+        result = np.full((rows, columns), np.nan, dtype=float)
+        if source is None:
+            return result
+        values = np.asarray(source, dtype=float)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        row_count = min(rows, values.shape[0])
+        column_count = min(columns, values.shape[1])
+        result[:row_count, :column_count] = values[:row_count, :column_count]
+        return result
     if ref_traj is not None:
         if ego_policy.last_ref_world_horizon is not None:
             ref_horizon_x = ego_policy.last_ref_world_horizon[0].copy()
@@ -186,9 +211,61 @@ def record_simulation_step(
     trace["car_mpc_action_loss"].append([mpc.last_action_loss for mpc in mpcs])
     trace["car_mpc_velocity_loss"].append([mpc.last_velocity_loss for mpc in mpcs])
     trace["car_mpc_heading_loss"].append([mpc.last_heading_loss for mpc in mpcs])
+    trace["car_mpc_terminal_viability_loss"].append(
+        [mpc.last_terminal_viability_loss for mpc in mpcs]
+    )
+    trace["car_mpc_terminal_viability_violation"].append(
+        [mpc.last_terminal_viability_violation for mpc in mpcs]
+    )
+    trace["car_mpc_stall_debt_seconds"].append(
+        [mpc.stall_debt.seconds for mpc in mpcs]
+    )
+    trace["car_mpc_stall_debt_weight"].append(
+        [mpc.stall_debt.weight for mpc in mpcs]
+    )
+    trace["car_mpc_stall_debt_loss"].append(
+        [mpc.last_stall_debt_loss for mpc in mpcs]
+    )
+    trace["car_mpc_stall_debt_deficit"].append(
+        [mpc.last_stall_debt_deficit for mpc in mpcs]
+    )
     trace["car_mpc_violation_loss"].append(
         [mpc.last_violation_loss for mpc in mpcs]
     )
+    trace["car_mpc_track_slack_loss"].append(
+        [mpc.last_track_slack_loss for mpc in mpcs]
+    )
+    trace["car_mpc_collision_slack_loss"].append(
+        [mpc.last_collision_slack_loss for mpc in mpcs]
+    )
+    trace["car_mpc_predicted_state_plan"].append([
+        padded_plan(mpc.last_state_plan, mpc.n_states, max_horizon + 1)
+        for mpc in mpcs
+    ])
+    trace["car_mpc_predicted_control_plan"].append([
+        padded_plan(mpc.last_control_plan, mpc.n_controls, max_horizon)
+        for mpc in mpcs
+    ])
+    trace["car_mpc_reference_plan"].append([
+        padded_plan(
+            getattr(policy, "last_ref_traj", None),
+            8,
+            max_horizon + 1,
+        )
+        for policy in policies
+    ])
+    trace["car_mpc_track_slack_plan"].append([
+        padded_plan(mpc.last_track_slack_plan, 1, max_horizon)[0]
+        for mpc in mpcs
+    ])
+    trace["car_mpc_collision_slack_plan"].append([
+        padded_plan(
+            mpc.last_collision_slack_plan,
+            mpc.max_constrained_opponents,
+            max_horizon,
+        )
+        for mpc in mpcs
+    ])
     trace["car_mpc_max_track_slack"].append(
         [
             float(np.max(mpc.last_track_slack_plan))
@@ -244,6 +321,16 @@ def record_simulation_step(
     trace["mpc_action_loss"].append(ego_mpc.last_action_loss)
     trace["mpc_velocity_loss"].append(ego_mpc.last_velocity_loss)
     trace["mpc_heading_loss"].append(ego_mpc.last_heading_loss)
+    trace["mpc_terminal_viability_loss"].append(
+        ego_mpc.last_terminal_viability_loss
+    )
+    trace["mpc_terminal_viability_violation"].append(
+        ego_mpc.last_terminal_viability_violation
+    )
+    trace["mpc_stall_debt_seconds"].append(ego_mpc.stall_debt.seconds)
+    trace["mpc_stall_debt_weight"].append(ego_mpc.stall_debt.weight)
+    trace["mpc_stall_debt_loss"].append(ego_mpc.last_stall_debt_loss)
+    trace["mpc_stall_debt_deficit"].append(ego_mpc.last_stall_debt_deficit)
     trace["mpc_violation_loss"].append(ego_mpc.last_violation_loss)
     trace["mpc_max_track_slack"].append(
         float(np.max(ego_mpc.last_track_slack_plan))
@@ -336,6 +423,9 @@ def record_simulation_step(
     trace["car_offroad_recovery_heading_error"].append(
         offroad_recovery_heading_error
     )
+    trace["car_low_speed_boundary_recovery_active"].append(
+        low_speed_boundary_recovery_active
+    )
     diagnostic_fields = (
         "max_collision_constraint",
         "min_predicted_longitudinal_distance",
@@ -401,7 +491,38 @@ def save_simulation_trace(trace, track, params):
         car_mpc_action_loss=np.asarray(trace["car_mpc_action_loss"]),
         car_mpc_velocity_loss=np.asarray(trace["car_mpc_velocity_loss"]),
         car_mpc_heading_loss=np.asarray(trace["car_mpc_heading_loss"]),
+        car_mpc_terminal_viability_loss=np.asarray(
+            trace["car_mpc_terminal_viability_loss"]
+        ),
+        car_mpc_terminal_viability_violation=np.asarray(
+            trace["car_mpc_terminal_viability_violation"]
+        ),
+        car_mpc_stall_debt_seconds=np.asarray(trace["car_mpc_stall_debt_seconds"]),
+        car_mpc_stall_debt_weight=np.asarray(trace["car_mpc_stall_debt_weight"]),
+        car_mpc_stall_debt_loss=np.asarray(trace["car_mpc_stall_debt_loss"]),
+        car_mpc_stall_debt_deficit=np.asarray(trace["car_mpc_stall_debt_deficit"]),
         car_mpc_violation_loss=np.asarray(trace["car_mpc_violation_loss"]),
+        car_mpc_track_slack_loss=np.asarray(
+            trace["car_mpc_track_slack_loss"], dtype=float
+        ),
+        car_mpc_collision_slack_loss=np.asarray(
+            trace["car_mpc_collision_slack_loss"], dtype=float
+        ),
+        car_mpc_predicted_state_plan=np.asarray(
+            trace["car_mpc_predicted_state_plan"], dtype=float
+        ),
+        car_mpc_predicted_control_plan=np.asarray(
+            trace["car_mpc_predicted_control_plan"], dtype=float
+        ),
+        car_mpc_reference_plan=np.asarray(
+            trace["car_mpc_reference_plan"], dtype=float
+        ),
+        car_mpc_track_slack_plan=np.asarray(
+            trace["car_mpc_track_slack_plan"], dtype=float
+        ),
+        car_mpc_collision_slack_plan=np.asarray(
+            trace["car_mpc_collision_slack_plan"], dtype=float
+        ),
         car_mpc_max_track_slack=np.asarray(trace["car_mpc_max_track_slack"]),
         car_mpc_max_collision_slack=np.asarray(
             trace["car_mpc_max_collision_slack"]
@@ -456,6 +577,16 @@ def save_simulation_trace(trace, track, params):
         mpc_action_loss=np.asarray(trace["mpc_action_loss"]),
         mpc_velocity_loss=np.asarray(trace["mpc_velocity_loss"]),
         mpc_heading_loss=np.asarray(trace["mpc_heading_loss"]),
+        mpc_terminal_viability_loss=np.asarray(
+            trace["mpc_terminal_viability_loss"]
+        ),
+        mpc_terminal_viability_violation=np.asarray(
+            trace["mpc_terminal_viability_violation"]
+        ),
+        mpc_stall_debt_seconds=np.asarray(trace["mpc_stall_debt_seconds"]),
+        mpc_stall_debt_weight=np.asarray(trace["mpc_stall_debt_weight"]),
+        mpc_stall_debt_loss=np.asarray(trace["mpc_stall_debt_loss"]),
+        mpc_stall_debt_deficit=np.asarray(trace["mpc_stall_debt_deficit"]),
         mpc_violation_loss=np.asarray(trace["mpc_violation_loss"]),
         mpc_max_track_slack=np.asarray(trace["mpc_max_track_slack"]),
         mpc_max_collision_slack=np.asarray(trace["mpc_max_collision_slack"]),
@@ -569,6 +700,9 @@ def save_simulation_trace(trace, track, params):
         car_offroad_recovery_heading_error=np.asarray(
             trace.get("car_offroad_recovery_heading_error", []), dtype=float
         ),
+        car_low_speed_boundary_recovery_active=np.asarray(
+            trace.get("car_low_speed_boundary_recovery_active", []), dtype=bool
+        ),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -606,17 +740,55 @@ def save_simulation_trace(trace, track, params):
         offroad_low_speed_threshold=np.asarray(
             params.OFFROAD_LOW_SPEED_THRESHOLD
         ),
+        low_speed_boundary_recovery_enabled=np.asarray(
+            params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED, dtype=bool
+        ),
+        low_speed_boundary_trigger_fraction=np.asarray(
+            params.LOW_SPEED_BOUNDARY_TRIGGER_FRACTION
+        ),
+        low_speed_boundary_exit_fraction=np.asarray(
+            params.LOW_SPEED_BOUNDARY_EXIT_FRACTION
+        ),
+        low_speed_boundary_trigger_speed=np.asarray(
+            params.LOW_SPEED_BOUNDARY_TRIGGER_SPEED
+        ),
+        low_speed_boundary_exit_speed=np.asarray(
+            params.LOW_SPEED_BOUNDARY_EXIT_SPEED
+        ),
+        low_speed_boundary_trigger_seconds=np.asarray(
+            params.LOW_SPEED_BOUNDARY_TRIGGER_SECONDS
+        ),
         velocity_track_weight=np.asarray(
             trace.get("velocity_track_weight", params.VELOCITY_TRACK_WEIGHT)
         ),
         heading_track_weight=np.asarray(
             trace.get("heading_track_weight", params.HEADING_TRACK_WEIGHT)
         ),
+        terminal_viability_weight=np.asarray(
+            trace.get(
+                "terminal_viability_weight", params.MPC_TERMINAL_VIABILITY_WEIGHT
+            )
+        ),
+        stall_debt_max_weight=np.asarray(
+            trace.get("stall_debt_max_weight", params.MPC_STALL_DEBT_MAX_WEIGHT)
+        ),
+        track_slack_weight=np.asarray(
+            trace.get("track_slack_weight", params.MPC_TRACK_SLACK_WEIGHT)
+        ),
         track_length=np.asarray(track.total_length),
         vehicle_model=np.asarray(trace["vehicle_model"]),
         simulation_dt=np.asarray(params.SIM_DT),
         control_dt=np.asarray(params.CONTROL_DT),
         mpc_dt=np.asarray(params.MPC_DT),
+        mpc_horizon=np.asarray(
+            trace.get("mpc_horizon", params.MPC_HORIZON)
+        ),
+        mpc_formulation=np.asarray(
+            trace.get("mpc_formulation", params.MPC_FORMULATION)
+        ),
+        mpc_state_coordinates=np.asarray(
+            trace.get("mpc_state_coordinates", "unknown")
+        ),
         mpc_enforce_track_boundary=np.asarray(params.MPC_ENFORCE_TRACK_BOUNDARY),
         mpc_enforce_collision_avoidance=np.asarray(
             params.MPC_ENFORCE_COLLISION_AVOIDANCE

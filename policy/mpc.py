@@ -230,6 +230,9 @@ class MPCPolicy(BasePolicy):
     # Main MPC control interface:
     # call get_reference_trajectory to get the reference trajectory, then call mpc.solve to get the control action
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
+        # Only real closed-loop control calls update the detachable stall debt;
+        # Parameter-IBR candidate solves therefore cannot inflate it.
+        self.mpc.update_stall_debt(current_s, state.vx, sim_time)
         ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
         self.last_ref_traj = ref_traj
         state_arr = state.to_array()
@@ -266,7 +269,13 @@ class MPCPolicy(BasePolicy):
                 self.mpc.last_action_loss = np.nan
                 self.mpc.last_velocity_loss = np.nan
                 self.mpc.last_heading_loss = np.nan
+                self.mpc.last_terminal_viability_loss = np.nan
+                self.mpc.last_terminal_viability_violation = np.nan
+                self.mpc.last_stall_debt_loss = np.nan
+                self.mpc.last_stall_debt_deficit = np.nan
                 self.mpc.last_violation_loss = np.nan
+                self.mpc.last_track_slack_loss = np.nan
+                self.mpc.last_collision_slack_loss = np.nan
         else:
             self._report_mpc_recovery(sim_time=sim_time)
             # Update this state only after a genuinely successful solve.
@@ -517,7 +526,15 @@ class MPCPolicy(BasePolicy):
             raceline_world[:, k] = [frenet["world_x"], frenet["world_y"]]
             ref[0, k] = p_pert_x
             ref[1, k] = p_ref_y
-            ref[2, k] = raceline_speed_k
+            # zeta controls how quickly the reference horizon advances.  Once
+            # velocity tracking is enabled, the same effective progression
+            # speed must be used as the speed target; using the raw raceline
+            # speed here would silently remove zeta from this part of the MPC.
+            ref[2, k] = float(np.clip(
+                zeta * raceline_speed_k,
+                0.0,
+                self.mpc.max_speed,
+            ))
             ref[3, k] = psi_center
             ref[4, k] = xc
             ref[5, k] = yc

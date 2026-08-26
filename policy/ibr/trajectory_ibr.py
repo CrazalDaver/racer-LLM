@@ -632,12 +632,11 @@ class TrajectoryIBRPolicy(BasePolicy):
             self._ibr_cached_ref_traj = ref_traj
             self._ibr_cached_ref_world_horizon = ref_world
             self._ibr_cached_raceline_world_horizon = self.last_raceline_world_horizon
-            world_plan = np.zeros((4, plan.shape[1]))
-            for k in range(plan.shape[1]):
-                x, y = self.track.frenet_to_world(plan[0, k], plan[1, k])
-                _, _, psi_center = self.track.interpolate(plan[0, k])
-                world_plan[:, k] = [x, y, psi_center + result["state_plan"][2, k], result["state_plan"][3, k]]
-            self.mpc.last_state_plan = world_plan
+            # The shared MPC trace convention is now Frenet
+            # [s,e,heading_error,v], matching trajectory IBR directly.
+            self.mpc.last_state_plan = np.asarray(
+                result["state_plan"], dtype=float
+            ).copy()
 
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
         # use cached IBR action if it is still valid for the current simulation time
