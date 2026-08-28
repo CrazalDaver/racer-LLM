@@ -230,9 +230,6 @@ class MPCPolicy(BasePolicy):
     # Main MPC control interface:
     # call get_reference_trajectory to get the reference trajectory, then call mpc.solve to get the control action
     def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
-        # Only real closed-loop control calls update the detachable stall debt;
-        # Parameter-IBR candidate solves therefore cannot inflate it.
-        self.mpc.update_stall_debt(current_s, state.vx, sim_time)
         ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
         self.last_ref_traj = ref_traj
         state_arr = state.to_array()
@@ -269,10 +266,6 @@ class MPCPolicy(BasePolicy):
                 self.mpc.last_action_loss = np.nan
                 self.mpc.last_velocity_loss = np.nan
                 self.mpc.last_heading_loss = np.nan
-                self.mpc.last_terminal_viability_loss = np.nan
-                self.mpc.last_terminal_viability_violation = np.nan
-                self.mpc.last_stall_debt_loss = np.nan
-                self.mpc.last_stall_debt_deficit = np.nan
                 self.mpc.last_violation_loss = np.nan
                 self.mpc.last_track_slack_loss = np.nan
                 self.mpc.last_collision_slack_loss = np.nan

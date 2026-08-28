@@ -9,6 +9,15 @@ myplot.png
 *.npz
 result/
 
+# Legacy generated reports used to live in the repository root.  Current
+# experiment entry points write under result/; keep accidental regenerations
+# out of source control as well.
+/position_sweep_report.html
+/simulation_report_noSafeGuard.html
+/llm_modes_report.html
+/llm_mode_report_assets/
+/simulation_trace*.mp4
+
 # Local manuscript reminders; intentionally not part of the repository.
 PAPER_NOTES.local.md
 EXPERIMENT_TODO.local.md

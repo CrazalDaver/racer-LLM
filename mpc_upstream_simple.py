@@ -82,7 +82,6 @@ class UpstreamSimpleMPCController(MPCController):
             cs.reshape(self.opponent_s, -1, 1),
             cs.reshape(self.opponent_e, -1, 1),
             self.opponent_active,
-            self.stall_debt_weight,
         )
 
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
@@ -108,17 +107,6 @@ class UpstreamSimpleMPCController(MPCController):
                 zero_cost,  # collision slack
             ],
         )
-        self.terminal_viability_fn = cs.Function(
-            "upstream_simple_terminal_viability",
-            [self.x_opt, self.p_opt],
-            [zero_cost, zero_cost],
-        )
-        self.stall_debt_fn = cs.Function(
-            "upstream_simple_stall_debt",
-            [self.x_opt, self.p_opt],
-            [zero_cost, zero_cost],
-        )
-
         self.n_x = self.n_states * (self.horizon + 1)
         self.n_u = self.n_controls * self.horizon
         self.n_track_slack = 0

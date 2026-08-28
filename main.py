@@ -259,6 +259,8 @@ def _policy_params_for_name(policy_names, snapshot):
         "llm-alpha",
         "llm-alpharacer",
         "llm_alpharacer",
+        "llm_evidence_first",
+        "llm_structured_action_first",
         "llm_parameter_policy",
         "llm_rules",
         "llm_with_rules",
@@ -825,6 +827,12 @@ def _add_case_args(parser):
 
 def _add_sim_args(parser):
     group = parser.add_argument_group("simulation")
+    group.add_argument(
+        "--track-name",
+        choices=["berlin", "modena", "rounded_rectangle"],
+        default=None,
+        help="Use a registered centerline, raceline, scale, and track width together.",
+    )
     group.add_argument("--vehicle-model", choices=["kinematic", "kinetic", "kinetics", "dbm"], default=None)
     group.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
     group.add_argument(
@@ -843,23 +851,6 @@ def _add_sim_args(parser):
             "Override the prediction horizon in 0.1 s MPC steps; "
             "N=10, 15, and 20 correspond to 1.0, 1.5, and 2.0 s."
         ),
-    )
-    group.add_argument(
-        "--mpc-terminal-viability-weight",
-        type=float,
-        default=None,
-        metavar="WEIGHT",
-        help=(
-            "Enable the optional terminal turning-room audit term; "
-            "0 (the default) disables it."
-        ),
-    )
-    group.add_argument(
-        "--mpc-stall-debt-max-weight",
-        type=float,
-        default=None,
-        metavar="WEIGHT",
-        help="Enable the detachable history-dependent MPC anti-stall audit.",
     )
     group.add_argument(
         "--mpc-track-slack-weight",
@@ -1012,16 +1003,6 @@ if __name__ == "__main__":
     if args.mpc_horizon is not None and args.mpc_horizon < 2:
         raise ValueError("--mpc-horizon must be at least 2")
     if (
-        args.mpc_terminal_viability_weight is not None
-        and args.mpc_terminal_viability_weight < 0.0
-    ):
-        raise ValueError("--mpc-terminal-viability-weight must be non-negative")
-    if (
-        args.mpc_stall_debt_max_weight is not None
-        and args.mpc_stall_debt_max_weight < 0.0
-    ):
-        raise ValueError("--mpc-stall-debt-max-weight must be non-negative")
-    if (
         args.mpc_track_slack_weight is not None
         and args.mpc_track_slack_weight < 0.0
     ):
@@ -1029,14 +1010,13 @@ if __name__ == "__main__":
     shared_sweep_kwargs = dict(
         trials_per_position=1,
         ego_positions=[args.ego_position] if args.ego_position is not None else [1, 2, 3],
+        track_name=args.track_name,
         vehicle_model_type=args.vehicle_model or "kinematic",
         total_time=args.total_time,
         raceline_csv=args.raceline_csv,
         start_gap=args.start_gap,
         initial_speeds=args.initial_speeds,
         velocity_track_weight=args.mpc_velocity_track_weight,
-        terminal_viability_weight=args.mpc_terminal_viability_weight,
-        stall_debt_max_weight=args.mpc_stall_debt_max_weight,
         track_slack_weight=args.mpc_track_slack_weight,
         horizon=args.mpc_horizon,
         mpc_formulation=params.MPC_FORMULATION,

@@ -215,19 +215,6 @@ class SimParams:
     # term; use the CLI override when explicitly testing velocity tracking.
     VELOCITY_TRACK_WEIGHT = 0.0
     HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost
-    # Optional terminal turning-room surrogate used only in the hairpin audit.
-    # Zero preserves the ordinary MPC objective exactly.
-    MPC_TERMINAL_VIABILITY_WEIGHT = 0.0
-    # Detachable shared-MPC anti-stagnation audit; zero disables it.
-    MPC_STALL_DEBT_MAX_WEIGHT = 0.0
-    MPC_STALL_DEBT_BASE_WEIGHT = 10.0
-    MPC_STALL_DEBT_ACTIVATION_SECONDS = 0.5
-    MPC_STALL_DEBT_EXPONENTIAL_TIME_SCALE = 0.5
-    MPC_STALL_DEBT_SPEED_THRESHOLD = 0.10
-    MPC_STALL_DEBT_PROGRESS_RATE_THRESHOLD = 0.05
-    MPC_STALL_DEBT_RECOVERY_DECAY_RATE = 2.0
-    MPC_STALL_DEBT_MINIMUM_HORIZON_PROGRESS = 0.50
-
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0
     MPC_MAX_STEER_RATE = 4.0  # normalized steering-command change per second (0.4 per 0.1 s MPC step)

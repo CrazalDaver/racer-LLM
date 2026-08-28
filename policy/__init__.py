@@ -7,10 +7,12 @@ from .ibr import (
     plan_parameter_ibr_policy_params,
 )
 from .llm import (
+    EvidenceFirstLLMPolicy,
     ExplicitRuleLLMPolicy,
     LLMAlphaRacerPolicy,
     RuleBasedPolicy,
     RuleBasedSafeguardPolicy,
+    StructuredBasisActionFirstLLMPolicy,
 )
 from .base import BasePolicy
 from .mpc import CenterLinePolicy, MPCPolicy, StaticAlphaRacerPolicy
@@ -24,6 +26,7 @@ __all__ = [
     "IteratedBestResponsePolicy",
     "ParameterIBRPolicy",
     "TrajectoryIBRPolicy",
+    "EvidenceFirstLLMPolicy",
     "ExplicitRuleLLMPolicy",
     "LLMAlphaRacerPolicy",
     "MPCPolicy",
@@ -31,6 +34,7 @@ __all__ = [
     "RuleBasedSafeguardPolicy",
     "SelfPlayRLPolicy",
     "StaticAlphaRacerPolicy",
+    "StructuredBasisActionFirstLLMPolicy",
     "angle_delta",
     "plan_alpharacer_policy_params",
     "plan_parameter_ibr_policy_params",

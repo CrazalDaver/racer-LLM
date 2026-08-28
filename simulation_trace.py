@@ -25,10 +25,14 @@ def create_simulation_trace(
     initial_speeds,
     vehicle_model_type,
     mpc_velocity_track_weight,
-    mpc_terminal_viability_weight,
-    mpc_stall_debt_max_weight,
     mpc_track_slack_weight,
 ):
+    llm_policy_names = {
+        "llm_alpharacer",
+        "llm_structured_action_first",
+        "llm_evidence_first",
+        "llm_explicit_rules",
+    }
     trace = SimulationTrace({
         "policy_names": resolved_policy_names,
         "car_alpharacer_weight_paths": [
@@ -48,11 +52,11 @@ def create_simulation_trace(
         "llm_model_names": [
             (
                 params.LLM_MODEL
-                if resolved_policy_names[idx] in {"llm_alpharacer", "llm_explicit_rules"}
+                if resolved_policy_names[idx] in llm_policy_names
                 and resolved_llm_model_names[idx] is None
                 else str(resolved_llm_model_names[idx])
             )
-            if resolved_policy_names[idx] in {"llm_alpharacer", "llm_explicit_rules"}
+            if resolved_policy_names[idx] in llm_policy_names
             else ""
             for idx in range(num_cars)
         ],
@@ -62,7 +66,7 @@ def create_simulation_trace(
                 if resolved_llm_temperatures[idx] is None
                 else float(resolved_llm_temperatures[idx])
             )
-            if resolved_policy_names[idx] in {"llm_alpharacer", "llm_explicit_rules"}
+            if resolved_policy_names[idx] in llm_policy_names
             else np.nan
             for idx in range(num_cars)
         ],
@@ -97,8 +101,6 @@ def create_simulation_trace(
         "mpc_state_coordinates": "frenet",
         "velocity_track_weight": mpc_velocity_track_weight,
         "heading_track_weight": params.HEADING_TRACK_WEIGHT,
-        "terminal_viability_weight": mpc_terminal_viability_weight,
-        "stall_debt_max_weight": mpc_stall_debt_max_weight,
         "track_slack_weight": mpc_track_slack_weight,
         "parameter_ibr_rounds": params.PARAMETER_IBR_ROUNDS,
         "parameter_ibr_search_points": params.PARAMETER_IBR_SEARCH_POINTS,
@@ -211,24 +213,6 @@ def record_simulation_step(
     trace["car_mpc_action_loss"].append([mpc.last_action_loss for mpc in mpcs])
     trace["car_mpc_velocity_loss"].append([mpc.last_velocity_loss for mpc in mpcs])
     trace["car_mpc_heading_loss"].append([mpc.last_heading_loss for mpc in mpcs])
-    trace["car_mpc_terminal_viability_loss"].append(
-        [mpc.last_terminal_viability_loss for mpc in mpcs]
-    )
-    trace["car_mpc_terminal_viability_violation"].append(
-        [mpc.last_terminal_viability_violation for mpc in mpcs]
-    )
-    trace["car_mpc_stall_debt_seconds"].append(
-        [mpc.stall_debt.seconds for mpc in mpcs]
-    )
-    trace["car_mpc_stall_debt_weight"].append(
-        [mpc.stall_debt.weight for mpc in mpcs]
-    )
-    trace["car_mpc_stall_debt_loss"].append(
-        [mpc.last_stall_debt_loss for mpc in mpcs]
-    )
-    trace["car_mpc_stall_debt_deficit"].append(
-        [mpc.last_stall_debt_deficit for mpc in mpcs]
-    )
     trace["car_mpc_violation_loss"].append(
         [mpc.last_violation_loss for mpc in mpcs]
     )
@@ -321,16 +305,6 @@ def record_simulation_step(
     trace["mpc_action_loss"].append(ego_mpc.last_action_loss)
     trace["mpc_velocity_loss"].append(ego_mpc.last_velocity_loss)
     trace["mpc_heading_loss"].append(ego_mpc.last_heading_loss)
-    trace["mpc_terminal_viability_loss"].append(
-        ego_mpc.last_terminal_viability_loss
-    )
-    trace["mpc_terminal_viability_violation"].append(
-        ego_mpc.last_terminal_viability_violation
-    )
-    trace["mpc_stall_debt_seconds"].append(ego_mpc.stall_debt.seconds)
-    trace["mpc_stall_debt_weight"].append(ego_mpc.stall_debt.weight)
-    trace["mpc_stall_debt_loss"].append(ego_mpc.last_stall_debt_loss)
-    trace["mpc_stall_debt_deficit"].append(ego_mpc.last_stall_debt_deficit)
     trace["mpc_violation_loss"].append(ego_mpc.last_violation_loss)
     trace["mpc_max_track_slack"].append(
         float(np.max(ego_mpc.last_track_slack_plan))
@@ -491,16 +465,6 @@ def save_simulation_trace(trace, track, params):
         car_mpc_action_loss=np.asarray(trace["car_mpc_action_loss"]),
         car_mpc_velocity_loss=np.asarray(trace["car_mpc_velocity_loss"]),
         car_mpc_heading_loss=np.asarray(trace["car_mpc_heading_loss"]),
-        car_mpc_terminal_viability_loss=np.asarray(
-            trace["car_mpc_terminal_viability_loss"]
-        ),
-        car_mpc_terminal_viability_violation=np.asarray(
-            trace["car_mpc_terminal_viability_violation"]
-        ),
-        car_mpc_stall_debt_seconds=np.asarray(trace["car_mpc_stall_debt_seconds"]),
-        car_mpc_stall_debt_weight=np.asarray(trace["car_mpc_stall_debt_weight"]),
-        car_mpc_stall_debt_loss=np.asarray(trace["car_mpc_stall_debt_loss"]),
-        car_mpc_stall_debt_deficit=np.asarray(trace["car_mpc_stall_debt_deficit"]),
         car_mpc_violation_loss=np.asarray(trace["car_mpc_violation_loss"]),
         car_mpc_track_slack_loss=np.asarray(
             trace["car_mpc_track_slack_loss"], dtype=float
@@ -577,16 +541,6 @@ def save_simulation_trace(trace, track, params):
         mpc_action_loss=np.asarray(trace["mpc_action_loss"]),
         mpc_velocity_loss=np.asarray(trace["mpc_velocity_loss"]),
         mpc_heading_loss=np.asarray(trace["mpc_heading_loss"]),
-        mpc_terminal_viability_loss=np.asarray(
-            trace["mpc_terminal_viability_loss"]
-        ),
-        mpc_terminal_viability_violation=np.asarray(
-            trace["mpc_terminal_viability_violation"]
-        ),
-        mpc_stall_debt_seconds=np.asarray(trace["mpc_stall_debt_seconds"]),
-        mpc_stall_debt_weight=np.asarray(trace["mpc_stall_debt_weight"]),
-        mpc_stall_debt_loss=np.asarray(trace["mpc_stall_debt_loss"]),
-        mpc_stall_debt_deficit=np.asarray(trace["mpc_stall_debt_deficit"]),
         mpc_violation_loss=np.asarray(trace["mpc_violation_loss"]),
         mpc_max_track_slack=np.asarray(trace["mpc_max_track_slack"]),
         mpc_max_collision_slack=np.asarray(trace["mpc_max_collision_slack"]),
@@ -763,14 +717,6 @@ def save_simulation_trace(trace, track, params):
         ),
         heading_track_weight=np.asarray(
             trace.get("heading_track_weight", params.HEADING_TRACK_WEIGHT)
-        ),
-        terminal_viability_weight=np.asarray(
-            trace.get(
-                "terminal_viability_weight", params.MPC_TERMINAL_VIABILITY_WEIGHT
-            )
-        ),
-        stall_debt_max_weight=np.asarray(
-            trace.get("stall_debt_max_weight", params.MPC_STALL_DEBT_MAX_WEIGHT)
         ),
         track_slack_weight=np.asarray(
             trace.get("track_slack_weight", params.MPC_TRACK_SLACK_WEIGHT)

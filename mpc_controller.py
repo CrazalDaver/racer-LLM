@@ -1,6 +1,5 @@
 from config import GRAVITY
 from vehicle_model import kinematic_frenet_step
-from mpc_stall_debt import StallDebtSettings, StallDebtTracker
 
 import numpy as np
 import casadi as cs
@@ -37,15 +36,6 @@ class MPCController:
         max_state_speed=5.0,
         velocity_track_weight=0.0,
         heading_track_weight=0.0,
-        terminal_viability_weight=0.0,
-        stall_debt_max_weight=0.0,
-        stall_debt_base_weight=10.0,
-        stall_debt_activation_seconds=0.5,
-        stall_debt_exponential_time_scale=0.5,
-        stall_debt_speed_threshold=0.10,
-        stall_debt_progress_rate_threshold=0.05,
-        stall_debt_recovery_decay_rate=2.0,
-        stall_debt_minimum_horizon_progress=0.50,
         track_length=None,
         min_longitudinal_separation=0.36,
         min_lateral_separation=0.20,
@@ -75,17 +65,6 @@ class MPCController:
         self.max_speed = max_state_speed
         self.velocity_track_weight = velocity_track_weight
         self.heading_track_weight = heading_track_weight
-        self.terminal_viability_weight = float(terminal_viability_weight)
-        self.stall_debt = StallDebtTracker(StallDebtSettings(
-            max_weight=float(stall_debt_max_weight),
-            base_weight=float(stall_debt_base_weight),
-            activation_seconds=float(stall_debt_activation_seconds),
-            exponential_time_scale=float(stall_debt_exponential_time_scale),
-            speed_threshold=float(stall_debt_speed_threshold),
-            progress_rate_threshold=float(stall_debt_progress_rate_threshold),
-            recovery_decay_rate=float(stall_debt_recovery_decay_rate),
-            minimum_horizon_progress=float(stall_debt_minimum_horizon_progress),
-        ))
         self.track_length = None if track_length is None else float(track_length)
         self.min_longitudinal_separation = float(min_longitudinal_separation)
         self.min_lateral_separation = float(min_lateral_separation)
@@ -106,8 +85,6 @@ class MPCController:
             raise ValueError("collision_superellipse_exponent must be an even integer >= 2")
         if self.track_slack_weight < 0.0 or self.collision_slack_weight < 0.0:
             raise ValueError("MPC slack weights must be non-negative")
-        if self.terminal_viability_weight < 0.0:
-            raise ValueError("MPC terminal viability weight must be non-negative")
         if self.friction_coefficient <= 0.0:
             raise ValueError("MPC friction coefficient must be positive")
         self.last_loss = np.nan
@@ -115,10 +92,6 @@ class MPCController:
         self.last_action_loss = np.nan
         self.last_velocity_loss = np.nan
         self.last_heading_loss = np.nan
-        self.last_terminal_viability_loss = np.nan
-        self.last_terminal_viability_violation = np.nan
-        self.last_stall_debt_loss = 0.0
-        self.last_stall_debt_deficit = 0.0
         self.last_violation_loss = np.nan
         self.last_track_slack_loss = np.nan
         self.last_collision_slack_loss = np.nan
@@ -135,15 +108,6 @@ class MPCController:
         self.last_opponent_active = None
         self.n_states = 4
         self.n_controls = 2
-        wheelbase = float(self.p.LF + self.p.LR)
-        steering_angles = (
-            float(self.p.Sa * (-1.0) + self.p.Sb),
-            float(self.p.Sa * 1.0 + self.p.Sb),
-        )
-        self.maximum_vehicle_curvature = max(
-            abs(np.tan(angle) / wheelbase) for angle in steering_angles
-        )
-
         curvature_s, curvature = self.track.curvature_profile()
         self.max_abs_curvature = float(np.max(np.abs(curvature)))
         self.minimum_nominal_frenet_denominator = float(
@@ -208,13 +172,7 @@ class MPCController:
             "opponent_active",
             self.max_constrained_opponents,
         )
-        self.stall_debt_weight = cs.SX.sym("stall_debt_weight", 1)
-
         self._build_problem()
-
-    def update_stall_debt(self, current_s, speed, sim_time):
-        """Update history once per completed closed-loop control interval."""
-        return self.stall_debt.update(current_s, speed, sim_time)
 
     def _vehicle_dynamics(self, xk, uk):
         return kinematic_frenet_step(
@@ -361,7 +319,6 @@ class MPCController:
                 opponent_s.T.reshape(-1, 1),
                 opponent_e.T.reshape(-1, 1),
                 opponent_active.reshape(-1, 1),
-                np.array([[self.stall_debt.weight]], dtype=float),
             ]
         )
 
@@ -384,12 +341,6 @@ class MPCController:
         self.last_violation_loss = float(violation_loss)
         self.last_track_slack_loss = float(track_slack_loss)
         self.last_collision_slack_loss = float(collision_slack_loss)
-        viability_loss, viability_violation = self.terminal_viability_fn(x_opt, p_val)
-        self.last_terminal_viability_loss = float(viability_loss)
-        self.last_terminal_viability_violation = float(viability_violation)
-        stall_loss, stall_deficit = self.stall_debt_fn(x_opt, p_val)
-        self.last_stall_debt_loss = float(stall_loss)
-        self.last_stall_debt_deficit = float(stall_deficit)
 
     def evaluate_fallback_loss(
         self,
@@ -464,64 +415,6 @@ class MPCController:
         )
         violation_cost = track_slack_cost + collision_slack_cost
 
-        # Optional terminal turning-room surrogate.  It asks whether the final
-        # predicted pose has enough lateral room to turn an outward heading
-        # back toward the track, using the bicycle model's maximum curvature.
-        # This is a local audit term (not part of Wang or alpha-RACER), and a
-        # zero weight leaves the production objective unchanged.
-        terminal_heading = cs.atan2(
-            cs.sin(self.X[2, self.horizon]), cs.cos(self.X[2, self.horizon])
-        )
-        smooth_eps = 1.0e-8
-        smooth_positive = lambda value: 0.5 * (
-            value + cs.sqrt(value * value + smooth_eps)
-        )
-        outward_left = smooth_positive(terminal_heading)
-        outward_right = smooth_positive(-terminal_heading)
-        left_turning_room = (1.0 - cs.cos(outward_left)) / self.maximum_vehicle_curvature
-        right_turning_room = (1.0 - cs.cos(outward_right)) / self.maximum_vehicle_curvature
-        left_violation = smooth_positive(
-            self.X[1, self.horizon] + left_turning_room - self.track_constraint_half_width
-        )
-        right_violation = smooth_positive(
-            -self.X[1, self.horizon] + right_turning_room - self.track_constraint_half_width
-        )
-        terminal_viability_violation = cs.sqrt(
-            left_violation * left_violation + right_violation * right_violation
-        )
-        terminal_viability_cost = (
-            self.terminal_viability_weight
-            * terminal_viability_violation
-            * terminal_viability_violation
-        )
-        # A history-dependent weight penalizes making too little progress over
-        # this horizon.  With weight zero this expression is identically zero.
-        # The ordinary 0.44 m soft constraint remains intact: its quadratic
-        # slack cost can trade against stall debt, while progressively making
-        # excursions toward the 0.55 m simulator recovery threshold expensive.
-        # Penalize lag behind a linearly increasing progress schedule at every
-        # prediction step.  A terminal-only target permits receding-horizon
-        # procrastination: every solve can postpone motion to its final steps
-        # while repeatedly executing a neutral first action.
-        schedule_deficit_squares = 0
-        for k in range(1, self.horizon + 1):
-            scheduled_progress = (
-                self.stall_debt.settings.minimum_horizon_progress
-                * k
-                / self.horizon
-            )
-            step_deficit = smooth_positive(
-                scheduled_progress - (self.X[0, k] - self.X[0, 0])
-            )
-            schedule_deficit_squares += step_deficit * step_deficit
-        smooth_progress_deficit = cs.sqrt(
-            2.0 * schedule_deficit_squares / (self.horizon + 1)
-        )
-        stall_debt_cost = (
-            self.stall_debt_weight
-            * smooth_progress_deficit
-            * smooth_progress_deficit
-        )
         # initial state constraint
         g_eq = [self.X[:, 0] - self.x0]
 
@@ -612,8 +505,6 @@ class MPCController:
             + velocity_cost
             + heading_cost
             + violation_cost
-            + terminal_viability_cost
-            + stall_debt_cost
         )
         self.g = cs.vertcat(*g_eq, *g_ineq)
         self.x_opt = cs.vertcat(
@@ -630,7 +521,6 @@ class MPCController:
             cs.reshape(self.opponent_s, -1, 1),
             cs.reshape(self.opponent_e, -1, 1),
             self.opponent_active,
-            self.stall_debt_weight,
         )
 
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
@@ -650,17 +540,6 @@ class MPCController:
                 collision_slack_cost,
             ],
         )
-        self.terminal_viability_fn = cs.Function(
-            "mpc_terminal_viability",
-            [self.x_opt, self.p_opt],
-            [terminal_viability_cost, terminal_viability_violation],
-        )
-        self.stall_debt_fn = cs.Function(
-            "mpc_stall_debt",
-            [self.x_opt, self.p_opt],
-            [stall_debt_cost, smooth_progress_deficit],
-        )
-        
         self.n_x = self.n_states * (self.horizon + 1)
         self.n_u = self.n_controls * self.horizon
         self.n_track_slack = self.horizon

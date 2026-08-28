@@ -10,6 +10,7 @@ from plotting import plot_simulation_results
 from policy import (
     AlphaRacerPolicy,
     CenterLinePolicy,
+    EvidenceFirstLLMPolicy,
     ExplicitRuleLLMPolicy,
     IteratedBestResponsePolicy,
     LLMAlphaRacerPolicy,
@@ -17,6 +18,7 @@ from policy import (
     RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
     StaticAlphaRacerPolicy,
+    StructuredBasisActionFirstLLMPolicy,
     plan_alpharacer_policy_params,
     plan_ibr_joint_actions,
     progress_delta,
@@ -77,6 +79,14 @@ def _normalize_policy_name(policy_name):
         "llm_alpharacer": "llm_alpharacer",
         "llmalpha": "llm_alpharacer",
         "llmalpharacer": "llm_alpharacer",
+
+        "llm_evidence": "llm_evidence_first",
+        "llm_evidence_first": "llm_evidence_first",
+        "evidence_first_llm": "llm_evidence_first",
+
+        "llm_structured_basis": "llm_structured_action_first",
+        "llm_action_first": "llm_structured_action_first",
+        "llm_structured_action_first": "llm_structured_action_first",
 
         "llm_rules": "llm_explicit_rules",
         "llm_rule": "llm_explicit_rules",
@@ -200,10 +210,19 @@ def create_policy(
             max_speed=params.MAX_RACELINE_SPEED,
             ref_lateral_clip=params.REF_LATERAL_CLIP,
         )
-    if policy_type in {"llm_alpharacer", "llm_explicit_rules"}:
+    if policy_type in {
+        "llm_alpharacer",
+        "llm_structured_action_first",
+        "llm_evidence_first",
+        "llm_explicit_rules",
+    }:
         policy_class = (
             ExplicitRuleLLMPolicy
             if policy_type == "llm_explicit_rules"
+            else StructuredBasisActionFirstLLMPolicy
+            if policy_type == "llm_structured_action_first"
+            else EvidenceFirstLLMPolicy
+            if policy_type == "llm_evidence_first"
             else LLMAlphaRacerPolicy
         )
         return policy_class(
@@ -372,8 +391,6 @@ def run_simulation(
     initial_lateral_offsets=None,
     initial_speeds=None,
     velocity_track_weight=None,
-    terminal_viability_weight=None,
-    stall_debt_max_weight=None,
     track_slack_weight=None,
     mpc_formulation=None,
     horizon=None,
@@ -454,20 +471,6 @@ def run_simulation(
     )
     if mpc_velocity_track_weight < 0.0:
         raise ValueError("velocity_track_weight must be non-negative")
-    mpc_terminal_viability_weight = (
-        params.MPC_TERMINAL_VIABILITY_WEIGHT
-        if terminal_viability_weight is None
-        else float(terminal_viability_weight)
-    )
-    if mpc_terminal_viability_weight < 0.0:
-        raise ValueError("terminal_viability_weight must be non-negative")
-    mpc_stall_debt_max_weight = (
-        params.MPC_STALL_DEBT_MAX_WEIGHT
-        if stall_debt_max_weight is None
-        else float(stall_debt_max_weight)
-    )
-    if mpc_stall_debt_max_weight < 0.0:
-        raise ValueError("stall_debt_max_weight must be non-negative")
     mpc_track_slack_weight = (
         params.MPC_TRACK_SLACK_WEIGHT
         if track_slack_weight is None
@@ -517,15 +520,6 @@ def run_simulation(
             max_state_speed=params.MAX_STATE_SPEED,
             velocity_track_weight=mpc_velocity_track_weight,
             heading_track_weight=params.HEADING_TRACK_WEIGHT,
-            terminal_viability_weight=mpc_terminal_viability_weight,
-            stall_debt_max_weight=mpc_stall_debt_max_weight,
-            stall_debt_base_weight=params.MPC_STALL_DEBT_BASE_WEIGHT,
-            stall_debt_activation_seconds=params.MPC_STALL_DEBT_ACTIVATION_SECONDS,
-            stall_debt_exponential_time_scale=params.MPC_STALL_DEBT_EXPONENTIAL_TIME_SCALE,
-            stall_debt_speed_threshold=params.MPC_STALL_DEBT_SPEED_THRESHOLD,
-            stall_debt_progress_rate_threshold=params.MPC_STALL_DEBT_PROGRESS_RATE_THRESHOLD,
-            stall_debt_recovery_decay_rate=params.MPC_STALL_DEBT_RECOVERY_DECAY_RATE,
-            stall_debt_minimum_horizon_progress=params.MPC_STALL_DEBT_MINIMUM_HORIZON_PROGRESS,
             track_length=track.total_length,
             min_longitudinal_separation=params.MPC_MIN_LONGITUDINAL_SEPARATION,
             min_lateral_separation=params.MPC_MIN_LATERAL_SEPARATION,
@@ -647,8 +641,6 @@ def run_simulation(
         initial_speeds=initial_speeds,
         vehicle_model_type=vehicle_model_type,
         mpc_velocity_track_weight=mpc_velocity_track_weight,
-        mpc_terminal_viability_weight=mpc_terminal_viability_weight,
-        mpc_stall_debt_max_weight=mpc_stall_debt_max_weight,
         mpc_track_slack_weight=mpc_track_slack_weight,
     )
     trace["raceline_csv"] = selected_raceline
@@ -1157,23 +1149,6 @@ if __name__ == "__main__":
         help="Override the shared MPC reference-speed tracking weight.",
     )
     parser.add_argument(
-        "--mpc-terminal-viability-weight",
-        type=float,
-        default=None,
-        metavar="WEIGHT",
-        help=(
-            "Enable the optional terminal turning-room audit term; "
-            "0 (the default) disables it."
-        ),
-    )
-    parser.add_argument(
-        "--mpc-stall-debt-max-weight",
-        type=float,
-        default=None,
-        metavar="WEIGHT",
-        help="Enable the detachable history-dependent MPC anti-stall audit.",
-    )
-    parser.add_argument(
         "--mpc-track-slack-weight",
         type=float,
         default=None,
@@ -1221,16 +1196,6 @@ if __name__ == "__main__":
             cli_args.low_speed_boundary_recovery
         )
     if (
-        cli_args.mpc_terminal_viability_weight is not None
-        and cli_args.mpc_terminal_viability_weight < 0.0
-    ):
-        parser.error("--mpc-terminal-viability-weight must be non-negative")
-    if (
-        cli_args.mpc_stall_debt_max_weight is not None
-        and cli_args.mpc_stall_debt_max_weight < 0.0
-    ):
-        parser.error("--mpc-stall-debt-max-weight must be non-negative")
-    if (
         cli_args.mpc_track_slack_weight is not None
         and cli_args.mpc_track_slack_weight < 0.0
     ):
@@ -1272,8 +1237,6 @@ if __name__ == "__main__":
         start_gap=cli_args.start_gap,
         initial_speeds=cli_args.initial_speeds,
         velocity_track_weight=cli_args.mpc_velocity_track_weight,
-        terminal_viability_weight=cli_args.mpc_terminal_viability_weight,
-        stall_debt_max_weight=cli_args.mpc_stall_debt_max_weight,
         track_slack_weight=cli_args.mpc_track_slack_weight,
         mpc_formulation=cli_args.mpc_formulation,
         show_plot=not cli_args.no_plot,
