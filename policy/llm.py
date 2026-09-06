@@ -121,6 +121,34 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             return None
         return round(float(value), digits)
 
+    @classmethod
+    def _side_and_magnitude(cls, value, magnitude_name, digits=1):
+        """Encode a signed lateral quantity without exposing a sign convention."""
+        if value is None or not np.isfinite(value):
+            return None
+        value = float(value)
+        side = "left" if value > 0.0 else "right" if value < 0.0 else "center"
+        return {"side": side, magnitude_name: cls._rounded(abs(value), digits)}
+
+    @classmethod
+    def _turn_and_magnitude(cls, value, magnitude_name, digits=1):
+        """Encode signed left-positive road geometry as direction plus magnitude."""
+        if value is None or not np.isfinite(value):
+            return None
+        value = float(value)
+        direction = "left" if value > 0.0 else "right" if value < 0.0 else "straight"
+        return {"direction": direction, magnitude_name: cls._rounded(abs(value), digits)}
+
+    @classmethod
+    def _gap_motion(cls, closing_speed):
+        """Describe whether a longitudinal gap is shrinking or growing."""
+        value = float(closing_speed)
+        trend = "closing" if value > 0.0 else "opening" if value < 0.0 else "constant"
+        return {
+            "trend": trend,
+            "speed_meters_per_second": cls._rounded(abs(value), digits=2),
+        }
+
     def _decision_history_payload(self) -> list:
         """Return only recent executed modes, oldest to newest."""
         return [
@@ -147,23 +175,28 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                     raceline_s,
                     centerline_s_hint=sample_s,
                 )
-                raceline_left_offset_percent = self._rounded(
-                    100.0 * raceline_state["lateral_e"] / max(lateral_limit, 1e-6),
-                    digits=1,
+                raceline_left_offset_percent = (
+                    100.0 * raceline_state["lateral_e"] / max(lateral_limit, 1e-6)
                 )
 
             samples.append(
                 {
                     "distance_ahead_meters": self._rounded(distance, digits=1),
-                    "centerline_left_curvature_per_meter": self._rounded(
+                    "centerline_curvature": self._turn_and_magnitude(
                         track_curvature_at(self.track, sample_s),
+                        "magnitude_per_meter",
                         digits=3,
                     ),
-                    "centerline_left_turn_degrees_from_current": self._rounded(
+                    "centerline_turn_from_current": self._turn_and_magnitude(
                         math.degrees(angle_delta(center_heading, current_heading)),
+                        "degrees",
                         digits=1,
                     ),
-                    "raceline_left_offset_percent_of_half_width": raceline_left_offset_percent,
+                    "raceline_offset_from_centerline": self._side_and_magnitude(
+                        raceline_left_offset_percent,
+                        "percent_of_half_width",
+                        digits=1,
+                    ),
                 }
             )
 
@@ -200,13 +233,14 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "id": int(opponent.get("car_idx", -1)),
             "position": position,
             "longitudinal_gap_meters": self._rounded(abs_delta_s, digits=2),
-            "left_offset_from_ego_percent_of_half_width": self._rounded(
+            "lateral_offset_from_ego": self._side_and_magnitude(
                 100.0
                 * (float(opponent.get("py", current_py)) - float(current_py))
                 / max(lateral_limit, 1e-6),
+                "percent_of_half_width",
                 digits=1,
             ),
-            "closing_speed_meters_per_second": self._rounded(closing_speed, digits=2),
+            "gap_motion": self._gap_motion(closing_speed),
             "ttc_seconds": ttc_seconds,  # null if donot approach
         }
 
@@ -247,12 +281,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             return {
                 "id": feature["id"],
                 "longitudinal_gap_meters": feature["longitudinal_gap_meters"],
-                "left_offset_from_ego_percent_of_half_width": feature[
-                    "left_offset_from_ego_percent_of_half_width"
-                ],
-                "closing_speed_meters_per_second": feature[
-                    "closing_speed_meters_per_second"
-                ],
+                "lateral_offset_from_ego": feature["lateral_offset_from_ego"],
+                "gap_motion": feature["gap_motion"],
                 "ttc_seconds": feature["ttc_seconds"],
             }
 
@@ -262,8 +292,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                     100.0 * (float(current_s) % self.track.total_length) / self.track.total_length,
                     digits=1,
                 ),
-                "left_position_percent_of_half_width": self._rounded(
+                "lateral_position": self._side_and_magnitude(
                     100.0 * float(current_py) / max(lateral_limit, 1e-6),
+                    "percent_of_half_width",
                     digits=1,
                 ),
                 "speed_percent_of_maximum": self._rounded(
@@ -359,7 +390,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "additionalProperties": False,
         }
 
-    def _query_llm(self, prompt: str) -> dict:
+    def _query_llm(self, prompt: str, *, system_prompt=None, output_schema=None) -> dict:
         self._last_raw_llm_response = ""
         self._last_llm_done_reason = ""
         self._last_llm_eval_count = -1
@@ -369,9 +400,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         # ollama query
         payload = {
             "model": self.model_name,
-            "system": self.system_prompt,  # local file that describes tasks definition and mode explanation
+            "system": self.system_prompt if system_prompt is None else system_prompt,
             "prompt": prompt,
-            "format": self._output_schema(),
+            "format": self._output_schema() if output_schema is None else output_schema,
             "stream": False,
             "options": {"temperature": self.temperature, "num_predict": 192},
         }
@@ -485,7 +516,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         return reason[:160]
 
     def _sanitize_basis(self, raw_params: dict) -> str:
-        return str(raw_params.get("basis", "uncertain"))[:40]
+        if "basis" in raw_params:
+            return str(raw_params["basis"])[:40]
+        traffic = str(raw_params.get("traffic_basis", "uncertain"))
+        track = str(raw_params.get("track_basis", ""))
+        return f"{traffic}|{track}"[:80] if track else traffic[:40]
 
     def _mode_context(self, state: CarState, current_s: float, opponents=None) -> dict:
         # Compute context information for mode guarding, including nearest opponent distances and relative speeds.

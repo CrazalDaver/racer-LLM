@@ -135,6 +135,19 @@ def _trace_safety_summary(data):
         "low_speed_boundary_recovery_triggers_by_car": trigger_count_by_car(
             "car_low_speed_boundary_recovery_active"
         ),
+        "deadlock_reset_count_by_car": (
+            _jsonable(
+                np.sum(
+                    np.asarray(data["car_deadlock_reset_event"], dtype=bool),
+                    axis=0,
+                )
+            )
+            if "car_deadlock_reset_event" in data.files
+            else [None] * car_count
+        ),
+        "deadlock_reset_blocked_seconds_by_car": time_by_car(
+            "car_deadlock_reset_blocked"
+        ),
         "mpc_recovery_seconds_by_car": time_by_car("car_mpc_recovery_active"),
         "max_track_slack_by_car": max_by_car("car_mpc_max_track_slack"),
         "max_collision_slack_by_car": max_by_car(
@@ -260,6 +273,9 @@ def _policy_params_for_name(policy_names, snapshot):
         "llm-alpharacer",
         "llm_alpharacer",
         "llm_evidence_first",
+        "llm_two_step_evidence",
+        "llm_raw_balanced",
+        "llm_balanced_two_step_evidence",
         "llm_structured_action_first",
         "llm_parameter_policy",
         "llm_rules",
@@ -913,6 +929,15 @@ def _add_sim_args(parser):
         help="Enable or disable the sustained low-speed boundary escape.",
     )
     group.add_argument(
+        "--deadlock-reset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable or disable the policy-independent sustained zero-progress "
+            "liveness reset."
+        ),
+    )
+    group.add_argument(
         "--ibr-implementation",
         choices=["local_wang", "historical_strict"],
         default="local_wang",
@@ -998,6 +1023,8 @@ if __name__ == "__main__":
         params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = (
             args.low_speed_boundary_recovery
         )
+    if args.deadlock_reset is not None:
+        params.DEADLOCK_RESET_ENABLED = args.deadlock_reset
     if args.mpc_formulation is not None:
         params.MPC_FORMULATION = args.mpc_formulation
     if args.mpc_horizon is not None and args.mpc_horizon < 2:

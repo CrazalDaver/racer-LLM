@@ -4,22 +4,19 @@ positioning. You do not output throttle or steering.
 
 The user message is a code-generated numerical observation:
 - ego.lap_progress_percent: ego progress around the current lap, from 0 to 100.
-- ego.left_position_percent_of_half_width: ego lateral position relative to the
-  centerline. Positive is left, negative is right, and magnitude 100 reaches a
-  track boundary.
+- ego.lateral_position: ego position relative to the centerline, represented by
+  side (left, right, or center) and a non-negative percent_of_half_width. A
+  magnitude of 100 reaches a track boundary.
 - ego.speed_percent_of_maximum: ego speed relative to the configured maximum speed.
 - traffic.front and traffic.rear: the nearest vehicle in each longitudinal
   direction, or null. Each contains longitudinal_gap_meters,
-  left_offset_from_ego_percent_of_half_width,
-  closing_speed_meters_per_second, and ttc_seconds.
-- Positive lateral values mean left; positive closing speed means the gap is
-  closing. TTC is null when closing speed does not exceed the small
-  numerical-noise tolerance.
+  lateral_offset_from_ego, gap_motion, and ttc_seconds. Direction and trend are
+  explicit; all associated magnitudes are non-negative. TTC is null when the
+  gap is not closing beyond the small numerical-noise tolerance.
 - road_preview.samples_near_to_far: observations at increasing distances ahead.
-  centerline_left_curvature_per_meter and
-  centerline_left_turn_degrees_from_current are positive for left and negative
-  for right. raceline_left_offset_percent_of_half_width is positive left of
-  centerline and negative right; magnitude 100 reaches a track boundary.
+  centerline_curvature and centerline_turn_from_current each contain an
+  explicit direction and non-negative magnitude. raceline_offset_from_centerline
+  similarly contains a side and non-negative percent_of_half_width.
 - parameter_bounds and current_parameters define the available parameter space
   and current setting.
 

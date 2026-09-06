@@ -29,6 +29,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from traffic_basis import (
+    TRAFFIC_BASIS_LABELS,
+    verify_traffic_basis,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODES = ("stable", "push", "overtake", "block")
@@ -37,6 +42,8 @@ STRUCTURED_VARIANTS = {
     "evidence_first_v1",
     "structured_action_first_minimal_v2",
     "evidence_first_minimal_v2",
+    "structured_action_first_dual_v3",
+    "evidence_first_dual_v3",
 }
 
 
@@ -72,44 +79,41 @@ def sign_state(value, deadband):
     return "ambiguous"
 
 
+def signed_lateral(container, legacy_key):
+    """Read either the old signed scalar or the direction+magnitude encoding."""
+    if legacy_key in container:
+        return float(container.get(legacy_key, 0.0))
+    field = (
+        container.get("lateral_position")
+        if legacy_key == "left_position_percent_of_half_width"
+        else container.get("lateral_offset_from_ego")
+    ) or {}
+    magnitude = float(field.get("percent_of_half_width", 0.0))
+    return magnitude if field.get("side") == "left" else -magnitude if field.get("side") == "right" else 0.0
+
+
+def signed_preview_turns(observation):
+    turns = []
+    for sample in observation.get("road_preview", {}).get("samples_near_to_far", []):
+        if sample.get("centerline_left_turn_degrees_from_current") is not None:
+            turns.append(float(sample["centerline_left_turn_degrees_from_current"]))
+            continue
+        turn = sample.get("centerline_turn_from_current")
+        if not turn:
+            continue
+        magnitude = float(turn.get("degrees", 0.0))
+        turns.append(magnitude if turn.get("direction") == "left" else -magnitude if turn.get("direction") == "right" else 0.0)
+    return turns
+
+
 def verify_basis(label, observation):
     """Return status and the observation used to check one basis label."""
-    traffic = observation.get("traffic", {})
-    front, rear = traffic.get("front"), traffic.get("rear")
-    if label == "no_front_vehicle":
-        return ("supported" if front is None else "contradicted", f"traffic.front={'null' if front is None else 'present'}")
-    if label == "no_rear_vehicle":
-        return ("supported" if rear is None else "contradicted", f"traffic.rear={'null' if rear is None else 'present'}")
+    if label in TRAFFIC_BASIS_LABELS:
+        return verify_traffic_basis(label, observation)
 
-    gap_claims = {
-        "closing_on_front_vehicle": (front, "positive", "front"),
-        "front_vehicle_pulling_away": (front, "negative", "front"),
-        "rear_vehicle_closing": (rear, "positive", "rear"),
-        "rear_vehicle_falling_behind": (rear, "negative", "rear"),
-    }
-    if label in gap_claims:
-        vehicle, expected, subject = gap_claims[label]
-        if vehicle is None:
-            return "contradicted", f"traffic.{subject}=null"
-        value = float(vehicle.get("closing_speed_meters_per_second", 0.0))
-        observed = sign_state(value, 0.1)
-        status = "ambiguous" if observed == "ambiguous" else "supported" if observed == expected else "contradicted"
-        return status, f"{subject}.closing_speed={value:.2f} m/s"
-
-    constant_gap_claims = {
-        "front_gap_approximately_constant": (front, "front"),
-        "rear_gap_approximately_constant": (rear, "rear"),
-    }
-    if label in constant_gap_claims:
-        vehicle, subject = constant_gap_claims[label]
-        if vehicle is None:
-            return "contradicted", f"traffic.{subject}=null"
-        value = float(vehicle.get("closing_speed_meters_per_second", 0.0))
-        observed = sign_state(value, 0.1)
-        return ("supported" if observed == "ambiguous" else "contradicted",
-                f"{subject}.closing_speed={value:.2f} m/s")
-
-    lateral = float(observation.get("ego", {}).get("left_position_percent_of_half_width", 0.0))
+    lateral = signed_lateral(
+        observation.get("ego", {}), "left_position_percent_of_half_width"
+    )
     lateral_state = sign_state(lateral, 5.0)
     lateral_claims = {
         "ego_left_of_center": "positive",
@@ -122,10 +126,7 @@ def verify_basis(label, observation):
         return status, f"ego.lateral={lateral:.1f}% half-width"
 
     if label.startswith("road_"):
-        samples = observation.get("road_preview", {}).get("samples_near_to_far", [])
-        turns = [float(sample["centerline_left_turn_degrees_from_current"])
-                 for sample in samples
-                 if sample.get("centerline_left_turn_degrees_from_current") is not None]
+        turns = signed_preview_turns(observation)
         left = any(value > 1.0 for value in turns)
         right = any(value < -1.0 for value in turns)
         observed = ("road_changes_direction" if left and right else
@@ -134,6 +135,29 @@ def verify_basis(label, observation):
         return ("supported" if label == observed else "contradicted",
                 f"preview_turns={','.join(f'{value:.1f}' for value in turns)} deg")
     return "unknown", "unrecognized basis"
+
+
+def verify_track_basis(label, observation):
+    """Check ego's centerline side relative to the previewed turn direction."""
+    turns = signed_preview_turns(observation)
+    left = any(value > 1.0 for value in turns)
+    right = any(value < -1.0 for value in turns)
+    lateral = signed_lateral(
+        observation.get("ego", {}), "left_position_percent_of_half_width"
+    )
+    side = sign_state(lateral, 5.0)
+    evidence = f"ego.lateral={lateral:.1f}%; preview_turns={','.join(f'{value:.1f}' for value in turns)} deg"
+
+    if left and right:
+        expected = "upcoming_turn_direction_changes"
+    elif not left and not right:
+        expected = "no_clear_upcoming_turn"
+    elif side == "ambiguous":
+        expected = "near_center_for_upcoming_turn"
+    else:
+        inside = (left and side == "positive") or (right and side == "negative")
+        expected = "inside_upcoming_turn" if inside else "outside_upcoming_turn"
+    return ("supported" if label == expected else "contradicted", evidence)
 
 
 def relative(path):
@@ -175,15 +199,25 @@ def audit_trace(path):
             observation, response = parse_object(prompts[slot]), parse_object(responses[slot])
             if observation is None or response is None:
                 continue
-            mode, basis = str(response.get("mode", "")).lower(), str(response.get("basis", ""))
+            mode = str(response.get("mode", "")).lower()
+            basis = str(response.get("traffic_basis", response.get("basis", "")))
+            track_basis = str(response.get("track_basis", ""))
             if mode not in MODES:
                 continue
             grounding, evidence = (verify_basis(basis, observation) if variant in STRUCTURED_VARIANTS
                                    else ("not_applicable", "raw free-text basis"))
+            track_grounding, track_evidence = (
+                verify_track_basis(track_basis, observation)
+                if track_basis
+                else ("not_applicable", "no structured track basis")
+            )
             decisions.append({
                 "trace": relative(path), "variant": variant, "call": int(call),
                 "basis": basis, "mode": mode, "reason": str(response.get("reason", "")),
                 "grounding": grounding, "grounding_evidence": evidence,
+                "track_basis": track_basis,
+                "track_grounding": track_grounding,
+                "track_grounding_evidence": track_evidence,
                 "latency_seconds": float(latencies[slot]) if np.isfinite(latencies[slot]) else None,
             })
 
@@ -215,12 +249,16 @@ def summarize(decisions, traces, excluded):
         ds = [row for row in decisions if row["variant"] == variant]
         ts = [row for row in traces if row["variant"] == variant]
         decisive = [row for row in ds if row["grounding"] in {"supported", "contradicted"}]
+        track_decisive = [row for row in ds if row["track_grounding"] in {"supported", "contradicted"}]
         summary["variants"][variant] = {
             "traces": len(ts), "decisions": len(ds),
             "mode_counts": dict(Counter(row["mode"] for row in ds)),
             "basis_counts": dict(Counter(row["basis"] for row in ds)),
             "grounding_counts": dict(Counter(row["grounding"] for row in ds)),
             "supported_fraction_excluding_ambiguous": mean([row["grounding"] == "supported" for row in decisive]),
+            "track_basis_counts": dict(Counter(row["track_basis"] for row in ds if row["track_basis"])),
+            "track_grounding_counts": dict(Counter(row["track_grounding"] for row in ds)),
+            "track_supported_fraction": mean([row["track_grounding"] == "supported" for row in track_decisive]),
             "mean_latency_seconds": mean([row["latency_seconds"] for row in ds]),
             "wins": int(sum(row["won"] for row in ts)),
             "mean_final_progress": mean([row["final_progress"] for row in ts]),
@@ -239,6 +277,8 @@ def plot_summary(summary, output):
         "evidence_first_v1": "evidence-first",
         "structured_action_first_minimal_v2": "action-first minimal",
         "evidence_first_minimal_v2": "evidence-first minimal",
+        "structured_action_first_dual_v3": "action-first dual",
+        "evidence_first_dual_v3": "evidence-first dual",
     }
     display = [display_names.get(name, name) for name in variants]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
@@ -253,20 +293,18 @@ def plot_summary(summary, output):
     axes[0].set_title("Mode distribution"); axes[0].legend(fontsize=8)
 
     structured = [name for name in variants if name in STRUCTURED_VARIANTS]
-    structured_x = np.arange(len(structured))
-    grounding_bottom = np.zeros(len(structured))
-    grounding_colors = {"supported": "#54a24b", "ambiguous": "#eeca3b", "contradicted": "#e45756"}
-    for status in ("supported", "ambiguous", "contradicted"):
-        values = []
-        for name in structured:
-            stats = summary["variants"][name]
-            values.append(stats["grounding_counts"].get(status, 0) / max(stats["decisions"], 1))
-        axes[1].bar(structured_x, values, bottom=grounding_bottom, label=status,
-                    color=grounding_colors[status])
-        grounding_bottom += values
+    structured_x = np.arange(len(structured)); grounding_width = 0.36
+    traffic_support = [summary["variants"][name]["supported_fraction_excluding_ambiguous"] or 0.0
+                       for name in structured]
+    track_support = [summary["variants"][name]["track_supported_fraction"] or 0.0
+                     for name in structured]
+    axes[1].bar(structured_x - grounding_width / 2, traffic_support, grounding_width,
+                label="traffic basis", color="#4c78a8")
+    axes[1].bar(structured_x + grounding_width / 2, track_support, grounding_width,
+                label="track basis", color="#54a24b")
     axes[1].set_xticks(structured_x, [display_names[name] for name in structured], rotation=20, ha="right")
     axes[1].set_ylim(0, 1); axes[1].set_ylabel("decision fraction")
-    axes[1].set_title("Structured-basis grounding"); axes[1].legend(fontsize=8)
+    axes[1].set_title("Supported factual basis"); axes[1].legend(fontsize=8)
 
     width = 0.36
     axes[2].bar(x - width / 2, [summary["variants"][v]["mean_final_progress"] for v in variants],
@@ -294,20 +332,29 @@ def write_html(summary, decisions, path):
     rows = []
     for variant, stats in summary["variants"].items():
         grounded = stats["supported_fraction_excluding_ambiguous"]
+        track_grounded = stats["track_supported_fraction"]
         rows.append(f"<tr><td>{html.escape(variant)}</td><td>{stats['traces']}</td><td>{stats['decisions']}</td>"
                     f"<td>{html.escape(str(stats['mode_counts']))}</td><td>{'N/A' if grounded is None else f'{100*grounded:.1f}%'}</td>"
+                    f"<td>{'N/A' if track_grounded is None else f'{100*track_grounded:.1f}%'}</td>"
                     f"<td>{stats['wins']}</td><td>{number(stats['mean_final_progress'], 1)}</td><td>{number(stats['mean_speed'])}</td>"
                     f"<td>{number(stats['mean_latency_seconds'])}</td></tr>")
     bad = [row for row in decisions if row["grounding"] == "contradicted"]
     examples = "".join(f"<tr><td>{html.escape(r['trace'])}</td><td>{r['call']}</td><td>{html.escape(r['basis'])}</td>"
                        f"<td>{html.escape(r['grounding_evidence'])}</td><td>{html.escape(r['mode'])}</td></tr>" for r in bad[:30])
     examples = examples or "<tr><td colspan='5'>No contradicted structured basis labels.</td></tr>"
+    bad_track = [row for row in decisions if row["track_grounding"] == "contradicted"]
+    track_examples = "".join(
+        f"<tr><td>{html.escape(r['trace'])}</td><td>{r['call']}</td><td>{html.escape(r['track_basis'])}</td>"
+        f"<td>{html.escape(r['track_grounding_evidence'])}</td><td>{html.escape(r['mode'])}</td></tr>"
+        for r in bad_track[:30]
+    ) or "<tr><td colspan='5'>No contradicted track basis labels.</td></tr>"
     path.write_text(f"""<!doctype html><html><head><meta charset='utf-8'><title>LLM basis A/B</title>
 <style>body{{font:15px system-ui;max-width:1250px;margin:30px auto;padding:0 18px}}table{{border-collapse:collapse;width:100%;margin:14px 0}}th,td{{border:1px solid #ccc;padding:7px;text-align:left}}th{{background:#f2f4f7}}img{{max-width:100%}}.note{{background:#fff8dc;padding:12px;border-left:4px solid #d9a400}}</style></head><body>
 <h1>Raw vs evidence-first LLM</h1><p class='note'>{html.escape(summary['scope_note'])} Deadbands only mark borderline observations ambiguous.</p>
-<img src='audit.png'><h2>Summary</h2><table><tr><th>Variant</th><th>Traces</th><th>Decisions</th><th>Mode counts</th><th>Supported basis*</th><th>Wins</th><th>Mean progress</th><th>Mean speed</th><th>Mean latency</th></tr>{''.join(rows)}</table>
-<p>*Among non-ambiguous structured labels. Raw free text is intentionally not assigned this score.</p>
-<h2>Contradicted structured basis</h2><table><tr><th>Trace</th><th>Call</th><th>Basis</th><th>Observation</th><th>Mode</th></tr>{examples}</table></body></html>""", encoding="utf-8")
+<img src='audit.png'><h2>Summary</h2><table><tr><th>Variant</th><th>Traces</th><th>Decisions</th><th>Mode counts</th><th>Traffic support*</th><th>Track support</th><th>Wins</th><th>Mean progress</th><th>Mean speed</th><th>Mean latency</th></tr>{''.join(rows)}</table>
+<p>*Traffic support excludes ambiguous near-zero closing speeds. Raw free text is intentionally not assigned these scores.</p>
+<h2>Contradicted traffic basis</h2><table><tr><th>Trace</th><th>Call</th><th>Basis</th><th>Observation</th><th>Mode</th></tr>{examples}</table>
+<h2>Contradicted track basis</h2><table><tr><th>Trace</th><th>Call</th><th>Track basis</th><th>Observation</th><th>Mode</th></tr>{track_examples}</table></body></html>""", encoding="utf-8")
 
 
 def main():

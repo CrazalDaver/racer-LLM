@@ -141,6 +141,10 @@ def record_simulation_step(
     offroad_recovery_active,
     offroad_recovery_heading_error,
     low_speed_boundary_recovery_active,
+    deadlock_reset_event,
+    deadlock_reset_blocked,
+    deadlock_reset_pre_lateral_error,
+    deadlock_reset_pre_speed,
     ref_component_snapshot,
 ):
     """Record one pre-integration simulation snapshot and return its reference point."""
@@ -400,6 +404,12 @@ def record_simulation_step(
     trace["car_low_speed_boundary_recovery_active"].append(
         low_speed_boundary_recovery_active
     )
+    trace["car_deadlock_reset_event"].append(deadlock_reset_event)
+    trace["car_deadlock_reset_blocked"].append(deadlock_reset_blocked)
+    trace["car_deadlock_reset_pre_lateral_error"].append(
+        deadlock_reset_pre_lateral_error
+    )
+    trace["car_deadlock_reset_pre_speed"].append(deadlock_reset_pre_speed)
     diagnostic_fields = (
         "max_collision_constraint",
         "min_predicted_longitudinal_distance",
@@ -657,6 +667,18 @@ def save_simulation_trace(trace, track, params):
         car_low_speed_boundary_recovery_active=np.asarray(
             trace.get("car_low_speed_boundary_recovery_active", []), dtype=bool
         ),
+        car_deadlock_reset_event=np.asarray(
+            trace.get("car_deadlock_reset_event", []), dtype=bool
+        ),
+        car_deadlock_reset_blocked=np.asarray(
+            trace.get("car_deadlock_reset_blocked", []), dtype=bool
+        ),
+        car_deadlock_reset_pre_lateral_error=np.asarray(
+            trace.get("car_deadlock_reset_pre_lateral_error", []), dtype=float
+        ),
+        car_deadlock_reset_pre_speed=np.asarray(
+            trace.get("car_deadlock_reset_pre_speed", []), dtype=float
+        ),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -711,6 +733,30 @@ def save_simulation_trace(trace, track, params):
         ),
         low_speed_boundary_trigger_seconds=np.asarray(
             params.LOW_SPEED_BOUNDARY_TRIGGER_SECONDS
+        ),
+        deadlock_reset_enabled=np.asarray(
+            params.DEADLOCK_RESET_ENABLED, dtype=bool
+        ),
+        deadlock_reset_trigger_speed=np.asarray(
+            params.DEADLOCK_RESET_TRIGGER_SPEED
+        ),
+        deadlock_reset_trigger_seconds=np.asarray(
+            params.DEADLOCK_RESET_TRIGGER_SECONDS
+        ),
+        deadlock_reset_min_progress=np.asarray(
+            params.DEADLOCK_RESET_MIN_PROGRESS
+        ),
+        deadlock_reset_restart_speed=np.asarray(
+            params.DEADLOCK_RESET_RESTART_SPEED
+        ),
+        deadlock_reset_min_sim_time=np.asarray(
+            params.DEADLOCK_RESET_MIN_SIM_TIME
+        ),
+        deadlock_reset_cooldown_seconds=np.asarray(
+            params.DEADLOCK_RESET_COOLDOWN_SECONDS
+        ),
+        deadlock_reset_collision_margin=np.asarray(
+            params.DEADLOCK_RESET_COLLISION_MARGIN
         ),
         velocity_track_weight=np.asarray(
             trace.get("velocity_track_weight", params.VELOCITY_TRACK_WEIGHT)

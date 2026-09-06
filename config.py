@@ -200,6 +200,19 @@ class SimParams:
     LOW_SPEED_BOUNDARY_TRIGGER_SECONDS = 0.50
     LOW_SPEED_BOUNDARY_MIN_SIM_TIME = 1.0
     LOW_SPEED_BOUNDARY_HEADING_GAIN = 0.50
+    # Policy-independent liveness reset for sustained zero-progress deadlocks.
+    # Disabled by default so historical experiments remain unchanged.  When
+    # enabled, the simulator re-centres a stationary car at the same Frenet s,
+    # aligns it with the local track tangent, and assigns a small forward speed.
+    # Every event (and every occupancy-blocked attempt) is recorded in the trace.
+    DEADLOCK_RESET_ENABLED = False
+    DEADLOCK_RESET_TRIGGER_SPEED = 0.05
+    DEADLOCK_RESET_TRIGGER_SECONDS = 1.50
+    DEADLOCK_RESET_MIN_PROGRESS = 0.10
+    DEADLOCK_RESET_RESTART_SPEED = 0.50
+    DEADLOCK_RESET_MIN_SIM_TIME = 5.0
+    DEADLOCK_RESET_COOLDOWN_SECONDS = 3.0
+    DEADLOCK_RESET_COLLISION_MARGIN = 0.05
     MPC_DT = 0.1
     # Optional detachable comparison profile.  ``constrained_local`` remains
     # the default and preserves all existing experiments.

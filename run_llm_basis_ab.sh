@@ -7,7 +7,11 @@
 #   ./run_llm_basis_ab.sh
 #   TOTAL_TIME=15 ./run_llm_basis_ab.sh
 #   TRACK_NAME=modena TOTAL_TIME=15 ./run_llm_basis_ab.sh
+#   ROOT_NAME=llm_basis_ab_berlin_50s TOTAL_TIME=50 ./run_llm_basis_ab.sh
 # TRACK_NAME: berlin (default), modena, or rounded_rectangle.
+# ROOT_NAME: optional result-directory name, useful for preserving earlier runs.
+# TRACK_SLACK_WEIGHT: shared MPC track-slack penalty (default 100000).
+# DEADLOCK_RESET=1: enable the shared sustained zero-progress reset.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,12 +20,18 @@ TOTAL_TIME="${TOTAL_TIME:-15}"
 TRACK_NAME="${TRACK_NAME:-berlin}"
 LLM_MODEL="${LLM_MODEL:-qwen2.5:7b}"
 VELOCITY_TRACK_WEIGHT="${VELOCITY_TRACK_WEIGHT:-10}"
-ROOT_NAME="llm_basis_minimal_ab_${TRACK_NAME}"
+TRACK_SLACK_WEIGHT="${TRACK_SLACK_WEIGHT:-100000}"
+DEADLOCK_RESET="${DEADLOCK_RESET:-0}"
+ROOT_NAME="${ROOT_NAME:-llm_basis_track_ab_${TRACK_NAME}}"
 RESULT_ROOT="result/${ROOT_NAME}"
 RAW_NAME="${ROOT_NAME}_raw"
 EVIDENCE_NAME="${ROOT_NAME}_evidence_first"
 ACTION_NAME="${ROOT_NAME}_structured_action_first"
 LOG_PATH="$RESULT_ROOT/runner.log"
+DEADLOCK_RESET_ARG="--no-deadlock-reset"
+if [[ "$DEADLOCK_RESET" == "1" ]]; then
+  DEADLOCK_RESET_ARG="--deadlock-reset"
+fi
 
 mkdir -p "$RESULT_ROOT"
 export PYTHONPYCACHEPREFIX="/tmp/racer_llm_pycache"
@@ -41,7 +51,9 @@ run_case() {
     --llm-temperature 0 \
     --mpc-formulation constrained_local \
     --mpc-velocity-track-weight "$VELOCITY_TRACK_WEIGHT" \
+    --mpc-track-slack-weight "$TRACK_SLACK_WEIGHT" \
     --no-low-speed-boundary-recovery \
+    "$DEADLOCK_RESET_ARG" \
     --no-animation \
     2>&1 | tee -a "$LOG_PATH"
 }

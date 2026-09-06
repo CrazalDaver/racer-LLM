@@ -9,6 +9,8 @@ from mpc_upstream_simple import UpstreamSimpleMPCController
 from plotting import plot_simulation_results
 from policy import (
     AlphaRacerPolicy,
+    BalancedRawLLMPolicy,
+    BalancedTwoStepEvidenceLLMPolicy,
     CenterLinePolicy,
     EvidenceFirstLLMPolicy,
     ExplicitRuleLLMPolicy,
@@ -17,8 +19,10 @@ from policy import (
     ParameterIBRPolicy,
     RuleBasedSafeguardPolicy,
     SelfPlayRLPolicy,
+    SmoothedModeLLMPolicy,
     StaticAlphaRacerPolicy,
     StructuredBasisActionFirstLLMPolicy,
+    TwoStepEvidenceLLMPolicy,
     plan_alpharacer_policy_params,
     plan_ibr_joint_actions,
     progress_delta,
@@ -44,6 +48,41 @@ def project_vehicle_state(track, state, s_hint, search_radius, max_heading_error
     if s_hint is None:
         return s_wrapped, e
     return s_hint + progress_delta(s_wrapped, s_hint, track.total_length), e
+
+
+def _deadlock_reset_target_is_clear(candidate, states, car_idx):
+    """Return whether a re-centred reset pose is clear of every other car."""
+    half_length = params.VEHICLE_HALF_LENGTH + params.DEADLOCK_RESET_COLLISION_MARGIN
+    half_width = params.VEHICLE_HALF_WIDTH + params.DEADLOCK_RESET_COLLISION_MARGIN
+    return all(
+        oriented_rectangle_overlap_cost(
+            candidate,
+            other,
+            half_length,
+            half_width,
+        )
+        <= 0.0
+        for other_idx, other in enumerate(states)
+        if other_idx != car_idx
+    )
+
+
+def _reset_policy_control_memory(policy, vehicle_params, restart_speed):
+    """Discard stale stopped-plan controls after a simulator liveness reset."""
+    neutral_steer = float(
+        np.clip(-vehicle_params.Sb / max(abs(vehicle_params.Sa), 1.0e-9), -1.0, 1.0)
+    )
+    reset_control = np.array(
+        [neutral_throttle(restart_speed, vehicle_params), neutral_steer],
+        dtype=float,
+    )
+    if hasattr(policy, "last_u"):
+        policy.last_u = reset_control.copy()
+    if hasattr(policy, "last_feasible_u"):
+        policy.last_feasible_u = reset_control.copy()
+    mpc = getattr(policy, "mpc", None)
+    if mpc is not None and hasattr(mpc, "last_control_plan"):
+        mpc.last_control_plan = None
 
 
 def _normalize_policy_name(policy_name):
@@ -80,9 +119,20 @@ def _normalize_policy_name(policy_name):
         "llmalpha": "llm_alpharacer",
         "llmalpharacer": "llm_alpharacer",
 
+        "llm_smoothed": "llm_smoothed_mode",
+        "llm_smoothed_mode": "llm_smoothed_mode",
+
         "llm_evidence": "llm_evidence_first",
         "llm_evidence_first": "llm_evidence_first",
         "evidence_first_llm": "llm_evidence_first",
+        "llm_two_step": "llm_two_step_evidence",
+        "llm_two_step_evidence": "llm_two_step_evidence",
+        "two_step_llm": "llm_two_step_evidence",
+        "llm_balanced_two_step": "llm_balanced_two_step_evidence",
+        "llm_balanced_two_step_evidence": "llm_balanced_two_step_evidence",
+
+        "llm_raw_balanced": "llm_raw_balanced",
+        "raw_balanced_llm": "llm_raw_balanced",
 
         "llm_structured_basis": "llm_structured_action_first",
         "llm_action_first": "llm_structured_action_first",
@@ -214,15 +264,27 @@ def create_policy(
         "llm_alpharacer",
         "llm_structured_action_first",
         "llm_evidence_first",
+        "llm_two_step_evidence",
+        "llm_raw_balanced",
+        "llm_balanced_two_step_evidence",
         "llm_explicit_rules",
+        "llm_smoothed_mode",
     }:
         policy_class = (
             ExplicitRuleLLMPolicy
             if policy_type == "llm_explicit_rules"
             else StructuredBasisActionFirstLLMPolicy
             if policy_type == "llm_structured_action_first"
+            else TwoStepEvidenceLLMPolicy
+            if policy_type == "llm_two_step_evidence"
+            else BalancedRawLLMPolicy
+            if policy_type == "llm_raw_balanced"
+            else BalancedTwoStepEvidenceLLMPolicy
+            if policy_type == "llm_balanced_two_step_evidence"
             else EvidenceFirstLLMPolicy
             if policy_type == "llm_evidence_first"
+            else SmoothedModeLLMPolicy
+            if policy_type == "llm_smoothed_mode"
             else LLMAlphaRacerPolicy
         )
         return policy_class(
@@ -698,6 +760,10 @@ def run_simulation(
     held_actions = [CarAction(throttle=0.0, steer=0.0) for _ in range(num_cars)]
     low_speed_boundary_timers = np.zeros(num_cars, dtype=float)
     low_speed_boundary_recovery_latched = np.zeros(num_cars, dtype=bool)
+    deadlock_reset_timers = np.zeros(num_cars, dtype=float)
+    deadlock_reset_anchor_s = np.asarray(progress_s, dtype=float).copy()
+    deadlock_reset_cooldown_until = np.zeros(num_cars, dtype=float)
+    deadlock_reset_blocked_latched = np.zeros(num_cars, dtype=bool)
     for step in progress_iter:
         last_step = step
         car_s = []
@@ -715,6 +781,83 @@ def run_simulation(
             car_e.append(e_before)
 
         control_update = step % control_steps == 0
+        deadlock_reset_event = [False] * num_cars
+        deadlock_reset_blocked = deadlock_reset_blocked_latched.tolist()
+        deadlock_reset_pre_lateral_error = [np.nan] * num_cars
+        deadlock_reset_pre_speed = [np.nan] * num_cars
+        if control_update:
+            sim_time = step * params.SIM_DT
+            for car_idx, state in enumerate(states):
+                if not params.DEADLOCK_RESET_ENABLED:
+                    deadlock_reset_timers[car_idx] = 0.0
+                    deadlock_reset_anchor_s[car_idx] = car_s[car_idx]
+                    deadlock_reset_blocked_latched[car_idx] = False
+                    deadlock_reset_blocked[car_idx] = False
+                    continue
+
+                eligible_time = (
+                    sim_time >= params.DEADLOCK_RESET_MIN_SIM_TIME
+                    and sim_time >= deadlock_reset_cooldown_until[car_idx]
+                )
+                nearly_stopped = (
+                    abs(state.vx) <= params.DEADLOCK_RESET_TRIGGER_SPEED
+                )
+                progress_change = abs(
+                    car_s[car_idx] - deadlock_reset_anchor_s[car_idx]
+                )
+                if not eligible_time or not nearly_stopped:
+                    deadlock_reset_timers[car_idx] = 0.0
+                    deadlock_reset_anchor_s[car_idx] = car_s[car_idx]
+                    deadlock_reset_blocked_latched[car_idx] = False
+                    deadlock_reset_blocked[car_idx] = False
+                    continue
+                if progress_change >= params.DEADLOCK_RESET_MIN_PROGRESS:
+                    deadlock_reset_timers[car_idx] = 0.0
+                    deadlock_reset_anchor_s[car_idx] = car_s[car_idx]
+                    deadlock_reset_blocked_latched[car_idx] = False
+                    deadlock_reset_blocked[car_idx] = False
+                    continue
+
+                deadlock_reset_timers[car_idx] += params.CONTROL_DT
+                if (
+                    deadlock_reset_timers[car_idx]
+                    < params.DEADLOCK_RESET_TRIGGER_SECONDS
+                ):
+                    continue
+
+                reset_x, reset_y = track.frenet_to_world(car_s[car_idx], 0.0)
+                _, _, reset_psi = track.interpolate(car_s[car_idx])
+                candidate = CarState(
+                    x=reset_x,
+                    y=reset_y,
+                    vx=params.DEADLOCK_RESET_RESTART_SPEED,
+                    vy=0.0,
+                    psi=reset_psi,
+                    omega=0.0,
+                )
+                if not _deadlock_reset_target_is_clear(candidate, states, car_idx):
+                    deadlock_reset_blocked_latched[car_idx] = True
+                    deadlock_reset_blocked[car_idx] = True
+                    continue
+
+                deadlock_reset_pre_lateral_error[car_idx] = car_e[car_idx]
+                deadlock_reset_pre_speed[car_idx] = state.vx
+                states[car_idx] = candidate
+                car_e[car_idx] = 0.0
+                deadlock_reset_event[car_idx] = True
+                deadlock_reset_blocked_latched[car_idx] = False
+                deadlock_reset_blocked[car_idx] = False
+                deadlock_reset_timers[car_idx] = 0.0
+                deadlock_reset_anchor_s[car_idx] = car_s[car_idx]
+                deadlock_reset_cooldown_until[car_idx] = (
+                    sim_time + params.DEADLOCK_RESET_COOLDOWN_SECONDS
+                )
+                _reset_policy_control_memory(
+                    policies[car_idx],
+                    vehicle_models[car_idx].p,
+                    params.DEADLOCK_RESET_RESTART_SPEED,
+                )
+
         if control_update:
             next_actions = []
             sim_time = step * params.SIM_DT
@@ -885,6 +1028,10 @@ def run_simulation(
             low_speed_boundary_recovery_active=(
                 low_speed_boundary_recovery_active
             ),
+            deadlock_reset_event=deadlock_reset_event,
+            deadlock_reset_blocked=deadlock_reset_blocked,
+            deadlock_reset_pre_lateral_error=deadlock_reset_pre_lateral_error,
+            deadlock_reset_pre_speed=deadlock_reset_pre_speed,
             ref_component_snapshot=ref_component_snapshot,
         )
 
@@ -1189,12 +1336,20 @@ if __name__ == "__main__":
         default=None,
         help="Enable or disable the sustained low-speed boundary escape.",
     )
+    parser.add_argument(
+        "--deadlock-reset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable the sustained zero-progress liveness reset.",
+    )
     cli_args = parser.parse_args()
 
     if cli_args.low_speed_boundary_recovery is not None:
         params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = (
             cli_args.low_speed_boundary_recovery
         )
+    if cli_args.deadlock_reset is not None:
+        params.DEADLOCK_RESET_ENABLED = cli_args.deadlock_reset
     if (
         cli_args.mpc_track_slack_weight is not None
         and cli_args.mpc_track_slack_weight < 0.0
