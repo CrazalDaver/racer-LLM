@@ -7,8 +7,9 @@ from pathlib import Path
 import numpy as np
 
 from config import params
-from plotting import compute_lap_stats
+from visualization.plotting import compute_lap_stats
 from simulation import run_simulation
+from simulation_core.config import SimulationConfig
 
 
 def _parse_float_list(values):
@@ -100,7 +101,6 @@ def _params_snapshot():
         "MPC_HORIZON": params.MPC_HORIZON,
         "STATIC_POLICY_PARAMS": params.STATIC_POLICY_PARAMS.copy(),
         "TOTAL_TIME": params.TOTAL_TIME,
-        "TRACE_OUTPUT": params.TRACE_OUTPUT,
         "NUM_CARS": params.NUM_CARS,
     }
 
@@ -127,7 +127,6 @@ def run_grid_search(args):
             params.VELOCITY_TRACK_WEIGHT = float(velocity_weight)
             params.MPC_HORIZON = int(horizon)
             params.TOTAL_TIME = float(args.total_time)
-            params.TRACE_OUTPUT = str(trace_path)
             params.NUM_CARS = int(args.num_cars)
             alpha_params = params.STATIC_POLICY_PARAMS.copy()
             alpha_params[0] = float(q_value)
@@ -137,16 +136,27 @@ def run_grid_search(args):
                 f"[{run_idx}/{len(combinations)}] "
                 f"VELOCITY_TRACK_WEIGHT={velocity_weight:g}, q={q_value:g}, horizon={horizon}"
             )
-            run_simulation(
-                policy_type=args.policy_type,
+            if (
+                args.policy_names is not None
+                and len(args.policy_names) != args.num_cars
+            ):
+                raise ValueError(
+                    f"--policy-names requires {args.num_cars} entries, "
+                    f"got {len(args.policy_names)}"
+                )
+            policies = args.policy_names or [args.policy_type] * args.num_cars
+            run_simulation(SimulationConfig(
+                policies=policies,
                 save_trace=True,
+                trace_output=trace_path,
                 show_plot=False,
-                num_cars=args.num_cars,
-                policy_names=args.policy_names,
-                vehicle_model_type=args.vehicle_model,
-                alpharacer_params=alpha_params,
-                v0=args.v0,
-            )
+                vehicle_model=args.vehicle_model,
+                alpha_params=alpha_params,
+                initial_speed=args.v0,
+                duration=args.total_time,
+                mpc_horizon=horizon,
+                mpc_velocity_weight=velocity_weight,
+            ))
 
             metrics = evaluate_trace(trace_path)
             row = {

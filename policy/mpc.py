@@ -64,8 +64,8 @@ class MPCPolicy(BasePolicy):
         return np.clip(-self.mpc.p.Sb / self.mpc.p.Sa, -1.0, 1.0)
 
     @staticmethod
-    def _recovery_throttle(vx: float) -> float:
-        """Simple, interpretable three-level fallback speed control."""
+    def _solver_failure_fallback_throttle(vx: float) -> float:
+        """Three-level throttle used only after an MPC solver failure."""
         vx = max(float(vx), 0.0)
         if vx > 2.0:
             return -0.3  # Brake when failure occurs at racing speed.
@@ -73,9 +73,11 @@ class MPCPolicy(BasePolicy):
             return 0.0   # Coast down toward a controllable crawl speed.
         return 0.3       # Keep enough drive to avoid a zero-speed deadlock.
 
-    # Conservative failure recovery: preserve the last feasible direction and
-    # brake. Only near a boundary do we slew gently toward the centerline.
-    def _recovery_control(self, state: CarState, current_s: float) -> np.ndarray:
+    # This is not the simulator's off-road/deadlock recovery.  It is a
+    # one-control fallback used only when mpc.solve() raises an exception.
+    def _solver_failure_fallback_control(
+        self, state: CarState, current_s: float
+    ) -> np.ndarray:
         _, current_e = self.track.project(
             state.x,
             state.y,
@@ -98,7 +100,7 @@ class MPCPolicy(BasePolicy):
                 0.25,
             )
             steer = np.clip(center_steer, steer - 0.05, steer + 0.05)
-        throttle = self._recovery_throttle(state.vx)
+        throttle = self._solver_failure_fallback_throttle(state.vx)
         return np.array([throttle, steer], dtype=float)
 
     def _format_mpc_time(self, sim_time) -> str:
@@ -229,7 +231,15 @@ class MPCPolicy(BasePolicy):
 
     # Main MPC control interface:
     # call get_reference_trajectory to get the reference trajectory, then call mpc.solve to get the control action
-    def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
+    def get_action(self, observation) -> CarAction:
+        """Build this policy's reference and solve its private shared MPC."""
+        if self.car_idx is None:
+            raise ValueError("MPCPolicy requires car_idx when used with RaceObservation")
+        ego = observation.car(self.car_idx)
+        state = ego.state
+        current_s = ego.s
+        opponents = observation.mpc_opponents(self.car_idx)
+        sim_time = observation.sim_time
         ref_traj = self.get_reference_trajectory(state, current_s, opponents=opponents)
         self.last_ref_traj = ref_traj
         state_arr = state.to_array()
@@ -246,7 +256,7 @@ class MPCPolicy(BasePolicy):
             )
         except Exception as e:
             self._report_mpc_failure(e, state, sim_time=sim_time)
-            u_first = self._recovery_control(state, current_s)
+            u_first = self._solver_failure_fallback_control(state, current_s)
             # Keep last_solver_status as the original IPOPT return status.
             # Recovery is recorded separately so diagnostics retain the cause.
             self.mpc.last_recovery_active = True
@@ -307,29 +317,6 @@ class MPCPolicy(BasePolicy):
             state.y,
         )
         return float(self.raceline.s[self.last_raceline_idx])
-
-    def _raceline_frenet_state(self, raceline_s: float, centerline_s_hint: float = None) -> dict:
-        # Given an s value along the raceline, compute the corresponding Frenet state relative to the track centerline.
-        point = self.raceline.interpolate(raceline_s)  # Get the raceline point in world coordinates.
-        center_s, lateral_e = self.track.project(
-            point["x_m"],
-            point["y_m"],
-            s_hint=centerline_s_hint,
-            search_radius=8.0,
-            psi_hint=point["psi_rad"],
-            max_heading_error=math.pi / 2.0,
-        )
-        xc, yc, psi_center = self.track.interpolate(center_s)
-        return {
-            "track_s": center_s,
-            "lateral_e": lateral_e,
-            "speed": min(point["vx_mps"], self.max_speed),
-            "center_x": xc,
-            "center_y": yc,
-            "psi_center": psi_center,
-            "normal_x": -math.sin(psi_center),
-            "normal_y": math.cos(psi_center),
-        }
 
     def _raceline_frenet_point(self, raceline_s: float, centerline_s_hint: float = None) -> dict:
         point = self.raceline.interpolate(raceline_s)  # Get the raceline point in world coordinates.

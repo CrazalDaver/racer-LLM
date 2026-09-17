@@ -1,4 +1,3 @@
-import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,19 +21,19 @@ class TrackSpec:
 TRACKS: Mapping[str, TrackSpec] = {
     "berlin": TrackSpec(
         "track_csv/berlin_2018.csv",
-        "track_csv/berlin_2018_raceline_with_speeds.csv",
+        "track_csv/generated/berlin_mincurv_iqp_local.csv",
         2.0,
         0.44,
     ),
     "modena": TrackSpec(
         "track_csv/modena_2019.csv",
-        "track_csv/modena_2019_with_speeds.csv",
+        "track_csv/generated/modena_mincurv_iqp_local.csv",
         2.0,
         0.37,
     ),
     "rounded_rectangle": TrackSpec(
         "track_csv/rounded_rectangle.csv",
-        "track_csv/rounded_rectangle_with_speeds.csv",
+        "track_csv/generated/rounded_rectangle_mincurv_iqp_local.csv",
         1.0,
         0.50,
     ),
@@ -135,7 +134,7 @@ class ProjectablePath:
             return self._project_impl(x, y)
         raise ValueError("Projection failed within the local progress window.")
 
-    def _project_impl(  # 
+    def _project_impl(
         self,
         x: float,
         y: float,
@@ -366,50 +365,3 @@ def _unwrap_progress(s: float, s_hint: float, total_length: float) -> float:
         math.sin((s - s_hint) * 2.0 * math.pi / total_length),
         math.cos((s - s_hint) * 2.0 * math.pi / total_length),
     ) * total_length / (2.0 * math.pi)
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser(description="Run simulation.py on a selectable alpha-RACER track.")
-    parser.add_argument("--track", default="berlin", help="berlin (default), modena, or rounded_rectangle")
-    parser.add_argument("--list", action="store_true", help="list registered tracks and exit")
-    parser.add_argument("--scale", type=float, default=None, help="override the selected track's configured scale")
-    parser.add_argument("--policy", default="centerline")
-    parser.add_argument("--policies", nargs="+", default=None, help="optional per-car policy names")
-    parser.add_argument("--num-cars", type=int, default=None)
-    parser.add_argument("--vehicle-model", choices=["kinematic", "dbm"], default=None)
-    parser.add_argument("--v0", type=float, default=0.0)
-    parser.add_argument("--ego-position", type=int, default=1)
-    parser.add_argument("--no-trace", action="store_true")
-    parser.add_argument("--no-plot", action="store_true")
-    return parser.parse_args()
-
-
-def main():
-    """Command-line entry point for selecting a track and running simulation."""
-    args = _parse_args()
-    if args.list:
-        for name, spec in TRACKS.items():
-            print(
-                f"{name}: scale={spec.scale:g}, half_width={spec.half_width:g}, "
-                f"centerline={spec.centerline}, raceline={spec.raceline}"
-            )
-        return
-
-    from simulation import run_simulation
-
-    run_simulation(
-        policy_type=args.policy,
-        track_name=args.track,
-        track_scale=args.scale,
-        policy_names=args.policies,
-        num_cars=args.num_cars,
-        vehicle_model_type=args.vehicle_model,
-        v0=args.v0,
-        ego_position=args.ego_position,
-        save_trace=not args.no_trace,
-        show_plot=not args.no_plot,
-    )
-
-
-if __name__ == "__main__":
-    main()

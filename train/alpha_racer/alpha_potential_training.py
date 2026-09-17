@@ -28,6 +28,7 @@ from policy.alpha_network import (
     build_alpha_input,
 )
 from simulation import run_simulation
+from simulation_core.config import SimulationConfig
 from track import Track, configure_track, load_centerline_csv
 
 
@@ -132,19 +133,18 @@ def collect_rollout_data(args):
 
         group_features, group_returns = [], []
         for variant_idx, joint_params in enumerate(variants):
-            trace = run_simulation(
-                policy_names=["static_alpharacer"] * 3,
-                num_cars=3,
-                static_policy_params_per_car=joint_params,
-                vehicle_model_type=args.vehicle_model,
-                horizon=args.horizon,
-                v0=args.initial_speed,
+            trace = run_simulation(SimulationConfig(
+                policies=["static_alpharacer"] * 3,
+                static_params_by_car=joint_params,
+                vehicle_model=args.vehicle_model,
+                mpc_horizon=args.horizon,
+                initial_speed=args.initial_speed,
                 ego_position=1 + group % 3,
-                total_time=args.duration,
+                duration=args.duration,
                 save_trace=False,
                 show_plot=False,
                 quiet=True,
-            )
+            ))
             features, update_indices = trace_features(trace, track, joint_params, args.horizon)
             rewards = trace_rewards(
                 trace,

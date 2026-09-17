@@ -1,5 +1,12 @@
-import numpy as np
+"""Repository-wide defaults and vehicle parameter presets.
+
+Runtime overrides belong in ``simulation_core.config.SimulationConfig``.
+This module contains shared defaults used when an override is absent.
+"""
+
 import copy
+
+import numpy as np
 
 
 GRAVITY = 9.81
@@ -20,26 +27,34 @@ ALPHARACER_PARAMETER_BOUNDS = np.asarray(
 
 
 class DynamicParams:
+    """Physical and actuator parameters for one vehicle model."""
+
     def __init__(self, vehicle_model_type="dbm"):
         model_type = vehicle_model_type.lower()
-        self.LF: float = .11
-        self.LR: float = .23
+
+        # Geometry and mass
+        self.LF: float = 0.11
+        self.LR: float = 0.23
         self.MASS: float = 4.65
-        self.DT: float = .05
-        self.K_RFY: float = 20.
-        self.K_FFY: float = 20.
         self.Iz: float = 0.1
-        self.Ta: float = 5.5    # throttle gain
-        self.Tb: float = -1.    # velocity-dependent term
-        self.Sa: float = 0.36
-        self.Sb: float = 0.03
+
+        # Integration and tire model
+        self.DT: float = 0.05
+        self.K_RFY: float = 20.0
+        self.K_FFY: float = 20.0
         self.mu: float = 3.0
         self.Cf: float = 1.0
         self.Cr: float = 1.0
         self.Bf: float = 60.0
         self.Br: float = 60.0
         self.hcom: float = 0.0
-        self.fr: float = 0.1    # friction
+        self.fr: float = 0.1
+
+        # Throttle and steering actuators
+        self.Ta: float = 5.5
+        self.Tb: float = -1.0
+        self.Sa: float = 0.36
+        self.Sb: float = 0.03
         self.delay: int = 4
         self.ros_kinematic = False
 
@@ -106,24 +121,37 @@ def duration_to_steps(duration_seconds, dt):
 
 
 class SimParams:
-    # Multi-rate execution: vehicle/contact integration runs at 50 Hz, MPC and
-    # policy actions update at 10 Hz, and the LLM updates every 1 s.
-    SIM_DT = 0.02
+    # ==================== SIMULATION TIMING ====================
+
+    # The simulator, policies, and MPC all advance on the upstream 0.1 s step.
+    # LLM policies may still update their high-level parameters less often.
+    SIM_DT = 0.1
     CONTROL_DT = 0.1
     TOTAL_TIME = 50.0
     v0 = 0.0
+
+    # ==================== TRACK AND START GRID =================
+
     TRACK_CSV = "track_csv/berlin_2018.csv"
-    RACELINE_CSV = "track_csv/berlin_2018_raceline_with_speeds.csv"
+    # Locally recomputed minimum-curvature raceline (Sa = 0.34).
+    RACELINE_CSV = "track_csv/generated/berlin_mincurv_iqp_local.csv"
     TRACK_SCALE = 2.0
     TRACK_HALF_WIDTH = 0.44
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
+    NUM_CARS = 1
+    CAR_START_GAP = 6.0
+
+    # ==================== VEHICLE AND CONTACT ==================
+
+    VEHICLE_MODEL = "kinematic"
     VEHICLE_HALF_LENGTH = 0.18
     VEHICLE_HALF_WIDTH = 0.12
-    # Upstream-style asymmetric overlap decay, calibrated per CONTROL_DT.
-    # The simulator scales these exponents by SIM_DT / CONTROL_DT so contact
-    # loss does not become stronger merely because integration is finer.
+    # Upstream-style asymmetric overlap decay applied once per 0.1 s step.
     COLLISION_FRONT_DECAY = 5.0
     COLLISION_REAR_DECAY = 20.0
+
+    # ==================== MPC SAFETY CONSTRAINTS ===============
+
     # Boundary handling treats each car as a point: both the reference and
     # predicted vehicle centre may use the full geometric track half-width.
     # Vehicle dimensions remain relevant only to contact detection/visuals.
@@ -155,23 +183,33 @@ class SimParams:
     # while allowing IPOPT to recover from an already unsafe measured state.
     MPC_ENFORCE_TRACK_BOUNDARY = True
     MPC_ENFORCE_COLLISION_AVOIDANCE = True
-    # Keep the boundary recoverable, but make voluntarily leaving the track
-    # substantially more expensive than accepting collision slack.
-    MPC_TRACK_SLACK_WEIGHT = 1.0e5
+    # Track slack is a lateral distance in metres. Collision slack is instead
+    # the dimensionless residual of the normalized superellipse constraint,
+    # so their weights are intentionally independent rather than numerically
+    # tied. In the rho_t=1e3 experiments the unchanged collision weight is
+    # therefore deliberately larger, prioritizing avoidance of vehicle overlap.
+    # A lower track penalty was more tolerant of the temporary boundary
+    # violation needed to escape the Berlin hairpin's low-speed equilibrium.
+    # Collision slack remains more expensive because it is dimensionless and
+    # represents vehicle overlap rather than lateral boundary overshoot.
+    MPC_TRACK_SLACK_WEIGHT = 1.0e3
     MPC_COLLISION_SLACK_WEIGHT = 1.0e4
     # Released alpha-RACER MPC constraint:
     # |v^2 tan(steer_command)| <= mu * g * wheelbase.
     # It progressively limits steering at high speed using a friction proxy.
     MPC_ENFORCE_FRICTION_SPEED_LIMIT = True
     MPC_FRICTION_COEFFICIENT = 1.6
+
+    # ==================== RECOVERY AND LIVENESS ================
+
     # Numerical-simulator recovery threshold.  This is deliberately separate
     # from TRACK_HALF_WIDTH: the alpha-RACER paper defines recovery outside the
     # track boundary, while the released Berlin simulation uses |e| > 0.55 m.
     # Keeping the implementation threshold explicit avoids presenting the
     # difference as a geometric "tolerance" derived by the model.
     OFFROAD_RECOVERY_THRESHOLD = 0.55
-    # Released alpha-RACER numerical-simulation recovery, calibrated per
-    # CONTROL_DT.  For overshoot d, the upstream code applies:
+    # Released alpha-RACER numerical-simulation recovery. For overshoot d, the
+    # upstream code applies once per 0.1 s step:
     #   v *= exp(-3 d)
     #   psi += (1 - exp(-d)) * heading_error
     #   steer += (-sign(e) - steer) * (1 - exp(-3 d))
@@ -185,34 +223,8 @@ class SimParams:
     # neutral throttle plus the upstream +0.2 boost so an aligned car cannot
     # remain trapped at the zero-acceleration equilibrium.
     OFFROAD_LOW_SPEED_THRESHOLD = 0.3
-    # Simulator-wide escape from the zero-speed equilibrium near a boundary.
-    # Unlike OFFROAD_RECOVERY_THRESHOLD, this does not alter vehicle state.  It
-    # only overrides the command after the car has remained nearly stationary
-    # near the nominal boundary for a sustained period.  The separate entry
-    # and exit thresholds provide hysteresis and prevent rapid toggling.
-    # Disabled by default while evaluating the MPC objective change.  It can
-    # still be enabled explicitly for a controlled recovery ablation.
-    LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = False
-    LOW_SPEED_BOUNDARY_TRIGGER_FRACTION = 0.90
-    LOW_SPEED_BOUNDARY_EXIT_FRACTION = 0.85
-    LOW_SPEED_BOUNDARY_TRIGGER_SPEED = 0.05
-    LOW_SPEED_BOUNDARY_EXIT_SPEED = 0.30
-    LOW_SPEED_BOUNDARY_TRIGGER_SECONDS = 0.50
-    LOW_SPEED_BOUNDARY_MIN_SIM_TIME = 1.0
-    LOW_SPEED_BOUNDARY_HEADING_GAIN = 0.50
-    # Policy-independent liveness reset for sustained zero-progress deadlocks.
-    # Disabled by default so historical experiments remain unchanged.  When
-    # enabled, the simulator re-centres a stationary car at the same Frenet s,
-    # aligns it with the local track tangent, and assigns a small forward speed.
-    # Every event (and every occupancy-blocked attempt) is recorded in the trace.
-    DEADLOCK_RESET_ENABLED = False
-    DEADLOCK_RESET_TRIGGER_SPEED = 0.05
-    DEADLOCK_RESET_TRIGGER_SECONDS = 1.50
-    DEADLOCK_RESET_MIN_PROGRESS = 0.10
-    DEADLOCK_RESET_RESTART_SPEED = 0.50
-    DEADLOCK_RESET_MIN_SIM_TIME = 5.0
-    DEADLOCK_RESET_COOLDOWN_SECONDS = 3.0
-    DEADLOCK_RESET_COLLISION_MARGIN = 0.05
+    # ==================== MPC CONTROL AND COST =================
+
     MPC_DT = 0.1
     # Optional detachable comparison profile.  ``constrained_local`` remains
     # the default and preserves all existing experiments.
@@ -223,10 +235,9 @@ class SimParams:
     Q = np.diag([1.0, 1.0])
     R = np.diag([1.0, 1.0]) #* 1e-6
 
-    # Optional ablation.  The default paper-core objective advances through
-    # longitudinal position references without an additional speed-profile
-    # term; use the CLI override when explicitly testing velocity tracking.
-    VELOCITY_TRACK_WEIGHT = 0.0
+    # Shared reference-speed tracking term.  It helps prevent the zero-speed
+    # receding-horizon equilibrium observed around the Berlin hairpin.
+    VELOCITY_TRACK_WEIGHT = 10.0
     HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0
@@ -234,26 +245,25 @@ class SimParams:
     MAX_RACELINE_SPEED = 5.0
     PROJECTION_SEARCH_RADIUS = 1.0
     PROJECTION_MAX_HEADING_ERROR = np.pi / 2.0
+
+    # ==================== SCENARIO AND OUTPUT ==================
+
     TRACE_OUTPUT = "simulation_trace.npz"
-    VEHICLE_MODEL = "kinematic"
-    NUM_CARS = 1
-    CAR_START_GAP = 6.0
-    EARLY_COLLISION_STOP = False # stop early if cars collide immediately after launch
-    EARLY_COLLISION_WINDOW_SECONDS = 3.0
-    EARLY_COLLISION_CONSECUTIVE_SECONDS = 0.06
     REF_DEBUG_SAMPLE_INTERVAL_SECONDS = 2.0
-    TRAJECTORY_SAMPLE_INTERVAL_SECONDS = 0.04
+    TRAJECTORY_SAMPLE_INTERVAL_SECONDS = 0.1
     PROGRESS_REPORT_INTERVAL_SECONDS = 4.0
+
+    # ==================== LLM POLICIES =========================
+
     LLM_MODEL = "qwen2.5:7b"
     LLM_BASE_URL = "http://localhost:11434"
     LLM_TIMEOUT = 20.0
-    LLM_TEMPERATURE = 0.2
+    LLM_TEMPERATURE = 0.0
     LLM_UPDATE_INTERVAL_SECONDS = 1.0
     # Maximum number of executed modes exposed in
     # memory.recent_modes_oldest_to_newest.
     LLM_RECENT_MODES_MAX_LENGTH = 1
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
-    LLM_SAFEGUARD_ENABLED = False # keep pure-LLM experiments free of hand-coded mode corrections
     # LLM scene classification uses a small buffer around the MPC collision
     # envelope so millimetre-scale threshold crossings do not imply clear road.
     LLM_CRITICAL_DISTANCE = 1.0
@@ -267,6 +277,9 @@ class SimParams:
     # a behavior mode.
     LLM_ROAD_PREVIEW_LENGTH_METERS = 8.0 
     LLM_ROAD_PREVIEW_SAMPLE_COUNT = 5
+
+    # ==================== ALPHARACER POLICIES ==================
+
     # Official alpha-RACER sampling bounds mapped to this project's
     # [q, zeta, s1, s2, s3] parameterization. The upstream
     # lookahead_factor range [0.15, 0.50] maps through
@@ -306,12 +319,19 @@ class SimParams:
     # local alpha-RACER initializer so direct-parameter LLM experiments do not
     # begin from out-of-range s1/s2 values before the first successful call.
     LLM_POLICY_PARAMS = np.array([2.0, 0.95**2, 0.30, 0.20, 0.00])
-    SELF_PLAY_RL_MODEL_PATH = "self_play_rl_policy.zip"  # Created by: python self_play_rl.py
+
+    # ==================== SELF-PLAY RL =========================
+
+    # Created by: python -m train.self_play_rl
+    SELF_PLAY_RL_MODEL_PATH = "self_play_rl_policy.zip"
     SELF_PLAY_RL_BACKEND = "sb3"  # Paper-compatible Stable-Baselines3 PPO checkpoint.
     SELF_PLAY_RL_STRICT_LOAD = True  # Do not silently replace a missing trained PPO with the heuristic fallback.
     SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
     SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
+
+    # ==================== TRAJECTORY IBR =======================
+
     # IBR_IMPLEMENTATION choices:
     #   local_wang      Wang-style IBR using this project's dynamics,
     #                   constraints, action definition, and MPC timing.
@@ -331,7 +351,9 @@ class SimParams:
     IBR_LATERAL_WEIGHT = 10.0
     IBR_LATERAL_EXPONENT = 4
     IBR_HEADING_WEIGHT = 0.0
-    IBR_SPEED_WEIGHT = 0.0
+    # Compatibility default for trace readers. Local trajectory IBR uses the
+    # effective shared MPC velocity weight so CLI overrides remain aligned.
+    IBR_SPEED_WEIGHT = VELOCITY_TRACK_WEIGHT
     IBR_CONTROL_WEIGHT = 0.0
     # ``neutral`` penalizes deviation from straight, speed-holding commands;
     # ``zero`` reproduces the released alpha-RACER IBR's ||u||^2 form.
@@ -353,6 +375,8 @@ class SimParams:
     # friction proxy while taking vehicle geometry/actuation from local MPC.
     IBR_HISTORICAL_ITERATIONS = 3
     IBR_HISTORICAL_FRICTION_COEFFICIENT = 1.6
+
+    # ==================== PARAMETER IBR ========================
 
     # Five-parameter IBR diagnostic. Each best response searches canonical
     # coordinates (q, zeta, s1, s2, s3), while candidate actions and

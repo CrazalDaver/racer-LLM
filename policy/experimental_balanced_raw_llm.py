@@ -18,7 +18,6 @@ class BalancedRawLLMPolicy(LLMAlphaRacerPolicy):
 
     def __init__(self, *args, **kwargs):
         kwargs["output_mode"] = "mode"
-        kwargs["safeguard_enabled"] = False
         kwargs["prompt_variant"] = "experimental_raw_no_default_mode"
         super().__init__(*args, **kwargs)
         self.system_prompt = f"{self.system_prompt.rstrip()}\n\n{self.PROMPT_ADDITION}"

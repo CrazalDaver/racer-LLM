@@ -142,7 +142,7 @@ class _HistoricalStrictIBRSolver:
         control_plan = optimum[self.n_x :].reshape(n, 2).T
         return state_plan, control_plan
 
-    def solve_pair(
+    def iterate_best_responses(
         self, neighbor_x0, own_x0, neighbor_curvature, own_curvature,
         neighbor_speed, own_speed, neighbor_previous_control=None,
         own_previous_control=None,

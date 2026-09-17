@@ -1,14 +1,18 @@
+"""Shared mutable vehicle state and control-command value objects."""
+
+from dataclasses import dataclass
+
 import numpy as np
 
 
+@dataclass
 class CarState:
-    def __init__(self, x=0.0, y=0.0, vx=0.0, vy=0.0, psi=0.0, omega=0.0):
-        self.x = x
-        self.y = y
-        self.vx = vx
-        self.vy = vy
-        self.psi = psi
-        self.omega = omega
+    x: float = 0.0
+    y: float = 0.0
+    vx: float = 0.0
+    vy: float = 0.0
+    psi: float = 0.0
+    omega: float = 0.0
 
     def to_array(self):
         return np.array([self.x, self.y, self.psi, self.vx, self.vy, self.omega])
@@ -18,7 +22,7 @@ class CarState:
         return cls(x=arr[0], y=arr[1], psi=arr[2], vx=arr[3], vy=arr[4], omega=arr[5])
 
 
+@dataclass
 class CarAction:
-    def __init__(self, throttle=0.0, steer=0.0):
-        self.throttle = throttle
-        self.steer = steer
+    throttle: float = 0.0
+    steer: float = 0.0

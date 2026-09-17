@@ -9,7 +9,8 @@ from track import Track
 class BasePolicy(abc.ABC):
     """
     Common interface and observable state shared by every driving policy.
-    get_action: Return the control action selected by this policy (throttle, steering).
+    ``get_action(observation)`` returns the selected throttle/steering command
+    from one immutable, complete control-tick race observation.
     """
 
     def __init__(self, track: Track, mpc, car_idx=None, policy_name=None):
@@ -32,7 +33,7 @@ class BasePolicy(abc.ABC):
         self.log_fn = print
 
     @abc.abstractmethod
-    def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
+    def get_action(self, observation) -> CarAction:
         """Return the control action selected by this policy."""
         raise NotImplementedError
 
@@ -45,4 +46,3 @@ class BasePolicy(abc.ABC):
     def flush_mpc_warnings(self, sim_time=None):
         """Backward-compatible wrapper for older simulation callers."""
         self.flush_solver_warnings(sim_time=sim_time)
-

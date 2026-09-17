@@ -15,7 +15,7 @@ class SelfPlayRLPolicy(BasePolicy):
     Direct-action self-play RL baseline compatible with alpha-RACER's RL branch.
 
     The upstream comparison loads ``PPO.load("trained_policy9")`` and calls
-    ``predict`` on a 15-value observation. The local self_play_rl.py follows
+    ``predict`` on a 15-value observation. The local training module follows
     the same Stable-Baselines3 checkpoint and inference interface.
     """
 
@@ -100,11 +100,12 @@ class SelfPlayRLPolicy(BasePolicy):
                 self.model = {"type": "linear", "weights": np.load(path), "bias": np.zeros(2)}
                 self.model_kind = "npy"
                 return
-            if self.backend in {"auto", "torch", "pth", "pt"} and suffix in {".pth", ".pt"}:
-                self.model = self._load_torch_policy(path)
-                self.model_kind = "torch"
-                return
-            if self.backend in {"auto", "sb3", "ppo"}:
+            if suffix in {".pth", ".pt"}:
+                raise ValueError(
+                    "Native Torch self-play checkpoints are unsupported; "
+                    "train with `python -m train.self_play_rl` and use its .zip output."
+                )
+            if self.backend in {"auto", "sb3", "ppo"} and suffix == ".zip":
                 self.model = self._load_sb3_policy(path)
                 self.model_kind = "sb3"
                 return
@@ -123,22 +124,6 @@ class SelfPlayRLPolicy(BasePolicy):
                 "Use a .npz/.json exported policy or install stable-baselines3 to load this file."
             ) from exc
         return PPO.load(str(path))
-
-    def _load_torch_policy(self, path: Path):
-        try:
-            from self_play_rl import load_policy_checkpoint
-        except ImportError as exc:
-            raise ImportError(
-                "PyTorch and self_play_rl.py are required to load native self-play RL checkpoints."
-            ) from exc
-        model, metadata = load_policy_checkpoint(path, device="cpu")
-        if "action_order" in metadata:
-            self.action_order = str(metadata["action_order"]).strip().lower()
-        if "throttle_bounds" in metadata:
-            self.throttle_bounds = tuple(float(v) for v in metadata["throttle_bounds"])
-        if "steer_bounds" in metadata:
-            self.steer_bounds = tuple(float(v) for v in metadata["steer_bounds"])
-        return model
 
     def _load_npz_policy(self, path: Path):
         data = np.load(path, allow_pickle=False)
@@ -343,7 +328,13 @@ class SelfPlayRLPolicy(BasePolicy):
         observation[~np.isfinite(observation)] = 0.0
         return observation
 
-    def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
+    def get_action(self, observation) -> CarAction:
+        if self.car_idx is None:
+            raise ValueError("SelfPlayRLPolicy requires car_idx when used with RaceObservation")
+        ego = observation.car(self.car_idx)
+        state = ego.state
+        current_s = ego.s
+        opponents = observation.mpc_opponents(self.car_idx)
         if self.raceline is not None:
             self.last_raceline_idx = self.raceline.nearest_index(state.x, state.y)
             self.last_raceline_s = float(self.raceline.s[self.last_raceline_idx])

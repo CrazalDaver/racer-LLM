@@ -1,17 +1,16 @@
 """Generate a self-contained HTML report from simulation NPZ/JSON results.
 
-NPZ rows contain the diagnostic figure from ``plotting.py`` on the left and
-the animation from ``animate_trace.py`` on the right. Position-sweep JSON rows
+NPZ rows contain the diagnostic figure from ``visualization.plotting`` on the
+left and the animation from ``visualization.animate_trace`` on the right. Position-sweep JSON rows
 contain aggregate plots on the left and a trial table on the right. Images are
 embedded into the HTML, so the report can be moved or shared as one file.
 
 Run this file without arguments to read ``result/position_sweep_summary.json``
 and write ``result/position_sweep_report.html``. You can still pass other paths:
 
-    .venv/bin/python generate_html_report.py LLM_alpha_1.npz LLM_alpha_2.npz
-    .venv/bin/python generate_html_report.py result/no_safeguard_LLM_alpha.json
-    .venv/bin/python generate_html_report.py trace.npz sweep.json -o report.html
-    .venv/bin/python generate_html_report.py result/*.npz -o report.html
+    .venv/bin/python -m visualization.generate_html_report LLM_alpha_1.npz LLM_alpha_2.npz
+    .venv/bin/python -m visualization.generate_html_report result/position_sweep_summary.json
+    .venv/bin/python -m visualization.generate_html_report trace.npz sweep.json -o report.html
 """
 
 from __future__ import annotations
@@ -31,8 +30,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from animate_trace import make_animation
-from plotting import plot_trace_npz
+from .animate_trace import make_animation
+from .plotting import plot_trace_npz
 
 
 # Optional custom default inputs. When this list is empty, running the script

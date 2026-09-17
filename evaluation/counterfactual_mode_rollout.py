@@ -36,7 +36,8 @@ from collision import oriented_rectangle_overlap_cost
 from config import make_vehicle_params, params
 from mpc_controller import MPCController
 from policy import StaticAlphaRacerPolicy, progress_delta
-from simulation import create_vehicle_model, project_vehicle_state
+from simulation_core.observation import RaceObservation
+from simulation import create_vehicle_model
 from state import CarState
 from track import Track, load_centerline_csv, load_raceline_csv
 
@@ -144,38 +145,37 @@ def simulate_branch(data, frame, ego_idx, mode, duration, track, raceline, recor
 
     for step in range(steps):
         source_frame = frame + step
-        current_s, e = project_vehicle_state(
-            track, state, current_s, params.PROJECTION_SEARCH_RADIUS, params.PROJECTION_MAX_HEADING_ERROR
+        current_s, e = track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=params.PROJECTION_SEARCH_RADIUS,
+            psi_hint=state.psi,
+            max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
         )
         max_abs_e = max(max_abs_e, abs(float(e)))
         boundary = boundary or abs(e) > float(scalar(data, "track_half_width", params.TRACK_HALF_WIDTH))
         offroad = offroad or abs(e) > float(scalar(data, "offroad_recovery_threshold", params.OFFROAD_RECOVERY_THRESHOLD))
 
-        opponents = []
         opponent_states = []
+        scene_states = []
+        scene_s = []
+        scene_e = []
         for car in range(data["car_x"].shape[1]):
-            if car == ego_idx:
-                continue
-            other = recorded_state(data, source_frame, car)
-            opponent_states.append(other)
-            delta = abs(progress_delta(float(data["car_px"][source_frame, car]), current_s, track.total_length))
-            minimum_gap = min(minimum_gap, delta)
-            opponents.append({
-                "car_idx": car,
-                "px": float(data["car_px"][source_frame, car]),
-                "py": float(data["car_py"][source_frame, car]),
-                "vx": max(float(other.vx), 0.0),
-                "vy": float(other.vy),
-                "omega": float(other.omega),
-                "psi": float(other.psi),
-                "state": other,
-            })
+            other = state if car == ego_idx else recorded_state(data, source_frame, car)
+            scene_states.append(other)
+            scene_s.append(current_s if car == ego_idx else float(data["car_px"][source_frame, car]))
+            scene_e.append(e if car == ego_idx else float(data["car_py"][source_frame, car]))
+            if car != ego_idx:
+                opponent_states.append(other)
+                minimum_gap = min(minimum_gap, abs(progress_delta(scene_s[car], current_s, track.total_length)))
 
         if step % control_steps == 0:
-            action = policy.get_action(
-                state, current_s, opponents=opponents,
-                sim_time=float(data["time"][frame]) + step * sim_dt,
+            obs = RaceObservation.from_runtime(
+                [policy] * len(scene_states), scene_states, scene_s, scene_e,
+                float(data["time"][frame]) + step * sim_dt,
             )
+            action = policy.get_action(obs)
             solver_failures += int(not policy.mpc.last_solver_success)
         if state.vx < 0.05:
             stalled_steps += 1
@@ -201,8 +201,13 @@ def simulate_branch(data, frame, ego_idx, mode, duration, track, raceline, recor
                 [float(data["car_y"][next_frame, car]) for car in opponent_indices]
             )
 
-    final_s, final_e = project_vehicle_state(
-        track, state, current_s, params.PROJECTION_SEARCH_RADIUS, params.PROJECTION_MAX_HEADING_ERROR
+    final_s, final_e = track.project(
+        state.x,
+        state.y,
+        s_hint=current_s,
+        search_radius=params.PROJECTION_SEARCH_RADIUS,
+        psi_hint=state.psi,
+        max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
     )
     progress = float(final_s - initial_s)
     final_source_frame = min(frame + max(len(progress_history) - 1, 0), len(data["time"]) - 1)
@@ -239,7 +244,12 @@ def decision_candidates(data, ego_idx, long_seconds, track):
     calls = np.asarray(data["llm_raw_call_indices"])[ego_idx]
     frames = ((calls[calls >= 1] - 1) * round(control_dt / sim_dt)).astype(int)
     future = int(math.ceil(long_seconds / sim_dt))
-    reset = np.asarray(data["car_deadlock_reset_event"], dtype=bool)
+    reset = np.asarray(
+        data["car_deadlock_reset_event"]
+        if "car_deadlock_reset_event" in data.files
+        else np.zeros((len(data["collision"]), data["car_x"].shape[1]), dtype=bool),
+        dtype=bool,
+    )
     collision = np.asarray(data["collision"], dtype=bool)
     curvature_s, curvature = track.curvature_profile(sample_step=0.1, heading_window=0.5)
     usable = []
@@ -355,6 +365,8 @@ def label_acceptability(branches, ratio):
     if not safe:
         for row in branches:
             row["acceptable"] = False
+            row["regret_m"] = None
+            row["best_safe"] = False
         return [], None
     # Primary score: change in signed lead over the most advanced recorded
     # opponent. Positive means ego closes the gap or extends its lead; negative
@@ -365,6 +377,14 @@ def label_acceptability(branches, ratio):
     threshold = best - (1.0 - ratio) * max(abs(best), 1.0)
     acceptable = []
     for row in branches:
+        # Constrained regret is defined only for safe branches. Unsafe choices
+        # are counted separately rather than hidden behind an arbitrary crash
+        # penalty expressed in metres.
+        row["regret_m"] = (
+            float(best - row["relative_progress_gain_m"])
+            if row["safe"] else None
+        )
+        row["best_safe"] = bool(row["safe"] and row["regret_m"] <= 1e-9)
         row["acceptable"] = bool(
             row["safe"] and row["relative_progress_gain_m"] >= threshold
         )
@@ -580,6 +600,12 @@ def main():
             "long_branches": long_rows,
         }
         final_rows = long_rows or short
+        chosen_row = next(row for row in final_rows if row["mode"] == chosen)
+        sample["recorded_mode_safe"] = bool(chosen_row["safe"])
+        sample["recorded_mode_regret_m"] = chosen_row["regret_m"]
+        sample["best_safe_modes"] = [
+            row["mode"] for row in final_rows if row["best_safe"]
+        ]
         interesting = sample["informative"] or not sample["recorded_mode_acceptable"]
         if interesting and gif_count < args.max_gifs:
             sample["temporary_gif"] = save_case_gif(
@@ -599,6 +625,16 @@ def main():
             row.pop("_trajectory", None)
 
     acceptance = [row["recorded_mode_acceptable"] for row in samples]
+    safe_regrets = [
+        row["recorded_mode_regret_m"]
+        for row in samples
+        if row["recorded_mode_regret_m"] is not None
+    ]
+    informative_regrets = [
+        row["recorded_mode_regret_m"]
+        for row in samples
+        if row["informative"] and row["recorded_mode_regret_m"] is not None
+    ]
     payload = {
         "trace": str(args.trace),
         "settings": vars(args) | {"trace": str(args.trace), "output_dir": str(args.output_dir)},
@@ -616,7 +652,20 @@ def main():
         ),
         "sample_count": len(samples),
         "recorded_mode_acceptance_rate": float(np.mean(acceptance)) if acceptance else None,
+        "recorded_mode_safe_rate": (
+            float(np.mean([row["recorded_mode_safe"] for row in samples]))
+            if samples else None
+        ),
+        "recorded_mode_mean_regret_m_safe_choices": (
+            float(np.mean(safe_regrets)) if safe_regrets else None
+        ),
+        "recorded_mode_median_regret_m_safe_choices": (
+            float(np.median(safe_regrets)) if safe_regrets else None
+        ),
         "informative_sample_count": int(sum(row["informative"] for row in samples)),
+        "recorded_mode_mean_regret_m_informative_safe_choices": (
+            float(np.mean(informative_regrets)) if informative_regrets else None
+        ),
         "recorded_mode_acceptance_rate_informative": (
             float(np.mean([row["recorded_mode_acceptable"] for row in samples if row["informative"]]))
             if any(row["informative"] for row in samples) else None
@@ -634,6 +683,10 @@ def main():
     report_path = write_temporary_report(args.output_dir, payload, overview_name)
     print(f"Saved {len(samples)} samples to {args.output_dir}")
     print(f"Recorded-mode acceptance rate: {payload['recorded_mode_acceptance_rate']}")
+    print(
+        "Recorded-mode mean regret (safe choices): "
+        f"{payload['recorded_mode_mean_regret_m_safe_choices']} m"
+    )
     print(f"Temporary report: {report_path}")
 
 

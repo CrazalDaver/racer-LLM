@@ -1,4 +1,4 @@
-"""Simulation trace collection and NPZ serialization helpers."""
+"""Simulation trace schema, per-step buffers, and NPZ serialization."""
 
 import json
 
@@ -26,12 +26,15 @@ def create_simulation_trace(
     vehicle_model_type,
     mpc_velocity_track_weight,
     mpc_track_slack_weight,
+    mpc_collision_slack_weight,
 ):
     llm_policy_names = {
         "llm_alpharacer",
         "llm_structured_action_first",
         "llm_evidence_first",
+        "llm_raw_balanced",
         "llm_explicit_rules",
+        "llm_smoothed_mode",
     }
     trace = SimulationTrace({
         "policy_names": resolved_policy_names,
@@ -70,10 +73,6 @@ def create_simulation_trace(
             else np.nan
             for idx in range(num_cars)
         ],
-        "llm_safeguard_enabled": bool(getattr(policies[ego_idx], "safeguard_enabled", False)),
-        "car_llm_safeguard_enabled": [
-            bool(getattr(policy, "safeguard_enabled", False)) for policy in policies
-        ],
         "car_llm_prompt_variants": [
             str(getattr(policy, "prompt_variant", "not_applicable")) for policy in policies
         ],
@@ -100,8 +99,10 @@ def create_simulation_trace(
         "vehicle_model": vehicle_model_type,
         "mpc_state_coordinates": "frenet",
         "velocity_track_weight": mpc_velocity_track_weight,
+        "ibr_speed_weight": mpc_velocity_track_weight,
         "heading_track_weight": params.HEADING_TRACK_WEIGHT,
         "track_slack_weight": mpc_track_slack_weight,
+        "collision_slack_weight": mpc_collision_slack_weight,
         "parameter_ibr_rounds": params.PARAMETER_IBR_ROUNDS,
         "parameter_ibr_search_points": params.PARAMETER_IBR_SEARCH_POINTS,
         "parameter_ibr_search_passes": params.PARAMETER_IBR_SEARCH_PASSES,
@@ -140,11 +141,6 @@ def record_simulation_step(
     control_update,
     offroad_recovery_active,
     offroad_recovery_heading_error,
-    low_speed_boundary_recovery_active,
-    deadlock_reset_event,
-    deadlock_reset_blocked,
-    deadlock_reset_pre_lateral_error,
-    deadlock_reset_pre_speed,
     ref_component_snapshot,
 ):
     """Record one pre-integration simulation snapshot and return its reference point."""
@@ -355,6 +351,7 @@ def record_simulation_step(
     for field in (
         "progress_reward",
         "lateral_cost",
+        "velocity_cost",
         "control_rate_cost",
         "track_slack_cost",
         "collision_slack_cost",
@@ -380,9 +377,6 @@ def record_simulation_step(
     trace["car_policy_requested_mode"].append(
         [getattr(policy, "last_llm_requested_mode", "") for policy in policies]
     )
-    trace["car_safeguard_override"].append(
-        [getattr(policy, "last_safeguard_override", "") for policy in policies]
-    )
     trace["car_explicit_rule_mode"].append(
         [getattr(policy, "last_explicit_rule_mode", "") for policy in policies]
     )
@@ -401,15 +395,6 @@ def record_simulation_step(
     trace["car_offroad_recovery_heading_error"].append(
         offroad_recovery_heading_error
     )
-    trace["car_low_speed_boundary_recovery_active"].append(
-        low_speed_boundary_recovery_active
-    )
-    trace["car_deadlock_reset_event"].append(deadlock_reset_event)
-    trace["car_deadlock_reset_blocked"].append(deadlock_reset_blocked)
-    trace["car_deadlock_reset_pre_lateral_error"].append(
-        deadlock_reset_pre_lateral_error
-    )
-    trace["car_deadlock_reset_pre_speed"].append(deadlock_reset_pre_speed)
     diagnostic_fields = (
         "max_collision_constraint",
         "min_predicted_longitudinal_distance",
@@ -447,12 +432,14 @@ def record_simulation_step(
     return ref_fx, ref_fy
 
 
-def save_simulation_trace(trace, track, params):
+def save_simulation_trace(trace, track, params, output_path=None):
     if not trace["time"]:
         return
 
+    output_path = params.TRACE_OUTPUT if output_path is None else output_path
+
     np.savez(
-        params.TRACE_OUTPUT,
+        output_path,
         time=np.asarray(trace["time"]),
         x=np.asarray(trace["x"]),
         y=np.asarray(trace["y"]),
@@ -578,10 +565,6 @@ def save_simulation_trace(trace, track, params):
         ),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
-        llm_safeguard_enabled=np.asarray(trace.get("llm_safeguard_enabled", False), dtype=bool),
-        car_llm_safeguard_enabled=np.asarray(
-            trace.get("car_llm_safeguard_enabled", []), dtype=bool
-        ),
         car_llm_prompt_variants=np.asarray(
             trace.get("car_llm_prompt_variants", []), dtype=str
         ),
@@ -627,6 +610,9 @@ def save_simulation_trace(trace, track, params):
         car_parameter_ibr_lateral_cost=np.asarray(
             trace.get("car_parameter_ibr_lateral_cost", []), dtype=float
         ),
+        car_parameter_ibr_velocity_cost=np.asarray(
+            trace.get("car_parameter_ibr_velocity_cost", []), dtype=float
+        ),
         car_parameter_ibr_control_rate_cost=np.asarray(
             trace.get("car_parameter_ibr_control_rate_cost", []), dtype=float
         ),
@@ -647,7 +633,6 @@ def save_simulation_trace(trace, track, params):
             trace.get("car_policy_assessment_consistent", []), dtype=bool
         ),
         car_policy_requested_mode=np.asarray(trace.get("car_policy_requested_mode", []), dtype=str),
-        car_safeguard_override=np.asarray(trace.get("car_safeguard_override", []), dtype=str),
         car_explicit_rule_mode=np.asarray(
             trace.get("car_explicit_rule_mode", []), dtype=str
         ),
@@ -663,21 +648,6 @@ def save_simulation_trace(trace, track, params):
         ),
         car_offroad_recovery_heading_error=np.asarray(
             trace.get("car_offroad_recovery_heading_error", []), dtype=float
-        ),
-        car_low_speed_boundary_recovery_active=np.asarray(
-            trace.get("car_low_speed_boundary_recovery_active", []), dtype=bool
-        ),
-        car_deadlock_reset_event=np.asarray(
-            trace.get("car_deadlock_reset_event", []), dtype=bool
-        ),
-        car_deadlock_reset_blocked=np.asarray(
-            trace.get("car_deadlock_reset_blocked", []), dtype=bool
-        ),
-        car_deadlock_reset_pre_lateral_error=np.asarray(
-            trace.get("car_deadlock_reset_pre_lateral_error", []), dtype=float
-        ),
-        car_deadlock_reset_pre_speed=np.asarray(
-            trace.get("car_deadlock_reset_pre_speed", []), dtype=float
         ),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
@@ -716,48 +686,6 @@ def save_simulation_trace(trace, track, params):
         offroad_low_speed_threshold=np.asarray(
             params.OFFROAD_LOW_SPEED_THRESHOLD
         ),
-        low_speed_boundary_recovery_enabled=np.asarray(
-            params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED, dtype=bool
-        ),
-        low_speed_boundary_trigger_fraction=np.asarray(
-            params.LOW_SPEED_BOUNDARY_TRIGGER_FRACTION
-        ),
-        low_speed_boundary_exit_fraction=np.asarray(
-            params.LOW_SPEED_BOUNDARY_EXIT_FRACTION
-        ),
-        low_speed_boundary_trigger_speed=np.asarray(
-            params.LOW_SPEED_BOUNDARY_TRIGGER_SPEED
-        ),
-        low_speed_boundary_exit_speed=np.asarray(
-            params.LOW_SPEED_BOUNDARY_EXIT_SPEED
-        ),
-        low_speed_boundary_trigger_seconds=np.asarray(
-            params.LOW_SPEED_BOUNDARY_TRIGGER_SECONDS
-        ),
-        deadlock_reset_enabled=np.asarray(
-            params.DEADLOCK_RESET_ENABLED, dtype=bool
-        ),
-        deadlock_reset_trigger_speed=np.asarray(
-            params.DEADLOCK_RESET_TRIGGER_SPEED
-        ),
-        deadlock_reset_trigger_seconds=np.asarray(
-            params.DEADLOCK_RESET_TRIGGER_SECONDS
-        ),
-        deadlock_reset_min_progress=np.asarray(
-            params.DEADLOCK_RESET_MIN_PROGRESS
-        ),
-        deadlock_reset_restart_speed=np.asarray(
-            params.DEADLOCK_RESET_RESTART_SPEED
-        ),
-        deadlock_reset_min_sim_time=np.asarray(
-            params.DEADLOCK_RESET_MIN_SIM_TIME
-        ),
-        deadlock_reset_cooldown_seconds=np.asarray(
-            params.DEADLOCK_RESET_COOLDOWN_SECONDS
-        ),
-        deadlock_reset_collision_margin=np.asarray(
-            params.DEADLOCK_RESET_COLLISION_MARGIN
-        ),
         velocity_track_weight=np.asarray(
             trace.get("velocity_track_weight", params.VELOCITY_TRACK_WEIGHT)
         ),
@@ -785,8 +713,14 @@ def save_simulation_trace(trace, track, params):
         mpc_enforce_collision_avoidance=np.asarray(
             params.MPC_ENFORCE_COLLISION_AVOIDANCE
         ),
-        mpc_track_slack_weight=np.asarray(params.MPC_TRACK_SLACK_WEIGHT),
-        mpc_collision_slack_weight=np.asarray(params.MPC_COLLISION_SLACK_WEIGHT),
+        # Keep the legacy field, but record the effective per-run override
+        # rather than the static config default.
+        mpc_track_slack_weight=np.asarray(
+            trace.get("track_slack_weight", params.MPC_TRACK_SLACK_WEIGHT)
+        ),
+        mpc_collision_slack_weight=np.asarray(
+            trace.get("collision_slack_weight", params.MPC_COLLISION_SLACK_WEIGHT)
+        ),
         mpc_enforce_friction_speed_limit=np.asarray(
             params.MPC_ENFORCE_FRICTION_SPEED_LIMIT
         ),
@@ -802,7 +736,9 @@ def save_simulation_trace(trace, track, params):
         ibr_heading_weight=np.asarray(params.IBR_HEADING_WEIGHT),
         ibr_allow_track_slack=np.asarray(params.IBR_ALLOW_TRACK_SLACK),
         ibr_allow_collision_slack=np.asarray(params.IBR_ALLOW_COLLISION_SLACK),
-        ibr_speed_weight=np.asarray(params.IBR_SPEED_WEIGHT),
+        ibr_speed_weight=np.asarray(
+            trace.get("ibr_speed_weight", params.IBR_SPEED_WEIGHT)
+        ),
         ibr_speed_cap_mode=np.asarray(params.IBR_SPEED_CAP_MODE),
         ibr_raceline_speed_cap_factor=np.asarray(
             params.IBR_RACELINE_SPEED_CAP_FACTOR
@@ -829,13 +765,5 @@ def save_simulation_trace(trace, track, params):
         llm_update_interval_seconds=np.asarray(
             trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
         ),
-        early_collision_window_seconds=np.asarray(params.EARLY_COLLISION_WINDOW_SECONDS),
-        early_collision_consecutive_seconds=np.asarray(
-            params.EARLY_COLLISION_CONSECUTIVE_SECONDS
-        ),
-        early_stop=np.asarray(trace.get("early_stop", False)),
-        early_stop_reason=np.asarray(trace.get("early_stop_reason", "")),
-        completed_steps=np.asarray(trace.get("completed_steps", len(trace["time"]))),
-        planned_steps=np.asarray(trace.get("planned_steps", len(trace["time"]))),
     )
-    print(f"Saved simulation trace to {params.TRACE_OUTPUT}")
+    print(f"Saved simulation trace to {output_path}")

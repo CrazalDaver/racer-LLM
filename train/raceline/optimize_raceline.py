@@ -77,7 +77,39 @@ except ImportError as exc:  # pragma: no cover - exercised only on missing optio
 OBJECTIVES = ("mincurv_iqp", "mincurv", "shortest")
 
 
+def _periodic_path_indices(points: np.ndarray, tolerance: float = 1.0e-9) -> np.ndarray:
+    """Return row indices for one clean period of a closed path."""
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("path points must have shape (N, 2)")
+    if points.shape[0] < 3:
+        raise ValueError("a closed path requires at least three points")
+    endpoint = points.shape[0]
+    if np.linalg.norm(points[0] - points[-1]) <= tolerance:
+        endpoint -= 1
+    indices = np.arange(endpoint)
+    candidates = points[:endpoint]
+    keep = np.r_[True, np.linalg.norm(np.diff(candidates, axis=0), axis=1) > tolerance]
+    indices = indices[keep]
+    if indices.size < 3:
+        raise ValueError("a closed path requires at least three distinct points")
+    return indices
+
+
+def _periodic_path_points(points: np.ndarray, tolerance: float = 1.0e-9) -> np.ndarray:
+    """Return one clean period of a closed path.
+
+    Some released alpha-RACER CSVs explicitly repeat their first waypoint as
+    the final row, while locally generated files do not.  Remove that duplicate
+    endpoint, as well as any zero-length consecutive segments, before building
+    a strictly increasing arc-length coordinate for periodic splines.
+    """
+    points = np.asarray(points, dtype=float)
+    return points[_periodic_path_indices(points, tolerance)]
+
+
 def _closed_arc_length(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    points = _periodic_path_points(points)
     closed = np.vstack((points, points[0]))
     lengths = np.linalg.norm(np.diff(closed, axis=0), axis=1)
     return np.r_[0.0, np.cumsum(lengths)], lengths
@@ -85,9 +117,7 @@ def _closed_arc_length(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def _resample_closed_centerline(points: np.ndarray, step: float) -> np.ndarray:
     """Return a periodic, approximately equidistant centerline."""
-    points = np.asarray(points, dtype=float)
-    if np.linalg.norm(points[0] - points[-1]) < 1.0e-9:
-        points = points[:-1]
+    points = _periodic_path_points(points)
     s, _ = _closed_arc_length(points)
     closed = np.vstack((points, points[0]))
     spline = CubicSpline(s, closed, axis=0, bc_type="periodic")
@@ -365,6 +395,7 @@ def _centerline_deviation(centerline: np.ndarray, raceline: np.ndarray) -> np.nd
 
 
 def _path_curvature(points: np.ndarray) -> np.ndarray:
+    points = _periodic_path_points(points)
     s, _ = _closed_arc_length(points)
     closed = np.vstack((points, points[0]))
     spline = CubicSpline(s, closed, axis=0, bc_type="periodic")
@@ -377,16 +408,19 @@ def _path_curvature(points: np.ndarray) -> np.ndarray:
 
 def _existing_raceline_metrics(path: str, scale: float) -> dict:
     existing = load_raceline_csv(path, scale=scale)
-    _, lengths = _closed_arc_length(existing.waypoints)
-    curvature = _path_curvature(existing.waypoints)
+    clean_indices = _periodic_path_indices(existing.waypoints)
+    waypoints = existing.waypoints[clean_indices]
+    speed = existing.speed[clean_indices]
+    _, lengths = _closed_arc_length(waypoints)
+    curvature = _path_curvature(waypoints)
     return {
         "path": path,
         "length_m": float(np.sum(lengths)),
-        "estimated_lap_time_s": _lap_time(existing.speed, lengths),
-        "mean_speed_mps": float(np.sum(lengths) / _lap_time(existing.speed, lengths)),
+        "estimated_lap_time_s": _lap_time(speed, lengths),
+        "mean_speed_mps": float(np.sum(lengths) / _lap_time(speed, lengths)),
         "max_abs_curvature_1pm": float(np.max(np.abs(curvature))),
-        "min_speed_mps": float(np.min(existing.speed)),
-        "max_speed_mps": float(np.max(existing.speed)),
+        "min_speed_mps": float(np.min(speed)),
+        "max_speed_mps": float(np.max(speed)),
     }
 
 

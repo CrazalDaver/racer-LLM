@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from config import params
-from plotting import compute_lap_stats
+from .plotting import compute_lap_stats
 from track import Track, load_centerline_csv, load_raceline_csv
 
 
@@ -31,13 +31,13 @@ def _short_policy_name(name):
     key = str(name).strip().lower()
     if "llm" in key:
         return "LLM"
-    if key in {"ibr", "iterated_best_response_policy"}:
+    if key == "ibr":
         return "IBR"
-    if key in {"static_policy", "static", "static_alpharacer", "fixed_parameter_controller"}:
+    if key == "static_alpharacer":
         return "Static"
-    if key in {"alpharacer", "alpha_racer", "potential_function_policy", "potential_function_min_policy", "weighted_alpharacer", "weighted"}:
+    if key == "alpharacer":
         return "Potential"
-    if key in {"rule_based_safeguard", "rule_based", "rules", "decision_tree"}:
+    if key == "rule_based":
         return "Rule+Guard"
     return str(name)
 
@@ -260,7 +260,7 @@ def make_animation(
     llm_mode_indices = [
         idx
         for idx, name in enumerate(policy_names[:car_count])
-        if ("llm" in name.lower() or "rule_based_safeguard" in name.lower())
+        if ("llm" in name.lower() or name.lower() == "rule_based")
         and car_policy_mode is not None
         and np.any((car_policy_mode[:, idx] != "custom") & (car_policy_mode[:, idx] != "fixed"))
     ]

@@ -35,6 +35,7 @@ from evaluation.mode_preset_audit import (
     validate_scenario,
 )
 from simulation import run_simulation
+from simulation_core.config import SimulationConfig
 from track import Track, configure_track, load_centerline_csv
 
 
@@ -144,8 +145,6 @@ def run_reference(args):
     for scene in scenes:
         validate_scenario(track, scene)
 
-    params.DEADLOCK_RESET_ENABLED = False
-    params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = False
     params.POTENTIAL_FUNCTION_OPT_STYLE = args.optimization
     params.POTENTIAL_FUNCTION_SEARCH_ITERS = args.search_iterations
     params.ALPHARACER_WEIGHT_SEARCH_ITERS = args.search_iterations
@@ -159,25 +158,24 @@ def run_reference(args):
         print(f"[{index}/{len(scenes)}] potential reference: {scene.name}")
         ranks = np.arange(3, dtype=float)
         initial_offsets = np.asarray(scene.s, dtype=float) + ranks * args.start_gap
-        trace = run_simulation(
+        trace = run_simulation(SimulationConfig(
             track_name=args.track,
             save_trace=False,
             show_plot=False,
-            num_cars=3,
-            policy_names=["alpharacer", "static", "static"],
-            static_policy_params_per_car=np.vstack([stable, stable, stable]),
-            alpharacer_weight_path=args.weight,
+            policies=["alpharacer", "static_alpharacer", "static_alpharacer"],
+            static_params_by_car=np.vstack([stable, stable, stable]),
+            alpha_weight_path=args.weight,
             ego_position=1,
             start_gap=args.start_gap,
-            initial_longitudinal_offsets=initial_offsets,
-            initial_lateral_offsets=np.asarray(scene.e, dtype=float),
-            initial_speeds=np.asarray(scene.speed, dtype=float),
-            total_time=args.rollout_seconds,
-            horizon=args.mpc_horizon,
-            velocity_track_weight=args.velocity_track_weight,
-            track_slack_weight=args.track_slack_weight,
+            start_s_offsets=initial_offsets,
+            start_e_offsets=np.asarray(scene.e, dtype=float),
+            start_speeds=np.asarray(scene.speed, dtype=float),
+            duration=args.rollout_seconds,
+            mpc_horizon=args.mpc_horizon,
+            mpc_velocity_weight=args.velocity_track_weight,
+            mpc_track_slack=args.track_slack_weight,
             quiet=True,
-        )
+        ))
         row, theta_series = _summarize(trace, scene, args.weight)
         rows.append(row)
         parameter_traces.append(theta_series)

@@ -45,7 +45,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         decision_dt=None,
         history_length=None,
         output_mode="auto", # Public compatibility option selecting the LLM response format: "mode", "params", or "auto".
-        safeguard_enabled=False,  # If True, apply deterministic mode-guarding rules to the LLM output.
         param_bounds=None,
         system_prompt_path=None,
         prompt_variant="raw",
@@ -65,7 +64,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             history_length = sim_params.LLM_RECENT_MODES_MAX_LENGTH
         self.history_length = max(0, int(history_length))
         self.response_format = self._resolve_response_format(output_mode, model_name)
-        self.safeguard_enabled = bool(safeguard_enabled)
         self.prompt_variant = str(prompt_variant)
         if self.response_format == "params" and self.prompt_variant == "raw":
             self.prompt_variant = "direct_params_effect_aware"
@@ -83,7 +81,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.last_llm_reason = "not_called"
         self.last_llm_basis = "not_called"
         self.last_llm_requested_mode = "stable"
-        self.last_safeguard_override = ""
         self.param_bounds = (
             param_bounds if param_bounds is not None else sim_params.LLM_PARAMETER_BOUNDS.copy()
         )
@@ -326,7 +323,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "requested_mode": self.last_llm_requested_mode,
                 "basis": self.last_llm_basis,
                 "reason": self.last_llm_reason,
-                "safeguard_override": self.last_safeguard_override,
                 "params": self.params.copy(),
             }
         )
@@ -390,7 +386,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "additionalProperties": False,
         }
 
-    def _query_llm(self, prompt: str, *, system_prompt=None, output_schema=None) -> dict:
+    def _query_llm(self, prompt: str) -> dict:
         self._last_raw_llm_response = ""
         self._last_llm_done_reason = ""
         self._last_llm_eval_count = -1
@@ -400,9 +396,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         # ollama query
         payload = {
             "model": self.model_name,
-            "system": self.system_prompt if system_prompt is None else system_prompt,
+            "system": self.system_prompt,  # local file that describes tasks definition and mode explanation
             "prompt": prompt,
-            "format": self._output_schema() if output_schema is None else output_schema,
+            "format": self._output_schema(),
             "stream": False,
             "options": {"temperature": self.temperature, "num_predict": 192},
         }
@@ -581,50 +577,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "current_py": current_py,
         }
 
-    def _apply_mode_guard(self, state: CarState, current_s: float, opponents=None):
-        self.last_safeguard_override = ""
-        if self.response_format != "mode":
-            return
-
-        context = self._mode_context(state, current_s, opponents)
-        guarded_mode = self.current_mode
-
-        near_contact = context["nearest_delta"] is not None and abs(context["nearest_delta"]) < sim_params.LLM_CRITICAL_DISTANCE
-        near_overlap = (
-            context["nearest_delta"] is not None
-            and abs(context["nearest_delta"]) < sim_params.LLM_CRITICAL_DISTANCE
-            and context["nearest_lateral_gap"] is not None
-            and context["nearest_lateral_gap"] < self.mpc.min_lateral_separation + sim_params.LLM_SAME_LANE_MARGIN
-        )
-        front_clear_for_push = context["nearest_front_delta"] is None or context["nearest_front_delta"] > sim_params.LLM_OVERTAKE_DISTANCE
-        push_allowed = front_clear_for_push and not near_overlap and abs(context["current_py"]) < 0.45
-        tiny_front_gap = (
-            context["nearest_front_delta"] is not None
-            and context["nearest_front_delta"] < self.mpc.min_longitudinal_separation
-            and context["nearest_front_lateral_gap"] is not None
-            and context["nearest_front_lateral_gap"] < self.mpc.min_lateral_separation + sim_params.LLM_SAME_LANE_MARGIN
-        )
-
-        if state.vx < 0.35 and near_contact:
-            guarded_mode = "stable"
-        elif tiny_front_gap:
-            if guarded_mode in {"push", "overtake", "block"}:
-                guarded_mode = "stable"
-        elif context["close_slow_front"]:
-            if guarded_mode in {"push", "stable", "block"}:
-                guarded_mode = "overtake"
-        elif guarded_mode == "push" and not push_allowed:
-            guarded_mode = "stable"
-        elif guarded_mode == "overtake" and not context["slow_front"]:
-            guarded_mode = "push" if push_allowed and state.vx > 1.0 else "stable"
-        elif guarded_mode == "block" and not context["faster_rear"]:
-            guarded_mode = "stable"
-
-        if guarded_mode != self.current_mode:  # Only log when the mode actually changes due to guarding.
-            self.last_safeguard_override = f"{self.current_mode}->{guarded_mode}"
-            self.current_mode = guarded_mode
-            self.params = self.mode_presets[guarded_mode].copy()
-
     def update_params_from_llm(self, state: CarState, current_s: float, opponents=None):
         # Call LLM only at the specified update interval; otherwise reuse the last parameters.
         self._llm_call_count += 1
@@ -655,10 +607,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 )
                 self.last_explicit_rule_mode = expected_mode
                 self.last_explicit_rule_consistent = self.current_mode == expected_mode
-            self.last_safeguard_override = ""
-            # Optionally validate/correct the discrete mode against the current race context.
-            if self.safeguard_enabled:
-                self._apply_mode_guard(state, current_s, opponents=opponents)
             self.last_llm_params = self.params.copy()
             self.last_llm_error = None
             self._record_llm_decision()
@@ -686,7 +634,6 @@ class ExplicitRuleLLMPolicy(LLMAlphaRacerPolicy):
 
     def __init__(self, *args, **kwargs):
         kwargs["output_mode"] = "mode"
-        kwargs["safeguard_enabled"] = False
         kwargs["prompt_variant"] = "explicit_rules"
         kwargs["system_prompt_path"] = (
             Path(__file__).with_name("prompts") / "mode_explicit_rules_system.txt"
@@ -699,7 +646,6 @@ class StructuredBasisActionFirstLLMPolicy(LLMAlphaRacerPolicy):
 
     def __init__(self, *args, **kwargs):
         kwargs["output_mode"] = "mode"
-        kwargs["safeguard_enabled"] = False
         kwargs["prompt_variant"] = "structured_action_first_minimal_v2"
         kwargs["system_prompt_path"] = (
             Path(__file__).with_name("prompts")
@@ -737,7 +683,6 @@ class EvidenceFirstLLMPolicy(LLMAlphaRacerPolicy):
 
     def __init__(self, *args, **kwargs):
         kwargs["output_mode"] = "mode"
-        kwargs["safeguard_enabled"] = False
         kwargs["prompt_variant"] = "evidence_first_minimal_v2"
         kwargs["system_prompt_path"] = (
             Path(__file__).with_name("prompts") / "mode_evidence_first_system.txt"
@@ -769,14 +714,13 @@ class RuleBasedPolicy(LLMAlphaRacerPolicy):
     """Deterministic baseline executing the explicit-prompt decision rules.
 
     It observes the same state and selects from the same four mode presets. No
-    language model, network request, or additional safeguard is used.
+    language model or network request is used.
     """
 
     def __init__(self, *args, **kwargs):
         kwargs["model_name"] = "rule_based"
         kwargs["output_mode"] = "mode"
         kwargs["temperature"] = 0.0
-        kwargs["safeguard_enabled"] = False
         kwargs["prompt_variant"] = "rule_only"
         kwargs["system_prompt_path"] = (
             Path(__file__).with_name("prompts") / "mode_explicit_rules_system.txt"
@@ -809,7 +753,3 @@ class RuleBasedPolicy(LLMAlphaRacerPolicy):
         return MPCPolicy.get_reference_trajectory(
             self, state, current_s, opponents=opponents
         )
-
-
-# Backward-compatible name for existing scripts.
-RuleBasedSafeguardPolicy = RuleBasedPolicy

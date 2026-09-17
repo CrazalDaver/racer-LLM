@@ -1,6 +1,25 @@
-"""Direct trajectory-space IBR policies and the local Wang-style solver."""
+"""Local trajectory-space IBR baseline and its simulation adapter.
+
+The local implementation follows the *alternating best-response* idea in
+Wang et al. (RSS 2019): for a two-car interaction it alternately optimizes
+the ego trajectory and a predicted neighbor trajectory, then executes the
+first ego command in receding-horizon fashion.  It uses this repository's
+Frenet kinematic model and safety conventions, rather than the paper's
+piecewise-polynomial SE-IBR formulation.  It is consequently an idea-level
+``local_wang`` baseline, not a reproduction of the sensitivity-enhanced
+objective or the original numerical implementation.
+
+There are deliberately two layers in this file:
+
+* :class:`LocalWangStyleSolver` owns only the two-car CasADi optimization.
+* :class:`TrajectoryIBRPolicy` translates simulator state into solver input,
+  stores the resulting control, and adapts plans for common trace fields.
+The simulator supplies an immutable race observation to ``get_action``; the
+policy performs its own local two-car solve directly from that snapshot.
+"""
 
 import math
+from dataclasses import dataclass
 
 import casadi as cs
 import numpy as np
@@ -15,87 +34,164 @@ from vehicle_model import (
 )
 
 from ..base import BasePolicy
-from ..utils import progress_delta, track_curvature_at, track_heading_error
+from ..utils import track_curvature_at, track_heading_error
 from .historical_ibr import _HistoricalStrictIBRSolver
 
 
 IBR_IMPLEMENTATIONS = ("local_wang", "historical_strict")
 
 
-class _WangIBRSolver:
-    """Two-player receding-horizon IBR based on Wang et al. (RSS 2019)."""
+@dataclass(frozen=True)
+class TrajectoryIBRSettings:
+    """Resolved, immutable inputs of one local trajectory-IBR solver.
 
-    def __init__(
-        self,
+    This object is intentionally narrower than the mutable global
+    ``config.params``.  Some fields must use the *effective* per-run MPC
+    values (for example a CLI velocity/slack override), while objective terms
+    remain experiment-level IBR choices.  Constructing this snapshot once
+    makes that boundary inspectable and avoids solver code silently reading
+    global configuration later.
+    """
+
+    horizon: int
+    dt: float
+    vehicle_params: object
+    mu: float
+    gravity: float
+    lateral_half_width: float
+    collision_longitudinal: float
+    collision_lateral: float
+    collision_exponent: int
+    track_slack_weight: float
+    collision_slack_weight: float
+    allow_track_slack: bool
+    allow_collision_slack: bool
+    progress_weight: float
+    lateral_weight: float
+    lateral_exponent: int
+    heading_weight: float
+    speed_weight: float
+    control_weight: float
+    control_reference: str
+    control_rate_weight: float
+    convergence_tolerance: float
+    max_steer_delta: float
+    max_speed: float
+    speed_cap_mode: str
+    raceline_speed_cap_factor: float
+    enforce_track_boundary: bool
+    enforce_collision_avoidance: bool
+    enforce_friction_speed_limit: bool
+    iterations: int
+
+    @classmethod
+    def from_runtime(
+        cls,
         *,
+        mpc,
+        sim_params,
         horizon,
-        dt,
         iterations,
-        vehicle_params,
-        mu,
-        gravity,
         lateral_half_width,
         collision_longitudinal,
         collision_lateral,
-        collision_exponent,
-        track_slack_weight,
-        collision_slack_weight,
-        allow_track_slack,
-        allow_collision_slack,
-        progress_weight,
-        lateral_weight,
-        lateral_exponent,
-        heading_weight,
-        speed_weight,
-        control_weight,
-        control_reference,
-        control_rate_weight,
-        convergence_tolerance,
-        max_steer_delta,
-        max_speed,
-        speed_cap_mode,
-        raceline_speed_cap_factor,
-        enforce_track_boundary,
-        enforce_collision_avoidance,
-        enforce_friction_speed_limit,
     ):
-        self.p = vehicle_params
-        self.horizon = int(horizon)
-        self.dt = float(dt)
-        self.iterations = int(iterations)
-        self.mu = float(mu)
-        self.gravity = float(gravity)
-        self.lateral_half_width = float(lateral_half_width)
-        self.collision_longitudinal = float(collision_longitudinal)
-        self.collision_lateral = float(collision_lateral)
-        self.collision_exponent = int(collision_exponent)
-        self.track_slack_weight = float(track_slack_weight)
-        self.collision_slack_weight = float(collision_slack_weight)
-        self.allow_track_slack = bool(allow_track_slack)
-        self.allow_collision_slack = bool(allow_collision_slack)
-        self.progress_weight = float(progress_weight)
-        self.lateral_weight = float(lateral_weight)
-        self.lateral_exponent = int(lateral_exponent)
+        """Resolve one solver snapshot from shared MPC and IBR configuration.
+
+        The MPC instance is authoritative for constraints and weights that
+        can be overridden per experiment.  ``sim_params`` supplies IBR-only
+        objective choices that currently have no per-run CLI override.
+        """
+        return cls(
+            horizon=int(horizon),
+            dt=float(mpc.dt),
+            vehicle_params=mpc.p,
+            mu=float(mpc.friction_coefficient),
+            gravity=float(GRAVITY),
+            lateral_half_width=float(lateral_half_width),
+            collision_longitudinal=float(collision_longitudinal),
+            collision_lateral=float(collision_lateral),
+            collision_exponent=int(mpc.collision_superellipse_exponent),
+            track_slack_weight=float(mpc.track_slack_weight),
+            collision_slack_weight=float(mpc.collision_slack_weight),
+            allow_track_slack=bool(sim_params.IBR_ALLOW_TRACK_SLACK),
+            allow_collision_slack=bool(sim_params.IBR_ALLOW_COLLISION_SLACK),
+            progress_weight=float(sim_params.IBR_PROGRESS_WEIGHT),
+            lateral_weight=float(sim_params.IBR_LATERAL_WEIGHT),
+            lateral_exponent=int(sim_params.IBR_LATERAL_EXPONENT),
+            heading_weight=float(sim_params.IBR_HEADING_WEIGHT),
+            speed_weight=float(mpc.velocity_track_weight),
+            control_weight=float(sim_params.IBR_CONTROL_WEIGHT),
+            control_reference=str(sim_params.IBR_CONTROL_REFERENCE),
+            control_rate_weight=float(sim_params.IBR_CONTROL_RATE_WEIGHT),
+            convergence_tolerance=float(sim_params.IBR_CONVERGENCE_TOLERANCE),
+            max_steer_delta=float(mpc.max_steer_delta),
+            max_speed=float(mpc.max_speed),
+            speed_cap_mode=str(sim_params.IBR_SPEED_CAP_MODE),
+            raceline_speed_cap_factor=float(sim_params.IBR_RACELINE_SPEED_CAP_FACTOR),
+            enforce_track_boundary=bool(mpc.enforce_track_boundary),
+            enforce_collision_avoidance=bool(mpc.enforce_collision_avoidance),
+            enforce_friction_speed_limit=bool(mpc.enforce_friction_speed_limit),
+            iterations=int(iterations),
+        )
+
+
+class LocalWangStyleSolver:
+    """Two-car, finite-horizon alternating best-response optimization.
+
+    Each solve keeps the other car's candidate Frenet ``[s, e]`` plan fixed,
+    optimizes one car's dynamically feasible state/control trajectory, then
+    alternates players for a bounded number of rounds.  A final ego solve
+    reacts to the latest neighbor response.  This is the local approximation
+    of the IBR loop; it does *not* contain Wang et al.'s sensitivity-enhanced
+    multiplier term.
+
+    The solver is independent of simulator objects after construction.  It
+    receives only :class:`TrajectoryIBRSettings`, numerical states, track
+    curvature samples, reference-speed samples, and the other trajectory.
+    That separation is intentional: policy-level state projection, cache
+    management, and multi-car scheduling do not belong in the NLP.
+    """
+
+    def __init__(self, settings: TrajectoryIBRSettings):
+        self.settings = settings
+        self.p = settings.vehicle_params
+        self.horizon = settings.horizon
+        self.dt = settings.dt
+        self.iterations = settings.iterations
+        self.mu = settings.mu
+        self.gravity = settings.gravity
+        self.lateral_half_width = settings.lateral_half_width
+        self.collision_longitudinal = settings.collision_longitudinal
+        self.collision_lateral = settings.collision_lateral
+        self.collision_exponent = settings.collision_exponent
+        self.track_slack_weight = settings.track_slack_weight
+        self.collision_slack_weight = settings.collision_slack_weight
+        self.allow_track_slack = settings.allow_track_slack
+        self.allow_collision_slack = settings.allow_collision_slack
+        self.progress_weight = settings.progress_weight
+        self.lateral_weight = settings.lateral_weight
+        self.lateral_exponent = settings.lateral_exponent
         if self.lateral_exponent not in {2, 4}:
             raise ValueError("IBR lateral_exponent must be 2 or 4")
-        self.heading_weight = float(heading_weight)
-        self.speed_weight = float(speed_weight)
-        self.control_weight = float(control_weight)
-        self.control_reference = str(control_reference)
+        self.heading_weight = settings.heading_weight
+        self.speed_weight = settings.speed_weight
+        self.control_weight = settings.control_weight
+        self.control_reference = settings.control_reference
         if self.control_reference not in {"neutral", "zero"}:
             raise ValueError("IBR control_reference must be 'neutral' or 'zero'")
-        self.control_rate_weight = float(control_rate_weight)
-        self.convergence_tolerance = max(float(convergence_tolerance), 0.0)
-        self.max_steer_delta = max(float(max_steer_delta), 0.0)
-        self.max_speed = float(max_speed)
-        self.speed_cap_mode = str(speed_cap_mode)
-        self.raceline_speed_cap_factor = float(raceline_speed_cap_factor)
+        self.control_rate_weight = settings.control_rate_weight
+        self.convergence_tolerance = max(settings.convergence_tolerance, 0.0)
+        self.max_steer_delta = max(settings.max_steer_delta, 0.0)
+        self.max_speed = settings.max_speed
+        self.speed_cap_mode = settings.speed_cap_mode
+        self.raceline_speed_cap_factor = settings.raceline_speed_cap_factor
         if self.speed_cap_mode not in {"global", "raceline"}:
             raise ValueError("IBR speed_cap_mode must be 'global' or 'raceline'")
-        self.enforce_track_boundary = bool(enforce_track_boundary)
-        self.enforce_collision_avoidance = bool(enforce_collision_avoidance)
-        self.enforce_friction_speed_limit = bool(enforce_friction_speed_limit)
-        self._build_solver()    # build CasADi solver for the IBR MPC problem
+        self.enforce_track_boundary = settings.enforce_track_boundary
+        self.enforce_collision_avoidance = settings.enforce_collision_avoidance
+        self.enforce_friction_speed_limit = settings.enforce_friction_speed_limit
+        self._build_solver()
 
     def _vehicle_dynamics(self, xk, uk, curvature):
         return kinematic_frenet_step(
@@ -109,12 +205,21 @@ class _WangIBRSolver:
         )
 
     def _build_solver(self):
+        """Build the reusable CasADi NLP once for a fixed settings snapshot.
+
+        Curvature, speed profile, initial state, previous command, and the
+        fixed neighbor plan remain numerical NLP parameters.  The variables
+        are the focal car's Frenet state/control sequence plus non-negative
+        track and collision slack.  Reusing this compiled graph is why these
+        quantities are not reconstructed in every policy tick.
+        """
         n = self.horizon
         x = cs.MX.sym("x", 4, n + 1)
         u = cs.MX.sym("u", 2, n)
         x0 = cs.MX.sym("x0", 4)
         curvature = cs.MX.sym("curvature", n)
-        target_speed = cs.MX.sym("target_speed", 1)
+        # Horizon-wise raceline speed profile, matching the shared MPC input.
+        target_speed = cs.MX.sym("target_speed", n)
         neutral_control = cs.MX.sym("neutral_control", 2)
         opp_s = cs.MX.sym("opp_s", n + 1)
         opp_e = cs.MX.sym("opp_e", n + 1)
@@ -130,7 +235,7 @@ class _WangIBRSolver:
             g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))  # kinematic constraints
             cost += self.lateral_weight * x[1, k] ** self.lateral_exponent
             cost += self.heading_weight * x[2, k] ** 2
-            cost += self.speed_weight * (x[3, k] - target_speed) ** 2
+            cost += self.speed_weight * (x[3, k] - target_speed[k]) ** 2
             # Absolute effort is measured relative to the command that holds
             # the reference speed and drives straight. This avoids treating
             # drag compensation as strategically meaningful acceleration.
@@ -159,7 +264,6 @@ class _WangIBRSolver:
         for k in range(n):
             ds = (x[0, k + 1] - opp_s[k + 1]) / self.collision_longitudinal
             de = (x[1, k + 1] - opp_e[k + 1]) / self.collision_lateral
-            # gamma <= 0 is the coupled constraint used by the SE derivative.
             g.append(
                 1.0 - ds ** self.collision_exponent
                 - de ** self.collision_exponent - collision_slack[k]
@@ -194,7 +298,22 @@ class _WangIBRSolver:
         self, x0, opponent_plan, curvature, target_speed,
         initial_plan=None, previous_control=None,
     ):
+        """Optimize one car while treating ``opponent_plan`` as fixed.
+
+        This is one best-response subproblem, not a joint solve.  Its output
+        becomes the other player's fixed trajectory in the next alternating
+        step.  Warm-start plans are aids to IPOPT convergence only; all
+        dynamic, track, collision, actuation, and slack constraints are
+        imposed again by the NLP.
+        """
         n = self.horizon
+        target_speed = np.asarray(target_speed, dtype=float).reshape(-1)
+        if target_speed.size == 1:
+            target_speed = np.full(n, float(target_speed[0]))
+        if target_speed.size != n:
+            raise ValueError(
+                f"target_speed must contain {n} samples, got {target_speed.size}"
+            )
         if initial_plan is None:
             x_init = np.tile(np.asarray(x0, dtype=float), (n + 1, 1)).T
         else:
@@ -223,14 +342,14 @@ class _WangIBRSolver:
             ])
         previous_control = np.asarray(previous_control, dtype=float)
         neutral_control = np.asarray(
-            [self._neutral_throttle(target_speed), -self.p.Sb / max(self.p.Sa, 1e-6)],
+            [self._neutral_throttle(target_speed[0]), -self.p.Sb / max(self.p.Sa, 1e-6)],
             dtype=float,
         )
         p_val = np.concatenate(
             [
                 np.asarray(x0, dtype=float),
                 np.asarray(curvature, dtype=float),
-                np.array([float(target_speed)]),
+                target_speed,
                 neutral_control,
                 np.asarray(opponent_plan[0], dtype=float),
                 np.asarray(opponent_plan[1], dtype=float),
@@ -262,7 +381,7 @@ class _WangIBRSolver:
             speed_cap = min(
                 self.max_speed,
                 max(
-                    self.raceline_speed_cap_factor * float(target_speed),
+                    self.raceline_speed_cap_factor * float(target_speed[0]),
                     minimum_reachable_speed(x0[3], self.dt, self.p),
                 ),
             )
@@ -327,11 +446,20 @@ class _WangIBRSolver:
         }
         return state_plan, control_plan, diagnostics
 
-    def solve_pair(
+    def iterate_best_responses(
         self, neighbor_x0, own_x0, neighbor_curvature, own_curvature,
         neighbor_speed, own_speed, neighbor_previous_control=None,
         own_previous_control=None,
     ):
+        """Run bounded alternating best responses and return the final ego plan.
+
+        Both initial plans are constant-speed rollouts used solely as first
+        guesses.  A round is ego best response followed by neighbor best
+        response.  The extra ego solve after the loop mirrors the paper's
+        execution convention: the command reacts to the latest neighbor plan.
+        Early termination tests only plan change; it is not proof of a Nash
+        equilibrium, especially because this local solver omits SE-IBR.
+        """
         n = self.horizon
         def rollout(x0):
             plan = np.repeat(np.asarray(x0, dtype=float).reshape(4, 1), n + 1, axis=1)
@@ -384,19 +512,24 @@ class _WangIBRSolver:
             "neighbor_diagnostics": neighbor_diagnostics,
         }
 
-
 class TrajectoryIBRPolicy(BasePolicy):
-    """
-    Selectable IBR baseline policy.
+    """Simulator-facing adapter for a direct trajectory-space IBR planner.
 
-    ``local_wang`` follows the general IBR/SE-IBR construction of Wang et al.
-    (RSS 2019) while using this project's physical model and MPC constraints.
-    Its ``iterations`` counts complete ego/opponent best-response rounds and
-    each planning call ends with one additional ego solve.
+    This policy directly executes the first control from a local two-car IBR
+    plan; unlike :class:`MPCPolicy`, it does not give a reference to the
+    shared MPC optimizer for control tracking.  The supplied ``mpc`` object
+    still defines the effective physical limits and cost scales, and is used
+    as the common diagnostics/trace interface expected by the simulator.
 
-    ``historical_strict`` restores this repository's earlier strict solver
-    with local vehicle parameters and hard track bounds. It also does not
-    support SE and exists only as a historical implementation comparison.
+    ``get_action`` receives one immutable :class:`RaceObservation`, chooses
+    the closest longitudinal opponent, and performs the complete local solve.
+    The observation contains previous-tick controls for all cars, so calling
+    policies in sequence cannot expose newly updated internal state.
+
+    ``local_wang`` is a local alternating-IBR adaptation, not an SE-IBR
+    reproduction.  ``historical_strict`` retains the repository's former
+    solver solely for historical comparisons and should not be used as the
+    primary Wang-style baseline.
     """
 
     ibr_level = "trajectory"
@@ -449,42 +582,19 @@ class TrajectoryIBRPolicy(BasePolicy):
                 lateral_half_width=float(lateral_half_width),
             )
             self.iterations = self.ibr_solver.iterations
+            self.ibr_settings = None
         else:
-            self.ibr_solver = _WangIBRSolver(
-                vehicle_params=self.mpc.p,
+            self.ibr_settings = TrajectoryIBRSettings.from_runtime(
+                mpc=self.mpc,
+                sim_params=sim_params,
                 horizon=solver_horizon,
-                dt=self.mpc.dt,
                 iterations=self.iterations,
-                lateral_half_width=float(lateral_half_width),
+                lateral_half_width=lateral_half_width,
                 collision_longitudinal=collision_longitudinal,
                 collision_lateral=collision_lateral,
-                collision_exponent=self.mpc.collision_superellipse_exponent,
-                progress_weight=sim_params.IBR_PROGRESS_WEIGHT,
-                lateral_weight=sim_params.IBR_LATERAL_WEIGHT,
-                lateral_exponent=sim_params.IBR_LATERAL_EXPONENT,
-                heading_weight=sim_params.IBR_HEADING_WEIGHT,
-                speed_weight=sim_params.IBR_SPEED_WEIGHT,
-                control_weight=sim_params.IBR_CONTROL_WEIGHT,
-                control_reference=sim_params.IBR_CONTROL_REFERENCE,
-                control_rate_weight=sim_params.IBR_CONTROL_RATE_WEIGHT,
-                convergence_tolerance=sim_params.IBR_CONVERGENCE_TOLERANCE,
-                track_slack_weight=self.mpc.track_slack_weight,
-                collision_slack_weight=self.mpc.collision_slack_weight,
-                allow_track_slack=sim_params.IBR_ALLOW_TRACK_SLACK,
-                allow_collision_slack=sim_params.IBR_ALLOW_COLLISION_SLACK,
-                gravity=GRAVITY,
-                mu=self.mpc.friction_coefficient,
-                max_steer_delta=self.mpc.max_steer_delta,
-                max_speed=self.mpc.max_speed,
-                speed_cap_mode=sim_params.IBR_SPEED_CAP_MODE,
-                raceline_speed_cap_factor=sim_params.IBR_RACELINE_SPEED_CAP_FACTOR,
-                enforce_track_boundary=self.mpc.enforce_track_boundary,
-                enforce_collision_avoidance=self.mpc.enforce_collision_avoidance,
-                enforce_friction_speed_limit=self.mpc.enforce_friction_speed_limit,
             )
-        self._ibr_cached_action = None
-        self._ibr_cached_action_time = None
-        self._ibr_action_valid_until = -np.inf
+            self.ibr_solver = LocalWangStyleSolver(self.ibr_settings)
+        self._last_ibr_action = None
         self._ibr_cached_ref_traj = None
         self._ibr_cached_ref_world_horizon = None
         self._ibr_cached_raceline_world_horizon = None
@@ -538,6 +648,16 @@ class TrajectoryIBRPolicy(BasePolicy):
             )
 
     def _curvature_lookahead(self, current_s, state):
+        """Sample centerline curvature along a frozen-speed nominal horizon.
+
+        The Frenet dynamics need a curvature value at every prediction step.
+        We use ``s_k = s_0 + k dt v_0`` as an inexpensive external parameter
+        schedule, rather than making curvature a symbolic function of the
+        optimized progress.  This is a local approximation: it can disagree
+        with the eventual plan when the car accelerates or brakes sharply,
+        particularly around a hairpin.  It should be audited against the
+        solved ``s`` plan before changing baseline behavior.
+        """
         curvature = np.zeros(self.ibr_solver.horizon)
         speed = max(float(state.vx), 0.0)
         for k in range(self.ibr_solver.horizon):
@@ -545,18 +665,33 @@ class TrajectoryIBRPolicy(BasePolicy):
             curvature[k] = track_curvature_at(self.track, s, ds=0.5)
         return curvature
 
-    def _reference_speed(self, state, current_s):
+    def _reference_speed_profile(self, state, current_s):
+        """Sample raceline target speeds for the local solver horizon.
+
+        This is a speed-tracking preference/cap input, not a trajectory given
+        to the solver.  The profile advances using its own sampled raceline
+        speed; it may therefore differ from both frozen-speed curvature
+        lookahead and the optimized progress sequence.
+        """
+        n = self.ibr_solver.horizon
         if self.raceline is None:
-            return max(float(state.vx), 0.5)
+            return np.full(n, max(float(state.vx), 0.5), dtype=float)
         try:
             idx = self.raceline.nearest_index(state.x, state.y)
             self.last_raceline_idx = idx
             self.last_raceline_s = float(self.raceline.s[idx])
-            return min(float(self.raceline.speed[idx]), self.max_speed)
+            profile = np.empty(n, dtype=float)
+            raceline_s = self.last_raceline_s
+            for k in range(n):
+                sample = self.raceline.interpolate(raceline_s)
+                profile[k] = min(float(sample["vx_mps"]), self.max_speed)
+                raceline_s += max(profile[k], 0.0) * self.ibr_solver.dt
+            return profile
         except Exception:
-            return max(float(state.vx), 0.5)
+            return np.full(n, max(float(state.vx), 0.5), dtype=float)
 
     def _frenet_x0(self, state, current_s, current_e):
+        """Project a simulator state into the solver's ``[s,e,psi_err,v]`` state."""
         return np.array(
             [
                 float(current_s),
@@ -567,8 +702,16 @@ class TrajectoryIBRPolicy(BasePolicy):
             dtype=float,
         )
 
-    def _make_ref_from_plan(self, plan, speed):
+    def _make_ref_from_plan(self, plan, speed_profile):
+        """Adapt a direct IBR plan to the shared trace/visualization format.
+
+        The returned reference is diagnostic only: the direct IBR action has
+        already been computed by :class:`LocalWangStyleSolver`; it is not fed
+        into ``self.mpc.solve``.  Keeping this adapter lets plots and saved
+        traces use the same fields for all policy families.
+        """
         horizon = self.mpc.horizon
+        speed_profile = np.asarray(speed_profile, dtype=float).reshape(-1)
         ref = np.zeros((8, horizon + 1))
         ref_world = np.zeros((2, horizon + 1))
         plan_len = plan.shape[1]
@@ -579,7 +722,7 @@ class TrajectoryIBRPolicy(BasePolicy):
             x, y, psi = self.track.interpolate(s)
             ref[0, k] = s % self.track.total_length
             ref[1, k] = e
-            ref[2, k] = speed
+            ref[2, k] = speed_profile[min(k, speed_profile.size - 1)]
             ref[3, k] = psi
             ref[4, k] = x
             ref[5, k] = y
@@ -588,15 +731,28 @@ class TrajectoryIBRPolicy(BasePolicy):
             ref_world[:, k] = self.track.frenet_to_world(s, e)
         return ref, ref_world
 
-    def plan_against_neighbor(
+    def prepare_interaction_plan(
         self, own_state, own_s, own_e, neighbor_state, neighbor_s,
         neighbor_e, sim_time=None, neighbor_previous_control=None,
     ):
+        """Prepare and cache this policy's first action against one neighbor.
+
+        Both current simulator states are converted to Frenet coordinates.
+        The local solver internally produces a predicted plan for each car,
+        but only this policy's first command is cached and later executed.
+        The neighbor is not commanded by this call; it will prepare its own
+        action in the batch coordinator if it is also a trajectory-IBR policy.
+        """
         own_x0 = self._frenet_x0(own_state, own_s, own_e)
         neighbor_x0 = self._frenet_x0(neighbor_state, neighbor_s, neighbor_e)
-        own_speed = self._reference_speed(own_state, own_s)
-        neighbor_speed = self._reference_speed(neighbor_state, neighbor_s)
-        result = self.ibr_solver.solve_pair(
+        own_speed = self._reference_speed_profile(own_state, own_s)
+        neighbor_speed = self._reference_speed_profile(neighbor_state, neighbor_s)
+        # The historical implementation has only a scalar speed cap and no
+        # velocity-tracking term; keep its replay interface unchanged.
+        if self.implementation == "historical_strict":
+            own_speed = float(own_speed[0])
+            neighbor_speed = float(neighbor_speed[0])
+        result = self.ibr_solver.iterate_best_responses(
             neighbor_x0=neighbor_x0,
             own_x0=own_x0,
             neighbor_curvature=self._curvature_lookahead(neighbor_s, neighbor_state),
@@ -606,16 +762,15 @@ class TrajectoryIBRPolicy(BasePolicy):
             neighbor_previous_control=neighbor_previous_control,
             own_previous_control=self.last_u,
         )
-        self._accept_ibr_result(result, own_speed, sim_time)
+        self._cache_interaction_result(result, own_speed, sim_time)
         self._report_ibr_recovery(sim_time=sim_time)
 
-    def _accept_ibr_result(self, result, ref_speed, sim_time):
+    def _cache_interaction_result(self, result, ref_speed, sim_time):
+        """Store a successful direct-control plan in policy and trace state."""
         action = np.asarray(result["action"], dtype=float)
         action = np.clip(action, -1.0, 1.0)
-        self._ibr_cached_action = CarAction(throttle=float(action[0]), steer=float(action[1]))
-        self._ibr_cached_action_time = sim_time
-        self._ibr_action_valid_until = (sim_time if sim_time is not None else 0.0) + self.mpc.dt
-        self.last_u = np.array([self._ibr_cached_action.throttle, self._ibr_cached_action.steer])
+        self._last_ibr_action = CarAction(throttle=float(action[0]), steer=float(action[1]))
+        self.last_u = np.array([self._last_ibr_action.throttle, self._last_ibr_action.steer])
         self.mpc.last_solver_success = True
         self.mpc.last_solver_status = "Solve_Succeeded"
         self.mpc.last_recovery_active = False
@@ -638,76 +793,30 @@ class TrajectoryIBRPolicy(BasePolicy):
                 result["state_plan"], dtype=float
             ).copy()
 
-    def get_action(self, state: CarState, current_s: float, opponents=None, sim_time=None) -> CarAction:
-        # use cached IBR action if it is still valid for the current simulation time
-        if (
-            self._ibr_cached_action is not None
-            and sim_time is not None
-            and sim_time < self._ibr_action_valid_until - 1e-9
-        ):
-            self.last_ref_traj = self._ibr_cached_ref_traj if self._ibr_cached_ref_traj is not None else self.last_ref_traj
-            self.last_ref_world_horizon = (
-                self._ibr_cached_ref_world_horizon
-                if self._ibr_cached_ref_world_horizon is not None
-                else self.last_ref_world_horizon
+    def get_action(self, observation) -> CarAction:
+        """Solve the local two-car game from ``observation`` and return its first control."""
+        if self.car_idx is None:
+            raise ValueError("TrajectoryIBRPolicy requires car_idx when used with RaceObservation")
+        ego = observation.car(self.car_idx)
+        neighbor = observation.nearest_opponent(self.car_idx, self.track.total_length)
+        if neighbor is None:
+            return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
+        try:
+            self.prepare_interaction_plan(
+                own_state=ego.state,
+                own_s=ego.s,
+                own_e=ego.e,
+                neighbor_state=neighbor.state,
+                neighbor_s=neighbor.s,
+                neighbor_e=neighbor.e,
+                sim_time=observation.sim_time,
+                neighbor_previous_control=neighbor.previous_action,
             )
-            self.last_raceline_world_horizon = (
-                self._ibr_cached_raceline_world_horizon
-                if self._ibr_cached_raceline_world_horizon is not None
-                else self.last_raceline_world_horizon
-            )
-            return self._ibr_cached_action
-        return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
+        except Exception as exc:
+            self._report_ibr_failure(exc, sim_time=observation.sim_time)
+            return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
+        return self._last_ibr_action
 
 
 # Backward-compatible public name used by existing scripts and imports.
 IteratedBestResponsePolicy = TrajectoryIBRPolicy
-
-
-def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
-    """Choose the closest longitudinal neighbor for the two-player solver."""
-    best_idx = None
-    best_abs_delta = np.inf
-    for other_idx, _ in enumerate(states):
-        if other_idx == car_idx:
-            continue
-        delta = progress_delta(
-            car_s[other_idx], car_s[car_idx], policy.track.total_length
-        )
-        if abs(delta) < best_abs_delta:
-            best_idx = other_idx
-            best_abs_delta = abs(delta)
-    return best_idx
-
-
-def plan_trajectory_ibr_actions(policies, states, car_s, car_e, sim_time=None):
-    """Plan and cache one low-level action directly for every trajectory IBR policy."""
-    for idx, policy in enumerate(policies):
-        if not isinstance(policy, TrajectoryIBRPolicy):  # only plan for trajectory IBR policies
-            continue
-        if (
-            policy._ibr_cached_action is not None
-            and sim_time is not None
-            and sim_time < policy._ibr_action_valid_until - 1.0e-9
-        ):
-            continue
-
-        # For each IBR agent, find the nearest longitudinal neighbor and plan against it
-        neighbor_idx = _nearest_interaction_neighbor(policy, idx, car_s, states)
-        if neighbor_idx is None:
-            continue
-        try:
-            policy.plan_against_neighbor(
-                own_state=states[idx],
-                own_s=car_s[idx],
-                own_e=car_e[idx],
-                neighbor_state=states[neighbor_idx],
-                neighbor_s=car_s[neighbor_idx],
-                neighbor_e=car_e[neighbor_idx],
-                sim_time=sim_time,
-                neighbor_previous_control=getattr(
-                    policies[neighbor_idx], "last_u", None
-                ),
-            )
-        except Exception as exc:
-            policy._report_ibr_failure(exc, sim_time=sim_time)

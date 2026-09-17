@@ -1,3 +1,5 @@
+"""Inspect metadata and arrays stored in a simulation NPZ trace."""
+
 import argparse
 from pathlib import Path
 

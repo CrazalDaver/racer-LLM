@@ -6,8 +6,8 @@ experimental variable.  Ego starts before a curved section and approaches a
 stationary opponent on the centerline.
 
 Example:
-    python visualize_llm_modes.py
-    python visualize_llm_modes.py --track modena --duration 4 --save modes.png
+    python -m evaluation.visualize_llm_modes
+    python -m evaluation.visualize_llm_modes --track modena --duration 4 --save modes.png
 """
 
 import argparse
@@ -28,7 +28,8 @@ from matplotlib.colors import Normalize
 
 from config import duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
-from simulation import create_policy, create_vehicle_model, progress_delta, project_vehicle_state
+from simulation_core.observation import RaceObservation
+from simulation import create_policy, create_vehicle_model, progress_delta
 from state import CarState
 from track import Track, configure_track, load_centerline_csv, load_raceline_csv
 
@@ -117,7 +118,7 @@ def simulate_mode(
     vehicle_params = make_vehicle_params("kinematic")
     ego_mpc = make_mpc(track, vehicle_params, horizon)
     opponent_mpc = make_mpc(track, vehicle_params, horizon)
-    # Construct the policy through the same factory as simulation.run_simulation().
+    # Construct the policy through the same helper as simulation.run_simulation().
     policy = create_policy(
         "static_alpharacer",
         track,
@@ -140,7 +141,7 @@ def simulate_mode(
     )
     opponent_policy.current_mode = "raceline_baseline"
     opponent_policy.log_fn = lambda _message: None
-    # Construct the vehicle through the same factory as run_simulation().
+    # Construct the vehicle through the same helper as run_simulation().
     ego_model = create_vehicle_model(
         "kinematic", params.SIM_DT, vehicle_params, params.MAX_STATE_SPEED
     )
@@ -170,52 +171,31 @@ def simulate_mode(
     action = None
     opponent_action = None
     for step in range(total_steps + 1):
-        progress_s, lateral_e = project_vehicle_state(
-            track,
-            state,
-            progress_s,
-            params.PROJECTION_SEARCH_RADIUS,
-            params.PROJECTION_MAX_HEADING_ERROR,
+        progress_s, lateral_e = track.project(
+            state.x,
+            state.y,
+            s_hint=progress_s,
+            search_radius=params.PROJECTION_SEARCH_RADIUS,
+            psi_hint=state.psi,
+            max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
         )
-        opponent_progress_s, opponent_e = project_vehicle_state(
-            track,
-            opponent_state,
-            opponent_progress_s,
-            params.PROJECTION_SEARCH_RADIUS,
-            params.PROJECTION_MAX_HEADING_ERROR,
+        opponent_progress_s, opponent_e = track.project(
+            opponent_state.x,
+            opponent_state.y,
+            s_hint=opponent_progress_s,
+            search_radius=params.PROJECTION_SEARCH_RADIUS,
+            psi_hint=opponent_state.psi,
+            max_heading_error=params.PROJECTION_MAX_HEADING_ERROR,
         )
-        opponent_for_ego = [{
-            "car_idx": 1,
-            "px": opponent_progress_s,
-            "py": opponent_e,
-            "vx": max(opponent_state.vx, 0.0),
-            "vy": opponent_state.vy,
-            "omega": opponent_state.omega,
-            "psi": opponent_state.psi,
-            "state": opponent_state,
-        }]
-        ego_for_opponent = [{
-            "car_idx": 0,
-            "px": progress_s,
-            "py": lateral_e,
-            "vx": max(state.vx, 0.0),
-            "vy": state.vy,
-            "omega": state.omega,
-            "psi": state.psi,
-            "state": state,
-        }]
         if step % control_steps == 0:
             sim_time = step * params.SIM_DT
-            action = policy.get_action(
-                state, progress_s, opponents=opponent_for_ego, sim_time=sim_time
+            obs = RaceObservation.observe(
+                [policy, opponent_policy], [state, opponent_state],
+                [progress_s, opponent_progress_s], [lateral_e, opponent_e], sim_time,
             )
+            action = policy.get_action(obs)
             if not stationary_opponent:
-                opponent_action = opponent_policy.get_action(
-                    opponent_state,
-                    opponent_progress_s,
-                    opponents=ego_for_opponent,
-                    sim_time=sim_time,
-                )
+                opponent_action = opponent_policy.get_action(obs)
         ref_world = policy.last_ref_world_horizon
         if ref_world is None:
             ref_x = np.full(horizon + 1, np.nan)

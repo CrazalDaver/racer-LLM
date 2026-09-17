@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 from collision import oriented_rectangle_overlap_cost
 from config import params
 from simulation import run_simulation
+from simulation_core.config import SimulationConfig
 from state import CarState
 from track import Track, configure_track, load_centerline_csv
 
@@ -211,8 +212,6 @@ def run_audit(args) -> tuple[list[Scenario], list[dict]]:
 
     # This audit must expose failures rather than allowing a supervisor to
     # repair them after the selected preset has acted.
-    params.DEADLOCK_RESET_ENABLED = False
-    params.LOW_SPEED_BOUNDARY_RECOVERY_ENABLED = False
 
     stable = np.asarray(params.LLM_MODE_PRESETS["stable"], dtype=float)
     rows = []
@@ -229,24 +228,24 @@ def run_audit(args) -> tuple[list[Scenario], list[dict]]:
                 [np.asarray(params.LLM_MODE_PRESETS[mode], dtype=float)]
                 + [stable] * (car_count - 1)
             )
-            trace = run_simulation(
+            trace = run_simulation(SimulationConfig(
                 track_name=args.track,
+                raceline=args.raceline_csv,
                 save_trace=False,
                 show_plot=False,
-                num_cars=car_count,
-                policy_names=["static"] * car_count,
-                static_policy_params_per_car=per_car_params,
+                policies=["static_alpharacer"] * car_count,
+                static_params_by_car=per_car_params,
                 ego_position=1,
                 start_gap=args.start_gap,
-                initial_longitudinal_offsets=initial_offsets,
-                initial_lateral_offsets=np.asarray(scenario.e, dtype=float),
-                initial_speeds=np.asarray(scenario.speed, dtype=float),
-                total_time=args.rollout_seconds,
-                horizon=args.mpc_horizon,
-                velocity_track_weight=args.velocity_track_weight,
-                track_slack_weight=args.track_slack_weight,
+                start_s_offsets=initial_offsets,
+                start_e_offsets=np.asarray(scenario.e, dtype=float),
+                start_speeds=np.asarray(scenario.speed, dtype=float),
+                duration=args.rollout_seconds,
+                mpc_horizon=args.mpc_horizon,
+                mpc_velocity_weight=args.velocity_track_weight,
+                mpc_track_slack=args.track_slack_weight,
                 quiet=True,
-            )
+            ))
             rows.append(summarize_rollout(trace, scenario, mode))
     return scenarios, rows
 
@@ -320,6 +319,11 @@ def write_outputs(args, scenarios: list[Scenario], rows: list[dict]):
             "estimate globally optimal five-parameter values."
         ),
         "track": args.track,
+        "raceline_csv": (
+            str(args.raceline_csv)
+            if args.raceline_csv is not None
+            else params.RACELINE_CSV
+        ),
         "rollout_seconds": args.rollout_seconds,
         "mpc_horizon": args.mpc_horizon,
         "velocity_track_weight": args.velocity_track_weight,
@@ -366,6 +370,13 @@ Example
     parser.add_argument(
         "--rollout-seconds", type=float, default=3.0,
         help="Duration of each fixed-mode branch (default: 3 s).",
+    )
+    parser.add_argument(
+        "--raceline-csv", type=Path, default=None,
+        help=(
+            "Override the registered raceline for this audit without changing "
+            "track.py; the selected path is recorded in summary.json."
+        ),
     )
     parser.add_argument(
         "--scenario", action="append", default=None,

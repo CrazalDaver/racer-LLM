@@ -1,5 +1,14 @@
 __pycache__/
 *.py[cod]
+.DS_Store
+
+# Manuscripts, rendered figures, reports, and local experiment logs.
+*.tex
+*.pdf
+*.html
+*.log
+LLM-racer-experiment record*/
+logs/
 
 .idea/
 Figure_*.png
@@ -21,8 +30,11 @@ result/
 # Local manuscript reminders; intentionally not part of the repository.
 PAPER_NOTES.local.md
 EXPERIMENT_TODO.local.md
+PLATFORM_CODE_MAP.local.md
 MPC_STALL_INVESTIGATION.local.md
 PHYSICS_IMPLEMENTATION_DIFFERENCES.local.md
+REFERENCES.local.md
+*.local.json
 
 # Unity replay generated files (keep unity/Assets, Packages, ProjectSettings).
 unity/Library/

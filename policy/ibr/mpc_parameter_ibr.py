@@ -3,11 +3,8 @@
 import numpy as np
 
 from config import params as sim_params
-from state import CarState
-
 from ..alpha_network import ALPHA_PARAMETER_BOUNDS
 from ..mpc import MPCPolicy
-from ..utils import progress_delta
 
 
 class ParameterIBRPolicy(MPCPolicy):
@@ -19,9 +16,9 @@ class ParameterIBRPolicy(MPCPolicy):
     the same raceline-reference MPC used by alpha-RACER and the LLM policies.
     Candidates are compared with the same local racing objective as trajectory
     IBR: progress, centerline-relative lateral error, control-rate regularization,
-    and the MPC's existing track/collision slack costs.  This outer score is
-    independent of the MPC's tunable tracking weight, so candidates with
-    different ``q`` remain comparable.
+    reference-speed tracking, and the MPC's existing track/collision slack
+    costs. The positional MPC tracking term remains excluded so candidates
+    with different ``q`` remain comparable.
     """
 
     ibr_level = "parameter"
@@ -82,7 +79,8 @@ class ParameterIBRPolicy(MPCPolicy):
             opponents=opponents,
             current_s=current_s,
         )
-        frenet_plan = np.asarray(self.mpc.last_state_plan, dtype=float)[:2].copy()
+        state_plan = np.asarray(self.mpc.last_state_plan, dtype=float)
+        frenet_plan = state_plan[:2].copy()
         control_plan = np.asarray(self.mpc.last_control_plan, dtype=float).copy()
         predicted_progress = float(frenet_plan[0, -1] - frenet_plan[0, 0])
         lateral_cost = sim_params.IBR_LATERAL_WEIGHT * float(
@@ -97,6 +95,9 @@ class ParameterIBRPolicy(MPCPolicy):
         control_rate_cost = sim_params.IBR_CONTROL_RATE_WEIGHT * float(
             np.sum(np.square(np.diff(previous_and_plan, axis=1)))
         )
+        velocity_cost = self.mpc.velocity_track_weight * float(
+            np.sum(np.square(state_plan[3, :-1] - ref_traj[2, :-1]))
+        )
         track_slack_cost = self.mpc.track_slack_weight * float(
             np.sum(np.square(self.mpc.last_track_slack_plan))
         )
@@ -109,6 +110,7 @@ class ParameterIBRPolicy(MPCPolicy):
         score = (
             progress_reward
             - lateral_cost
+            - velocity_cost
             - control_rate_cost
             - track_slack_cost
             - collision_slack_cost
@@ -117,6 +119,7 @@ class ParameterIBRPolicy(MPCPolicy):
             "predicted_progress": predicted_progress,
             "progress_reward": progress_reward,
             "lateral_cost": lateral_cost,
+            "velocity_cost": velocity_cost,
             "control_rate_cost": control_rate_cost,
             "track_slack_cost": track_slack_cost,
             "collision_slack_cost": collision_slack_cost,
@@ -204,188 +207,80 @@ class ParameterIBRPolicy(MPCPolicy):
         }
         return best.copy(), best_plan.copy()
 
+    def _initial_plan(self, car):
+        plan = np.zeros((2, self.mpc.horizon + 1), dtype=float)
+        plan[0, 0] = car.s
+        plan[1, :] = car.e
+        for k in range(self.mpc.horizon):
+            plan[0, k + 1] = plan[0, k] + max(float(car.state.vx), 0.0) * self.mpc.dt
+        return plan
 
-def _constant_velocity_frenet_plan(model_policy, state, current_s, current_e):
-    """Initialize one player's internal plan before the first BR update."""
-    horizon = model_policy.mpc.horizon
-    plan = np.zeros((2, horizon + 1), dtype=float)
-    plan[0, 0] = float(current_s)
-    plan[1, :] = float(current_e)
-    for k in range(horizon):
-        plan[0, k + 1] = (
-            plan[0, k] + max(float(state.vx), 0.0) * model_policy.mpc.dt
-        )
-    return plan
-
-
-def _nearest_interaction_neighbor(policy, car_idx, car_s, states):
-    """Match trajectory IBR by selecting one nearest longitudinal neighbor."""
-    best_idx = None
-    best_abs_delta = np.inf
-    for other_idx, _ in enumerate(states):
-        if other_idx == car_idx:
-            continue
-        delta = progress_delta(
-            car_s[other_idx], car_s[car_idx], policy.track.total_length
-        )
-        if abs(delta) < best_abs_delta:
-            best_idx = other_idx
-            best_abs_delta = abs(delta)
-    return best_idx
-
-
-def _parameter_ibr_opponent(other_idx, states, car_s, car_e, plan):
-    """Build the shared-MPC record for one modeled interaction neighbor."""
-    state = states[other_idx]
-    return {
-        "car_idx": other_idx,
-        "px": float(car_s[other_idx]),
-        "py": float(car_e[other_idx]),
-        "vx": max(float(state.vx), 0.0),
-        "vy": float(state.vy),
-        "omega": float(state.omega),
-        "psi": float(state.psi),
-        "state": state,
-        "px_plan": plan[0].copy(),
-        "py_plan": plan[1].copy(),
-    }
-
-
-def plan_parameter_ibr_policy_params(policies, states, car_s, car_e, sim_time=None):
-    """Run one local two-player parameter-space IBR game per controlled car.
-
-    Each controlled car selects its nearest longitudinal neighbor and uses its
-    own :class:`ParameterIBRPolicy` model to alternate the neighbor's
-    hypothetical best response and then its own.  The real neighbor policy is
-    never invoked.  This mirrors the two-player structure used by the local
-    Wang-style trajectory IBR; constant velocity only initializes the game.
-
-    The hypothetical neighbor update remains local.  Only the controlled
-    vehicle receives the final optimized parameters and plan.
-    """
-    controlled_indices = [
-        idx for idx, policy in enumerate(policies)
-        if isinstance(policy, ParameterIBRPolicy) and policy.update_due(sim_time)
-    ]
-    if not controlled_indices:
-        return
-
-    results = {}
-    for ego_idx in controlled_indices:
-        model_policy = policies[ego_idx]
-        neighbor_idx = _nearest_interaction_neighbor(
-            model_policy, ego_idx, car_s, states
-        )
-        if neighbor_idx is None:
-            continue
-
-        bounds = np.asarray(model_policy.PARAM_BOUNDS, dtype=float)
+    def _update_from_observation(self, observation):
+        """Run this car's private two-player parameter BR from a frozen scene."""
+        ego = observation.car(self.car_idx)
+        neighbor = observation.nearest_opponent(self.car_idx, self.track.total_length)
+        if neighbor is None:
+            return
+        bounds = np.asarray(self.PARAM_BOUNDS, dtype=float)
         spans = np.maximum(bounds[:, 1] - bounds[:, 0], 1.0e-12)
-        pair = (ego_idx, neighbor_idx)
-        modeled_params = {}
-        previous_controls = {}
-        plans = {}
-        for idx in pair:
-            real_policy = policies[idx]
-            params = np.asarray(
-                getattr(real_policy, "params", sim_params.ALPHARACER_INITIAL_PARAMS),
-                dtype=float,
-            )
-            if params.shape != (5,):
-                params = np.asarray(
-                    sim_params.ALPHARACER_INITIAL_PARAMS, dtype=float
-                )
-            modeled_params[idx] = np.clip(
-                params, bounds[:, 0], bounds[:, 1]
-            ).copy()
-
-            previous_u = getattr(real_policy, "last_feasible_u", None)
-            if previous_u is None:
-                previous_u = getattr(
-                    real_policy, "last_u", model_policy.last_feasible_u
-                )
-            previous_u = np.asarray(previous_u, dtype=float)
-            if previous_u.shape != (2,):
-                previous_u = np.asarray(model_policy.last_feasible_u, dtype=float)
-            previous_controls[idx] = previous_u.copy()
-
-            cached = getattr(real_policy, "predicted_frenet_plan", None)
-            expected_length = model_policy.mpc.horizon + 1
-            if cached is not None and cached.shape == (2, expected_length):
+        pair = (ego, neighbor)
+        modeled_params, previous_controls, plans = {}, {}, {}
+        for car in pair:
+            theta = car.policy_params
+            if theta is None or theta.shape != (5,):
+                theta = sim_params.ALPHARACER_INITIAL_PARAMS
+            modeled_params[car.car_idx] = np.clip(theta, bounds[:, 0], bounds[:, 1]).copy()
+            previous = car.previous_feasible_action
+            if previous is None or previous.shape != (2,):
+                previous = car.previous_action
+            previous_controls[car.car_idx] = np.asarray(previous, dtype=float).copy()
+            cached = car.predicted_frenet_plan
+            if cached is not None and cached.shape == (2, self.mpc.horizon + 1):
                 plan = np.asarray(cached, dtype=float).copy()
-                plan[0] += float(car_s[idx]) - plan[0, 0]
-                plan[1] += float(car_e[idx]) - plan[1, 0]
+                plan[0] += car.s - plan[0, 0]
+                plan[1] += car.e - plan[1, 0]
             else:
-                plan = _constant_velocity_frenet_plan(
-                    model_policy, states[idx], car_s[idx], car_e[idx]
-                )
-            plans[idx] = plan
+                plan = self._initial_plan(car)
+            plans[car.car_idx] = plan
 
-        saved_model_state = (
-            model_policy.params.copy(),
-            model_policy.last_feasible_u.copy(),
-            model_policy.predicted_frenet_plan,
-            model_policy.last_parameter_ibr_score,
-            model_policy.last_parameter_ibr_diagnostics,
-        )
+        saved = (self.params.copy(), self.last_feasible_u.copy(), self.predicted_frenet_plan,
+                 self.last_parameter_ibr_score, self.last_parameter_ibr_diagnostics)
         try:
-            rounds = max(1, int(sim_params.PARAMETER_IBR_ROUNDS))
-            for _ in range(rounds):
+            for _ in range(max(1, int(sim_params.PARAMETER_IBR_ROUNDS))):
                 max_change = 0.0
-                # The ego's own BR is deliberately last, so the committed plan
-                # responds to the neighbor prediction from this same round.
-                for idx, other_idx in (
-                    (neighbor_idx, ego_idx),
-                    (ego_idx, neighbor_idx),
-                ):
-                    previous = modeled_params[idx].copy()
-                    model_policy.params = previous.copy()
-                    model_policy.last_feasible_u = previous_controls[idx].copy()
-                    opponent = _parameter_ibr_opponent(
-                        other_idx, states, car_s, car_e, plans[other_idx]
-                    )
-                    params_opt, plan_opt = model_policy.best_response(
-                        states[idx], car_s[idx], [opponent]
-                    )
-                    modeled_params[idx] = params_opt
-                    plans[idx] = plan_opt
-                    max_change = max(
-                        max_change,
-                        float(np.max(np.abs(params_opt - previous) / spans)),
-                    )
-                if max_change <= model_policy.convergence_tolerance:
+                for car, other in ((neighbor, ego), (ego, neighbor)):
+                    previous = modeled_params[car.car_idx].copy()
+                    self.params = previous.copy()
+                    self.last_feasible_u = previous_controls[car.car_idx].copy()
+                    other_plan = plans[other.car_idx]
+                    opponent = {
+                        "car_idx": other.car_idx, "px": other.s, "py": other.e,
+                        "vx": max(float(other.state.vx), 0.0), "vy": float(other.state.vy),
+                        "omega": float(other.state.omega), "psi": float(other.state.psi),
+                        "state": other.state, "px_plan": other_plan[0].copy(),
+                        "py_plan": other_plan[1].copy(),
+                    }
+                    theta, plan = self.best_response(car.state, car.s, [opponent])
+                    modeled_params[car.car_idx], plans[car.car_idx] = theta, plan
+                    max_change = max(max_change, float(np.max(np.abs(theta - previous) / spans)))
+                if max_change <= self.convergence_tolerance:
                     break
-
-            diagnostics = {
-                key: value.copy() if isinstance(value, np.ndarray) else value
-                for key, value in model_policy.last_parameter_ibr_diagnostics.items()
-            }
-            results[ego_idx] = (
-                modeled_params[ego_idx].copy(),
-                plans[ego_idx].copy(),
-                float(model_policy.last_parameter_ibr_score),
-                diagnostics,
-                neighbor_idx,
-            )
+            diagnostics = {key: value.copy() if isinstance(value, np.ndarray) else value
+                           for key, value in self.last_parameter_ibr_diagnostics.items()}
+            result = (modeled_params[ego.car_idx].copy(), plans[ego.car_idx].copy(),
+                      float(self.last_parameter_ibr_score), diagnostics)
         finally:
-            (
-                model_policy.params,
-                model_policy.last_feasible_u,
-                model_policy.predicted_frenet_plan,
-                model_policy.last_parameter_ibr_score,
-                model_policy.last_parameter_ibr_diagnostics,
-            ) = saved_model_state
+            (self.params, self.last_feasible_u, self.predicted_frenet_plan,
+             self.last_parameter_ibr_score, self.last_parameter_ibr_diagnostics) = saved
+        self.params, self.predicted_frenet_plan, self.last_parameter_ibr_score, diagnostics = result
+        self.last_parameter_ibr_diagnostics = {**diagnostics,
+            "opponent_model": "own_parameter_best_response", "modeled_player_count": 2,
+            "interaction_neighbor_idx": neighbor.car_idx}
+        self.last_parameter_ibr_update_time = observation.sim_time
 
-    for ego_idx, result in results.items():
-        policy = policies[ego_idx]
-        params_opt, plan_opt, score, diagnostics, neighbor_idx = result
-        policy.params = params_opt
-        policy.predicted_frenet_plan = plan_opt
-        policy.last_parameter_ibr_score = score
-        policy.last_parameter_ibr_diagnostics = {
-            **diagnostics,
-            "opponent_model": "own_parameter_best_response",
-            "modeled_player_count": 2,
-            "interaction_neighbor_idx": neighbor_idx,
-        }
-        policy.last_parameter_ibr_update_time = sim_time
+    def get_action(self, observation):
+        if self.car_idx is None:
+            raise ValueError("ParameterIBRPolicy requires car_idx when used with RaceObservation")
+        if self.update_due(observation.sim_time):
+            self._update_from_observation(observation)
+        return super().get_action(observation)

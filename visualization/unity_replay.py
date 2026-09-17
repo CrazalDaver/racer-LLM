@@ -4,9 +4,9 @@ The script converts an NPZ (or an embedded JSON trial) to a replay file,
 launches Unity, captures frames, and produces a GIF or MP4.
 
 Examples:
-    python unity_replay.py simulation_trace.npz
-    python unity_replay.py result/position_sweep_summary.json --trial 2
-    python unity_replay.py simulation_trace.npz --unity-build /path/to/env-v0.app
+    python -m visualization.unity_replay simulation_trace.npz
+    python -m visualization.unity_replay result/position_sweep_summary.json --trial 2
+    python -m visualization.unity_replay simulation_trace.npz --unity-build /path/to/env-v0.app
 """
 
 from __future__ import annotations
@@ -26,7 +26,9 @@ import numpy as np
 REQUIRED_FIELDS = ("time", "car_x", "car_y", "car_psi")
 ACTION_FIELDS_PER_CAR = 3
 DEFAULT_CAR_COUNT = 3
-DEFAULT_UNITY_BUILD = Path(__file__).resolve().parent / "unity_build" / "AlphaRacerReplay.app"
+DEFAULT_UNITY_BUILD = (
+    Path(__file__).resolve().parents[1] / "unity_build" / "AlphaRacerReplay.app"
+)
 
 
 @dataclass

@@ -1,4 +1,3 @@
-import math
 from pathlib import Path
 
 import numpy as np
@@ -8,15 +7,12 @@ try:
 except ImportError:
     torch = None
 
-from state import CarState
-
 from .alpha_network import (
     ALPHA_PARAMETER_BOUNDS,
     SimpleNeuralNetwork,
     build_alpha_input,
 )
 from .mpc import MPCPolicy
-from .utils import progress_delta
 
 class AlphaRacerPolicy(MPCPolicy):
     """
@@ -94,42 +90,10 @@ class AlphaRacerPolicy(MPCPolicy):
         self.joint_params = np.repeat(self.opponent_default_params[None, :], 3, axis=0)
         if self.car_idx is not None and 0 <= self.car_idx < 3:
             self.joint_params[self.car_idx] = self.params
-        self._warned_missing_opponents = False
         # This is this agent's own estimate of the joint policy parameters.
         # It is deliberately not shared with other AlphaRacerPolicy instances:
         # each agent solves the paper's online potential maximization from its
         # own model/view and executes only its own five-parameter block.
-        self._joint_plan_ready = False
-    
-    def _ordered_cars(self, state: CarState, current_s: float, opponents):
-        cars = [
-            {
-                "px": current_s,
-                "py": self.track.project(
-                    state.x,
-                    state.y,
-                    s_hint=current_s,
-                    search_radius=8.0,
-                    psi_hint=state.psi,
-                    max_heading_error=math.pi / 2.0,
-                )[1],
-                "vx": state.vx,
-                "vy": state.vy,
-                "omega": state.omega,
-                "psi": state.psi,
-                "state": state,
-            }
-        ]
-        for opponent in opponents or []:
-            cars.append(dict(opponent))
-
-        if len(cars) < 3:
-            if not self._warned_missing_opponents:
-                self._log(f"[potential-function policy][{self.warning_label}] expected 3 cars; padding missing opponents.")
-                self._warned_missing_opponents = True
-            while len(cars) < 3:
-                cars.append({"px": current_s, "py": 0.0, "vx": 0.0, "vy": 0.0, "omega": 0.0, "psi": state.psi})
-        return cars[:3]
 
     def _build_joint_input(self, cars, joint_params):
         """Build the canonical 39-D input without reordering vehicle roles."""
@@ -193,55 +157,26 @@ class AlphaRacerPolicy(MPCPolicy):
         theta = lower + xi.detach()[0] * span
         return theta.cpu().numpy().reshape(3, 5)
 
-    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
-        if self._joint_plan_ready:  # cache
-            self._joint_plan_ready = False
-        else:
-            # Standalone use (outside simulation.py): still optimize the full
-            # joint theta.  Here the policy is role 0 and opponent blocks are
-            # private latent estimates; only role 0 is executed.
-            cars = self._ordered_cars(state, current_s, opponents or [])
-            local_joint = np.repeat(
-                self.opponent_default_params[None, :], 3, axis=0
+    def get_action(self, observation):
+        """Optimize private joint theta from the frozen global car ordering, then MPC."""
+        if self.car_idx is None or self.car_idx >= 3:
+            raise ValueError("AlphaRacerPolicy supports the three-car RaceObservation ordering")
+        cars = []
+        for car in observation.cars[:3]:
+            cars.append(
+                {
+                    "px": car.s,
+                    "py": car.e,
+                    "vx": car.state.vx,
+                    "vy": car.state.vy,
+                    "omega": car.state.omega,
+                    "psi": car.state.psi,
+                    "state": car.state,
+                }
             )
-            local_joint[0] = self.params
-            local_joint = self._maximize_joint_params(cars, local_joint)
-            self.params = local_joint[0].copy()
-        return super().get_reference_trajectory(state, current_s, opponents=opponents)
-
-
-def plan_alpharacer_policy_params(policies, states, car_s, car_e):
-    """Run the paper's online alpha-RACER update independently for each agent.
-
-    Every AlphaRacerPolicy maximizes its own learned potential over the full
-    joint theta, retains that private joint estimate, and executes only the
-    five-parameter block belonging to its vehicle.  The low-level MPC remains
-    a separate per-vehicle optimization, as in equations (1a)-(1h).
-    """
-    alpha_indices = [idx for idx, policy in enumerate(policies) if isinstance(policy, AlphaRacerPolicy)]
-    if not alpha_indices:
-        return
-
-    cars = [
-        {
-            "px": float(car_s[idx]),
-            "py": float(car_e[idx]),
-            "vx": float(states[idx].vx),
-            "vy": float(states[idx].vy),
-            "omega": float(states[idx].omega),
-            "psi": float(states[idx].psi),
-            "state": states[idx],
-        }
-        for idx in range(min(len(states), 3))
-    ]
-    if not cars:
-        return
-
-    for idx in alpha_indices:
-        if idx >= 3:
-            continue
-        policy = policies[idx]
-        joint = policy._maximize_joint_params(cars, policy.joint_params)
-        policy.joint_params = joint.copy()
-        policy.params = joint[idx].copy()
-        policy._joint_plan_ready = True
+        if len(cars) < 3:
+            raise ValueError("AlphaRacerPolicy requires a three-car RaceObservation")
+        joint = self._maximize_joint_params(cars, self.joint_params)
+        self.joint_params = joint.copy()
+        self.params = joint[self.car_idx].copy()
+        return super().get_action(observation)

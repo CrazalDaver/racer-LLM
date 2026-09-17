@@ -1,3 +1,5 @@
+"""Plot saved traces and in-memory simulation results."""
+
 import argparse
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +27,7 @@ def _string_list(value):
     return [str(item) for item in array.tolist()]
 
 
-def _time_step(time, fallback=0.02):
+def _time_step(time, fallback=0.1):
     if len(time) < 2:
         return fallback
     return float(np.median(np.diff(time)))
