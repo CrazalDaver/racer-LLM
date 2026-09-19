@@ -1,0 +1,122 @@
+{
+  "ego": {
+    "lap_progress_percent": 6.7,
+    "lateral_position": {
+      "percent_of_half_width": 0.0,
+      "side": "center"
+    },
+    "speed_percent_of_maximum": 40.0
+  },
+  "memory": {
+    "previous_mode": "stable",
+    "recent_modes_oldest_to_newest": []
+  },
+  "road_preview": {
+    "preview_length_meters": 8.0,
+    "samples_near_to_far": [
+      {
+        "centerline_curvature": {
+          "direction": "right",
+          "magnitude_per_meter": 0.03
+        },
+        "centerline_turn_from_current": {
+          "degrees": 0.0,
+          "direction": "straight"
+        },
+        "distance_ahead_meters": 0.0,
+        "raceline_offset_from_centerline": {
+          "percent_of_half_width": 59.0,
+          "side": "right"
+        }
+      },
+      {
+        "centerline_curvature": {
+          "direction": "right",
+          "magnitude_per_meter": 0.016
+        },
+        "centerline_turn_from_current": {
+          "degrees": 3.7,
+          "direction": "right"
+        },
+        "distance_ahead_meters": 2.0,
+        "raceline_offset_from_centerline": {
+          "percent_of_half_width": 74.0,
+          "side": "right"
+        }
+      },
+      {
+        "centerline_curvature": {
+          "direction": "right",
+          "magnitude_per_meter": 0.033
+        },
+        "centerline_turn_from_current": {
+          "degrees": 6.8,
+          "direction": "right"
+        },
+        "distance_ahead_meters": 4.0,
+        "raceline_offset_from_centerline": {
+          "percent_of_half_width": 82.6,
+          "side": "right"
+        }
+      },
+      {
+        "centerline_curvature": {
+          "direction": "right",
+          "magnitude_per_meter": 0.027
+        },
+        "centerline_turn_from_current": {
+          "degrees": 10.7,
+          "direction": "right"
+        },
+        "distance_ahead_meters": 6.0,
+        "raceline_offset_from_centerline": {
+          "percent_of_half_width": 83.4,
+          "side": "right"
+        }
+      },
+      {
+        "centerline_curvature": {
+          "direction": "straight",
+          "magnitude_per_meter": 0.0
+        },
+        "centerline_turn_from_current": {
+          "degrees": 11.4,
+          "direction": "right"
+        },
+        "distance_ahead_meters": 8.0,
+        "raceline_offset_from_centerline": {
+          "percent_of_half_width": 82.8,
+          "side": "right"
+        }
+      }
+    ]
+  },
+  "traffic": {
+    "front": {
+      "gap_motion": {
+        "speed_meters_per_second": 0.15,
+        "trend": "closing"
+      },
+      "id": 1,
+      "lateral_offset_from_ego": {
+        "percent_of_half_width": 22.7,
+        "side": "left"
+      },
+      "longitudinal_gap_meters": 2.0,
+      "ttc_seconds": 13.33
+    },
+    "rear": {
+      "gap_motion": {
+        "speed_meters_per_second": 0.25,
+        "trend": "closing"
+      },
+      "id": 2,
+      "lateral_offset_from_ego": {
+        "percent_of_half_width": 22.7,
+        "side": "right"
+      },
+      "longitudinal_gap_meters": 2.0,
+      "ttc_seconds": 8.0
+    }
+  }
+}

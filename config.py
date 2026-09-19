@@ -264,6 +264,9 @@ class SimParams:
     # memory.recent_modes_oldest_to_newest.
     LLM_RECENT_MODES_MAX_LENGTH = 1
     LLM_OUTPUT_MODE = "auto" # "auto" infers from LLM_MODEL; use "mode" or "params" to force a style
+    # Observation-only tolerance for longitudinal relative speed. Values inside
+    # this band are reported as a constant gap and never produce a closure time.
+    LLM_RELATIVE_SPEED_DEADBAND_MPS = 0.1
     # LLM scene classification uses a small buffer around the MPC collision
     # envelope so millimetre-scale threshold crossings do not imply clear road.
     LLM_CRITICAL_DISTANCE = 1.0

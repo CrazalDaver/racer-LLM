@@ -124,8 +124,12 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         if value is None or not np.isfinite(value):
             return None
         value = float(value)
-        side = "left" if value > 0.0 else "right" if value < 0.0 else "center"
-        return {"side": side, magnitude_name: cls._rounded(abs(value), digits)}
+        magnitude = cls._rounded(abs(value), digits)
+        if magnitude == 0.0:
+            side = "center"
+        else:
+            side = "left" if value > 0.0 else "right"
+        return {"side": side, magnitude_name: magnitude}
 
     @classmethod
     def _turn_and_magnitude(cls, value, magnitude_name, digits=1):
@@ -133,14 +137,28 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         if value is None or not np.isfinite(value):
             return None
         value = float(value)
-        direction = "left" if value > 0.0 else "right" if value < 0.0 else "straight"
-        return {"direction": direction, magnitude_name: cls._rounded(abs(value), digits)}
+        magnitude = cls._rounded(abs(value), digits)
+        if magnitude == 0.0:
+            direction = "straight"
+        else:
+            direction = "left" if value > 0.0 else "right"
+        return {"direction": direction, magnitude_name: magnitude}
+
+    @staticmethod
+    def _gap_speed_is_constant(closing_speed):
+        deadband = float(sim_params.LLM_RELATIVE_SPEED_DEADBAND_MPS)
+        return abs(float(closing_speed)) <= deadband + 1.0e-12
 
     @classmethod
     def _gap_motion(cls, closing_speed):
         """Describe whether a longitudinal gap is shrinking or growing."""
         value = float(closing_speed)
-        trend = "closing" if value > 0.0 else "opening" if value < 0.0 else "constant"
+        if cls._gap_speed_is_constant(value):
+            trend = "constant"
+        elif value > 0.0:
+            trend = "closing"
+        else:
+            trend = "opening"
         return {
             "trend": trend,
             "speed_meters_per_second": cls._rounded(abs(value), digits=2),
@@ -222,7 +240,8 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             closing_speed = opponent_speed - ego_speed
         ttc_seconds = (
             self._rounded(abs_delta_s / closing_speed, digits=2)
-            if closing_speed > 0.1
+            if closing_speed > 0.0
+            and not self._gap_speed_is_constant(closing_speed)
             else None
         )
 

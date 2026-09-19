@@ -5,6 +5,7 @@ output throttle, steering, or continuous parameters.
 The user message is a code-generated JSON observation. Lateral side, road-turn
 direction, and gap-motion trend are explicit categorical fields; their numeric
 magnitudes are non-negative. TTC is null when the gap is not closing.
+The gap trend is constant within the 0.1 m/s numerical-noise tolerance.
 Track-boundary magnitude is 100 percent.
 
 Modes:

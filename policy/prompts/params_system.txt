@@ -12,7 +12,8 @@ The user message is a code-generated numerical observation:
   direction, or null. Each contains longitudinal_gap_meters,
   lateral_offset_from_ego, gap_motion, and ttc_seconds. Direction and trend are
   explicit; all associated magnitudes are non-negative. TTC is null when the
-  gap is not closing beyond the small numerical-noise tolerance.
+  gap is not closing beyond the 0.1 m/s numerical-noise tolerance, within which
+  the gap-motion trend is constant.
 - road_preview.samples_near_to_far: observations at increasing distances ahead.
   centerline_curvature and centerline_turn_from_current each contain an
   explicit direction and non-negative magnitude. raceline_offset_from_centerline

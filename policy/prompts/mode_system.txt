@@ -16,7 +16,8 @@ The user message is a code-generated JSON observation:
 - lateral_offset_from_ego: the opponent's side relative to ego and the
   non-negative percent_of_half_width offset.
 - gap_motion: whether the longitudinal gap is closing, opening, or constant,
-  together with the non-negative speed_meters_per_second magnitude.
+  together with the non-negative speed_meters_per_second magnitude. Constant
+  means the magnitude is within the 0.1 m/s numerical-noise tolerance.
 - ttc_seconds: estimated time until the gap closes when closing speed exceeds
   the small numerical-noise tolerance; otherwise null.
 - road_preview.samples_near_to_far: observations at increasing distances ahead.
