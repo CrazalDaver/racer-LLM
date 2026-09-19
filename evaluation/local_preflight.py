@@ -154,28 +154,11 @@ def run_observation_checks():
 
 def run_observation_snapshot_check():
     """Compare one deterministic three-car LLM scene with its reviewed JSON."""
-    race = Race(SimulationConfig(
-        policies=("llm_alpharacer", "static_alpharacer", "static_alpharacer"),
-        duration=0.1,
-        track_name="berlin",
-        ego_position=1,
-        start_gap=0.8,
-        # These offsets place the cars at s=(10, 12, 8) metres after the
-        # ordinary starting-rank displacement has been applied.
-        start_s_offsets=(10.0, 12.8, 9.6),
-        start_e_offsets=(0.0, 0.1, -0.1),
-        start_speeds=(2.0, 1.85, 2.25),
-        save_trace=False,
-        show_plot=False,
-        quiet=True,
-    ))
-    race.environment.begin_step(0)
-    observation = race.environment.capture(race.policies)
-    ego = observation.car(race.ego_idx)
-    actual = race.policies[race.ego_idx]._scene_features(
-        ego.state,
-        ego.s,
-        opponents=observation.mpc_opponents(race.ego_idx),
+    race, actual = _capture_llm_scene(
+        "baseline",
+        car_s=(10.0, 12.0, 8.0),
+        car_e=(0.0, 0.1, -0.1),
+        car_speed=(2.0, 1.85, 2.25),
     )
 
     snapshot_path = Path(__file__).with_name("snapshots") / "llm_observation_v1_1.json"
@@ -200,6 +183,133 @@ def run_observation_snapshot_check():
         "rear_vehicle_id": actual["traffic"]["rear"]["id"],
         "road_preview_samples": len(actual["road_preview"]["samples_near_to_far"]),
     }
+
+
+def _capture_llm_scene(observation_variant, car_s, car_e, car_speed):
+    """Build one deterministic prompt scene without contacting the LLM server."""
+    start_gap = 0.8
+    start_offsets = tuple(
+        float(s) + rank * start_gap for rank, s in enumerate(car_s)
+    )
+    race = Race(SimulationConfig(
+        policies=("llm_alpharacer", "static_alpharacer", "static_alpharacer"),
+        duration=0.1,
+        track_name="berlin",
+        ego_position=1,
+        start_gap=start_gap,
+        start_s_offsets=start_offsets,
+        start_e_offsets=car_e,
+        start_speeds=car_speed,
+        llm_observation_variant=observation_variant,
+        save_trace=False,
+        show_plot=False,
+        quiet=True,
+    ))
+    race.environment.begin_step(0)
+    observation = race.environment.capture(race.policies)
+    ego = observation.car(race.ego_idx)
+    scene = race.policies[race.ego_idx]._scene_features(
+        ego.state,
+        ego.s,
+        opponents=observation.mpc_opponents(race.ego_idx),
+    )
+    return race, scene
+
+
+def run_observation_variant_checks():
+    """Verify that each ablation changes only its declared observation field."""
+    _, baseline = _capture_llm_scene(
+        "baseline", (10.0, 12.0, 14.0), (0.0, 0.1, -0.1), (2.0, 1.85, 1.5)
+    )
+    all_race, all_opponents = _capture_llm_scene(
+        "all_opponents", (10.0, 12.0, 14.0), (0.0, 0.1, -0.1), (2.0, 1.85, 1.5)
+    )
+    assert "additional_opponents_near_to_far" not in baseline["traffic"]
+    assert all_opponents["traffic"]["front"]["id"] == 1
+    assert all_opponents["traffic"]["rear"] is None
+    assert [
+        item["id"]
+        for item in all_opponents["traffic"]["additional_opponents_near_to_far"]
+    ] == [2]
+    all_without_extra = json.loads(json.dumps(all_opponents))
+    all_without_extra["traffic"].pop("additional_opponents_near_to_far")
+    assert all_without_extra == baseline
+
+    baseline_standard_race, baseline_standard = _capture_llm_scene(
+        "baseline", (10.0, 12.0, 8.0), (0.0, 0.1, -0.1), (2.0, 1.85, 2.25)
+    )
+    no_lap_race, no_lap = _capture_llm_scene(
+        "no_lap_progress", (10.0, 12.0, 8.0), (0.0, 0.1, -0.1), (2.0, 1.85, 2.25)
+    )
+    assert "lap_progress_percent" not in no_lap["ego"]
+    no_lap_with_baseline_value = json.loads(json.dumps(no_lap))
+    no_lap_with_baseline_value["ego"]["lap_progress_percent"] = (
+        baseline_standard["ego"]["lap_progress_percent"]
+    )
+    assert no_lap_with_baseline_value == baseline_standard
+    assert "ego.lap_progress_percent" not in no_lap_race.policies[0].system_prompt
+
+    speed_race, raceline_speed = _capture_llm_scene(
+        "raceline_speed", (10.0, 12.0, 8.0), (0.0, 0.1, -0.1), (2.0, 1.85, 2.25)
+    )
+    speed_samples = raceline_speed["road_preview"]["samples_near_to_far"]
+    assert all(
+        sample["raceline_target_speed_meters_per_second"] is not None
+        for sample in speed_samples
+    )
+    speed_without_targets = json.loads(json.dumps(raceline_speed))
+    for sample in speed_without_targets["road_preview"]["samples_near_to_far"]:
+        sample.pop("raceline_target_speed_meters_per_second")
+    assert speed_without_targets == baseline_standard
+    assert "raceline_target_speed_meters_per_second" in speed_race.policies[0].system_prompt
+
+    feedback_race, first_feedback_scene = _capture_llm_scene(
+        "decision_feedback", (10.0, 12.0, 8.0), (0.0, 0.1, -0.1), (2.0, 1.85, 2.25)
+    )
+    feedback_policy = feedback_race.policies[0]
+    feedback_policy._llm_call_count = 1
+    # Rebuild once with the correct first decision-call index, then mark that
+    # mode as the action executed over the following interval.
+    first_observation = feedback_race.environment.capture(feedback_race.policies)
+    first_ego = first_observation.car(0)
+    first_feedback_scene = feedback_policy._scene_features(
+        first_ego.state, first_ego.s, first_observation.mpc_opponents(0)
+    )
+    assert first_feedback_scene["memory"]["previous_decision_feedback"] is None
+    feedback_without_extra = json.loads(json.dumps(first_feedback_scene))
+    feedback_without_extra["memory"].pop("previous_decision_feedback")
+    assert feedback_without_extra == baseline_standard
+    feedback_policy._commit_decision_feedback_state()
+
+    next_s, next_e, next_speed = 11.0, 0.05, 2.2
+    next_x, next_y = feedback_race.track.frenet_to_world(next_s, next_e)
+    _, _, next_psi = feedback_race.track.interpolate(next_s)
+    feedback_policy._llm_call_count = 11
+    next_scene = feedback_policy._scene_features(
+        CarState(x=next_x, y=next_y, vx=next_speed, psi=next_psi),
+        next_s,
+        opponents=[
+            {"car_idx": 1, "px": 13.2, "py": 0.1, "vx": 1.85},
+            {"car_idx": 2, "px": 9.5, "py": -0.1, "vx": 2.25},
+        ],
+    )
+    feedback = next_scene["memory"]["previous_decision_feedback"]
+    assert feedback["executed_mode"] == "stable"
+    assert feedback["elapsed_seconds"] == 1.0
+    assert feedback["ego_progress_change_meters"] == 1.0
+    assert feedback["ego_lateral_change_meters_left_positive"] == 0.05
+    assert feedback["ego_speed_change_meters_per_second"] == 0.2
+
+    assert all_race.policies[0].observation_variant == "all_opponents"
+    assert baseline_standard_race.policies[0].observation_variant == "baseline"
+    print("PASS independent LLM observation variants", flush=True)
+    return [
+        "baseline",
+        "all_opponents",
+        "no_lap_progress",
+        "raceline_speed",
+        "decision_feedback",
+    ]
 
 
 def run_track_checks(seconds):
@@ -255,6 +365,7 @@ def main():
         "simulation_dt": params.SIM_DT,
         "observation_checks": run_observation_checks(),
         "observation_snapshot": run_observation_snapshot_check(),
+        "observation_variants": run_observation_variant_checks(),
         "interface_checks": run_interface_checks(),
         "track_checks": run_track_checks(args.track_seconds),
     }

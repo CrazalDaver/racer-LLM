@@ -59,6 +59,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   llm_policy_params=None, llm_output_mode=None,
                   llm_model_name=None, llm_temperature=None,
                   llm_update_interval_seconds=None,
+                  llm_observation_variant="baseline",
                   self_play_rl_model_path=None, self_play_rl_backend=None,
                   self_play_rl_strict_load=None, self_play_rl_action_order=None):
     """Construct one policy from canonical identity plus relevant overrides."""
@@ -78,7 +79,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
         "llm_smoothed_mode": SmoothedModeLLMPolicy,
     }
     if policy_type in llm_classes:
-        return llm_classes[policy_type](track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name, base_url=params.LLM_BASE_URL, timeout=params.LLM_TIMEOUT, temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode, **common)
+        return llm_classes[policy_type](track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name, base_url=params.LLM_BASE_URL, timeout=params.LLM_TIMEOUT, temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode, observation_variant=llm_observation_variant, **common)
     if policy_type == "rule_based":
         return RuleBasedPolicy(track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, **common)
     if policy_type == "alpharacer":

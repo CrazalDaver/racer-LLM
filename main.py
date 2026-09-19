@@ -8,6 +8,8 @@ import re
 import sys
 from pathlib import Path
 
+from simulation_core.config import LLM_OBSERVATION_VARIANTS
+
 try:
     import argcomplete
 except ImportError:  # Tab completion is optional; normal execution still works without it.
@@ -230,6 +232,11 @@ def _trace_llm_summary(data):
             "prompt_variant": (
                 str(np.asarray(data["car_llm_prompt_variants"])[car_idx])
                 if "car_llm_prompt_variants" in data.files
+                else "unknown"
+            ),
+            "observation_variant": (
+                str(np.asarray(data["car_llm_observation_variants"])[car_idx])
+                if "car_llm_observation_variants" in data.files
                 else "unknown"
             ),
             "call_count": int(np.sum(valid_calls)),
@@ -592,6 +599,12 @@ def _add_sim_args(parser):
         help="Wall-clock interval between LLM decisions (default: 1.0 s).",
     )
     group.add_argument(
+        "--llm-observation-variant",
+        choices=LLM_OBSERVATION_VARIANTS,
+        default="baseline",
+        help="Select one independent LLM observation ablation.",
+    )
+    group.add_argument(
         "--ibr-implementation",
         choices=["local_wang", "historical_strict"],
         default="local_wang",
@@ -716,6 +729,7 @@ def _sweep_kwargs_from_args(args):
         "llm_model": args.llm_model,
         "llm_models": args.llm_models,
         "llm_update_interval": args.llm_update_interval_seconds,
+        "llm_observation_variant": args.llm_observation_variant,
         "llm_temperature": args.llm_temperature,
         "llm_temperatures": args.llm_temperatures,
         "show_plot": args.show_plot,

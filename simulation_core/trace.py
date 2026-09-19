@@ -76,6 +76,10 @@ def create_simulation_trace(
         "car_llm_prompt_variants": [
             str(getattr(policy, "prompt_variant", "not_applicable")) for policy in policies
         ],
+        "car_llm_observation_variants": [
+            str(getattr(policy, "observation_variant", "not_applicable"))
+            for policy in policies
+        ],
         "car_llm_system_prompt_paths": [
             str(getattr(policy, "system_prompt_path", "")) for policy in policies
         ],
@@ -567,6 +571,9 @@ def save_simulation_trace(trace, track, params, output_path=None):
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
         car_llm_prompt_variants=np.asarray(
             trace.get("car_llm_prompt_variants", []), dtype=str
+        ),
+        car_llm_observation_variants=np.asarray(
+            trace.get("car_llm_observation_variants", []), dtype=str
         ),
         car_llm_system_prompt_paths=np.asarray(
             trace.get("car_llm_system_prompt_paths", []), dtype=str

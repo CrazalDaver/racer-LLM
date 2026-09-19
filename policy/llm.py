@@ -9,6 +9,7 @@ import urllib.request
 import numpy as np
 
 from config import duration_to_steps, params as sim_params
+from simulation_core.config import LLM_OBSERVATION_VARIANTS
 from state import CarState
 
 from .mpc import MPCPolicy
@@ -25,6 +26,28 @@ EVIDENCE_FIRST_BASIS_LABELS = (
     "rear_vehicle_falling_behind",
     "rear_gap_approximately_constant",
 )
+
+OBSERVATION_VARIANT_INSTRUCTIONS = {
+    "all_opponents": (
+        "Observation ablation: traffic.additional_opponents_near_to_far contains "
+        "every opponent not already represented by traffic.front or traffic.rear. "
+        "Each entry uses the same factual fields and also states front or rear."
+    ),
+    "no_lap_progress": (
+        "Observation ablation: absolute lap progress is intentionally omitted; "
+        "use only the supplied local road and traffic state."
+    ),
+    "raceline_speed": (
+        "Observation ablation: every road-preview sample additionally contains "
+        "raceline_target_speed_meters_per_second at that location."
+    ),
+    "decision_feedback": (
+        "Observation ablation: memory.previous_decision_feedback is null before "
+        "the first completed decision interval. Afterwards it reports objective "
+        "changes since the previous LLM decision. Lateral change is left-positive; "
+        "positive opponent gap change means separation increased."
+    ),
+}
 
 class LLMAlphaRacerPolicy(MPCPolicy):
     """
@@ -48,6 +71,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         param_bounds=None,
         system_prompt_path=None,
         prompt_variant="raw",
+        observation_variant="baseline",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -65,6 +89,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.history_length = max(0, int(history_length))
         self.response_format = self._resolve_response_format(output_mode, model_name)
         self.prompt_variant = str(prompt_variant)
+        self.observation_variant = str(observation_variant)
+        if self.observation_variant not in LLM_OBSERVATION_VARIANTS:
+            raise ValueError(
+                f"Unknown LLM observation variant: {self.observation_variant}"
+            )
         if self.response_format == "params" and self.prompt_variant == "raw":
             self.prompt_variant = "direct_params_effect_aware"
         if self.response_format not in {"mode", "params"}:
@@ -96,11 +125,23 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.last_assessment_consistent = True
         self.last_explicit_rule_mode = ""
         self.last_explicit_rule_consistent = True
+        self._previous_decision_feedback_state = None
+        self._pending_decision_feedback_state = None
         if system_prompt_path is None:
             filename = "params_system.txt" if self.response_format == "params" else "mode_system.txt"
             system_prompt_path = Path(__file__).with_name("prompts") / filename
         self.system_prompt_path = Path(system_prompt_path)
         self.system_prompt = self.system_prompt_path.read_text(encoding="utf-8").strip()
+        if self.observation_variant == "no_lap_progress":
+            self.system_prompt = self.system_prompt.replace(
+                "- ego.lap_progress_percent: ego progress around the current lap, from 0 to 100.\n",
+                "",
+            )
+        variant_instruction = OBSERVATION_VARIANT_INSTRUCTIONS.get(
+            self.observation_variant
+        )
+        if variant_instruction:
+            self.system_prompt = f"{self.system_prompt}\n\n{variant_instruction}"
 
     def _resolve_response_format(self, output_mode, model_name) -> str:
         # Select discrete-mode or direct-parameter responses from the explicit option or model name.
@@ -183,6 +224,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             sample_s = current_s + float(distance)
             center_x, center_y, center_heading = self.track.interpolate(sample_s)
             raceline_left_offset_percent = None
+            raceline_target_speed = None
             if self.raceline is not None:
                 raceline_idx = self.raceline.nearest_index(center_x, center_y)
                 raceline_s = float(self.raceline.s[raceline_idx])
@@ -193,27 +235,31 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 raceline_left_offset_percent = (
                     100.0 * raceline_state["lateral_e"] / max(lateral_limit, 1e-6)
                 )
+                raceline_target_speed = raceline_state["speed"]
 
-            samples.append(
-                {
-                    "distance_ahead_meters": self._rounded(distance, digits=1),
-                    "centerline_curvature": self._turn_and_magnitude(
-                        track_curvature_at(self.track, sample_s),
-                        "magnitude_per_meter",
-                        digits=3,
-                    ),
-                    "centerline_turn_from_current": self._turn_and_magnitude(
-                        math.degrees(angle_delta(center_heading, current_heading)),
-                        "degrees",
-                        digits=1,
-                    ),
-                    "raceline_offset_from_centerline": self._side_and_magnitude(
-                        raceline_left_offset_percent,
-                        "percent_of_half_width",
-                        digits=1,
-                    ),
-                }
-            )
+            sample = {
+                "distance_ahead_meters": self._rounded(distance, digits=1),
+                "centerline_curvature": self._turn_and_magnitude(
+                    track_curvature_at(self.track, sample_s),
+                    "magnitude_per_meter",
+                    digits=3,
+                ),
+                "centerline_turn_from_current": self._turn_and_magnitude(
+                    math.degrees(angle_delta(center_heading, current_heading)),
+                    "degrees",
+                    digits=1,
+                ),
+                "raceline_offset_from_centerline": self._side_and_magnitude(
+                    raceline_left_offset_percent,
+                    "percent_of_half_width",
+                    digits=1,
+                ),
+            }
+            if self.observation_variant == "raceline_speed":
+                sample["raceline_target_speed_meters_per_second"] = self._rounded(
+                    raceline_target_speed, digits=2
+                )
+            samples.append(sample)
 
         return {
             "preview_length_meters": self._rounded(preview_length, digits=1),
@@ -302,26 +348,43 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "ttc_seconds": feature["ttc_seconds"],
             }
 
+        front = nearest("front")
+        rear = nearest("rear")
+        ego_features = {
+            "lap_progress_percent": self._rounded(
+                100.0 * (float(current_s) % self.track.total_length) / self.track.total_length,
+                digits=1,
+            ),
+            "lateral_position": self._side_and_magnitude(
+                100.0 * float(current_py) / max(lateral_limit, 1e-6),
+                "percent_of_half_width",
+                digits=1,
+            ),
+            "speed_percent_of_maximum": self._rounded(
+                100.0 * max(float(state.vx), 0.0) / max(self.max_speed, 1e-6),
+                digits=1,
+            ),
+        }
+        if self.observation_variant == "no_lap_progress":
+            ego_features.pop("lap_progress_percent")
+
+        traffic = {"front": front, "rear": rear}
+        if self.observation_variant == "all_opponents":
+            represented_ids = {
+                vehicle["id"] for vehicle in (front, rear) if vehicle is not None
+            }
+            traffic["additional_opponents_near_to_far"] = sorted(
+                [
+                    feature
+                    for feature in opponent_features
+                    if feature["id"] not in represented_ids
+                ],
+                key=lambda feature: feature["longitudinal_gap_meters"],
+            )
+
         scene = {
-            "ego": {
-                "lap_progress_percent": self._rounded(
-                    100.0 * (float(current_s) % self.track.total_length) / self.track.total_length,
-                    digits=1,
-                ),
-                "lateral_position": self._side_and_magnitude(
-                    100.0 * float(current_py) / max(lateral_limit, 1e-6),
-                    "percent_of_half_width",
-                    digits=1,
-                ),
-                "speed_percent_of_maximum": self._rounded(
-                    100.0 * max(float(state.vx), 0.0) / max(self.max_speed, 1e-6),
-                    digits=1,
-                ),
-            },
-            "traffic": {
-                "front": nearest("front"),
-                "rear": nearest("rear"),
-            },
+            "ego": ego_features,
+            "traffic": traffic,
             "road_preview": self._road_preview(current_s, lateral_limit),
         }
         if self.response_format == "mode":
@@ -330,7 +393,72 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 # Deliberately omit previous_basis in this memory ablation.
                 "recent_modes_oldest_to_newest": self._decision_history_payload(),
             }
+            if self.observation_variant == "decision_feedback":
+                scene["memory"]["previous_decision_feedback"] = (
+                    self._decision_feedback(
+                        state,
+                        current_s,
+                        current_py,
+                        front,
+                        rear,
+                    )
+                )
         return scene
+
+    def _decision_feedback(self, state, current_s, current_e, front, rear):
+        """Return objective changes since the previous LLM decision interval."""
+        current_gaps = {
+            vehicle["id"]: vehicle["longitudinal_gap_meters"]
+            for vehicle in (front, rear)
+            if vehicle is not None
+        }
+        current = {
+            "control_call": self._llm_call_count,
+            "s": float(current_s),
+            "e": float(current_e),
+            "speed": max(float(state.vx), 0.0),
+            "gaps": current_gaps,
+        }
+        self._pending_decision_feedback_state = current
+        previous = self._previous_decision_feedback_state
+        if previous is None:
+            return None
+
+        gap_changes = []
+        for car_idx in sorted(current_gaps.keys() & previous["gaps"].keys()):
+            gap_changes.append({
+                "id": int(car_idx),
+                "longitudinal_gap_change_meters": self._rounded(
+                    current_gaps[car_idx] - previous["gaps"][car_idx], digits=2
+                ),
+            })
+        return {
+            "executed_mode": previous["mode"],
+            "elapsed_seconds": self._rounded(
+                (current["control_call"] - previous["control_call"])
+                * self.decision_dt,
+                digits=2,
+            ),
+            "ego_progress_change_meters": self._rounded(
+                current["s"] - previous["s"], digits=2
+            ),
+            "ego_lateral_change_meters_left_positive": self._rounded(
+                current["e"] - previous["e"], digits=3
+            ),
+            "ego_speed_change_meters_per_second": self._rounded(
+                current["speed"] - previous["speed"], digits=2
+            ),
+            "opponent_gap_changes": gap_changes,
+        }
+
+    def _commit_decision_feedback_state(self):
+        if self._pending_decision_feedback_state is None:
+            return
+        self._previous_decision_feedback_state = {
+            **self._pending_decision_feedback_state,
+            "mode": self.current_mode,
+        }
+        self._pending_decision_feedback_state = None
 
     def _record_llm_decision(self):
         if self.history_length <= 0:
@@ -640,6 +768,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             if not self._warned_llm_error:
                 self._log(f"LLM policy failed once, reusing last parameters: {exc}")
                 self._warned_llm_error = True
+        self._commit_decision_feedback_state()
 
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         self.update_params_from_llm(state, current_s, opponents=opponents)

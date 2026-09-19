@@ -11,7 +11,7 @@ from policy import progress_delta
 from simulation_core.environment import RaceEnvironment
 from simulation_core.recorder import TraceRecorder
 from state import CarState
-from simulation_core.config import SimulationConfig
+from simulation_core.config import LLM_OBSERVATION_VARIANTS, SimulationConfig
 from simulation_core.utils import (
     create_policy,
     create_vehicle_model,
@@ -249,6 +249,7 @@ class Race:
                     llm_model_name=self.resolved_llm_model_names[car_idx],
                     llm_temperature=self.resolved_llm_temperatures[car_idx],
                     llm_update_interval_seconds=config.llm_update_interval,
+                    llm_observation_variant=config.llm_observation_variant,
                     self_play_rl_model_path=config.rl_model_path,
                     self_play_rl_backend=config.rl_backend,
                     self_play_rl_strict_load=config.rl_strict_load,
@@ -443,6 +444,11 @@ if __name__ == "__main__":
         "--parameter-ibr-update-interval", type=float, default=None, metavar="SECONDS"
     )
     parser.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=3)
+    parser.add_argument(
+        "--llm-observation-variant",
+        choices=LLM_OBSERVATION_VARIANTS,
+        default="baseline",
+    )
     parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
     parser.add_argument(
         "--mpc-velocity-track-weight",
@@ -548,6 +554,7 @@ if __name__ == "__main__":
         mpc_track_slack=cli_args.mpc_track_slack_weight,
         mpc_collision_slack=cli_args.mpc_collision_slack_weight,
         ibr_implementation=cli_args.ibr_implementation,
+        llm_observation_variant=cli_args.llm_observation_variant,
         trace_output=output_path,
         show_plot=not cli_args.no_plot,
     )

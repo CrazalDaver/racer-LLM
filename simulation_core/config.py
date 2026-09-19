@@ -14,6 +14,13 @@ PolicyName = Literal[
     "rule_based", "self_play_rl",
 ]
 CANONICAL_POLICY_NAMES = frozenset(PolicyName.__args__)
+LLM_OBSERVATION_VARIANTS = (
+    "baseline",
+    "all_opponents",
+    "no_lap_progress",
+    "raceline_speed",
+    "decision_feedback",
+)
 
 
 def validate_policy_name(name: str) -> str:
@@ -70,6 +77,8 @@ class SimulationConfig:
     llm_temperature: float | None = None
     llm_temperatures: Sequence[float | None] | None = None
     llm_update_interval: float | None = None
+    llm_observation_variant: str = "baseline"
+
     # Self-play RL
     rl_model_path: str | None = None
     rl_backend: str | None = None

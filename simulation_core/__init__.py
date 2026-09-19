@@ -5,6 +5,6 @@ keeps construction, observations, environment mechanics, and recording
 together without crowding the repository root.
 """
 
-from .config import SimulationConfig
+from .config import LLM_OBSERVATION_VARIANTS, SimulationConfig
 
-__all__ = ["SimulationConfig"]
+__all__ = ["LLM_OBSERVATION_VARIANTS", "SimulationConfig"]
