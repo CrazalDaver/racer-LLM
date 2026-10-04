@@ -127,6 +127,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.last_explicit_rule_consistent = True
         self._previous_decision_feedback_state = None
         self._pending_decision_feedback_state = None
+        self._oracle_rollout_frozen = False
         if system_prompt_path is None:
             filename = "params_system.txt" if self.response_format == "params" else "mode_system.txt"
             system_prompt_path = Path(__file__).with_name("prompts") / filename
@@ -726,6 +727,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
 
     def update_params_from_llm(self, state: CarState, current_s: float, opponents=None):
         # Call LLM only at the specified update interval; otherwise reuse the last parameters.
+        if self._oracle_rollout_frozen:
+            self.params = self.last_llm_params.copy()
+            return
         self._llm_call_count += 1
         if self._llm_call_count > 1 and (self._llm_call_count - 1) % self._update_interval_calls != 0:
             self.params = self.last_llm_params.copy()
@@ -773,6 +777,16 @@ class LLMAlphaRacerPolicy(MPCPolicy):
     def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
         self.update_params_from_llm(state, current_s, opponents=opponents)
         return super().get_reference_trajectory(state, current_s, opponents=opponents)
+
+    def freeze_for_oracle_rollout(self):
+        """Freeze external high-level calls inside a hypothetical branch.
+
+        The copied lower-level MPC remains closed-loop and responsive.  This
+        prevents candidate order from changing the number or timing of Ollama
+        requests; deterministic in-process AlphaRacer/IBR opponents are not
+        frozen by the rollout evaluator.
+        """
+        self._oracle_rollout_frozen = True
 
 
 
@@ -884,6 +898,9 @@ class RuleBasedPolicy(LLMAlphaRacerPolicy):
         return mode
 
     def update_params_from_rules(self, state: CarState, current_s: float, opponents=None):
+        if self._oracle_rollout_frozen:
+            self.params = self.last_rule_params.copy()
+            return
         self._llm_call_count += 1
         if self._llm_call_count > 1 and (self._llm_call_count - 1) % self._update_interval_calls != 0:
             self.params = self.last_rule_params.copy()

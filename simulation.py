@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import random
 
 import numpy as np
 
@@ -9,6 +10,7 @@ from mpc_upstream_simple import UpstreamSimpleMPCController
 from visualization.plotting import plot_simulation_results
 from policy import progress_delta
 from simulation_core.environment import RaceEnvironment
+from simulation_core.oracle import OracleRolloutEvaluator
 from simulation_core.recorder import TraceRecorder
 from state import CarState
 from simulation_core.config import LLM_OBSERVATION_VARIANTS, SimulationConfig
@@ -37,6 +39,7 @@ class Race:
         if not isinstance(config, SimulationConfig):
             raise TypeError("Race expects a SimulationConfig instance")
         self.config = config
+        self._initialize_random_seed()
 
         # ==================== 1. SCENARIO AND START GRID ====================
         self._initialize_scenario()
@@ -46,6 +49,23 @@ class Race:
 
         # ==================== 3. PHYSICS, RECORDING, AND CONSOLE ============
         self._initialize_runtime()
+
+    def _initialize_random_seed(self):
+        """Apply and retain the explicit per-race seed when one is supplied."""
+        self.random_seed = (
+            None if self.config.random_seed is None else int(self.config.random_seed)
+        )
+        if self.random_seed is None:
+            return
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+        try:
+            import torch
+        except ImportError:
+            return
+        torch.manual_seed(self.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.random_seed)
 
     def _initialize_scenario(self):
         """Load the track and resolve the roster and initial grid."""
@@ -164,6 +184,13 @@ class Race:
         )
         if self.mpc_collision_slack_weight < 0.0:
             raise ValueError("collision_slack_weight must be non-negative")
+        self.oracle_commitment_seconds = (
+            params.ORACLE_COMMITMENT_SECONDS
+            if config.oracle_commitment_seconds is None
+            else float(config.oracle_commitment_seconds)
+        )
+        if self.oracle_commitment_seconds <= 0.0:
+            raise ValueError("oracle_commitment_seconds must be positive")
         self.resolved_mpc_formulation = (
             params.MPC_FORMULATION
             if config.mpc_formulation is None
@@ -250,6 +277,7 @@ class Race:
                     llm_temperature=self.resolved_llm_temperatures[car_idx],
                     llm_update_interval_seconds=config.llm_update_interval,
                     llm_observation_variant=config.llm_observation_variant,
+                    oracle_commitment_seconds=self.oracle_commitment_seconds,
                     self_play_rl_model_path=config.rl_model_path,
                     self_play_rl_backend=config.rl_backend,
                     self_play_rl_strict_load=config.rl_strict_load,
@@ -310,6 +338,14 @@ class Race:
             vehicle_models=self.vehicle_models,
             initial_progress=initial_progress,
         )
+        self.oracle_evaluator = (
+            OracleRolloutEvaluator(self)
+            if any(
+                hasattr(policy, "oracle_decision_due")
+                for policy in self.policies
+            )
+            else None
+        )
         self.recorder = TraceRecorder(self)
         self.reporter = _ProgressReporter(
             self, self.total_steps, report_steps
@@ -323,6 +359,18 @@ class Race:
             # ----- A. Capture the current scene -----
             self.environment.begin_step(step)
             observation = self.environment.capture(self.policies)
+
+            # Oracle branches are evaluated from this single pre-action
+            # snapshot.  Applying the winning preset changes policy state only;
+            # the real environment is advanced exactly once below.
+            if self.oracle_evaluator is not None:
+                for policy in self.policies:
+                    due = getattr(policy, "oracle_decision_due", None)
+                    if due is not None and due(step):
+                        decision = self.oracle_evaluator.evaluate(
+                            policy, observation, step
+                        )
+                        policy.apply_oracle_decision(decision)
 
             # ----- B. Ask every policy to act -----
             actions = tuple(

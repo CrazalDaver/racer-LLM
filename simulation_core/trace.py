@@ -367,6 +367,9 @@ def record_simulation_step(
             for policy in policies
         ])
     trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
+    trace["car_policy_decision_count"].append(
+        [int(getattr(policy, "policy_decision_count", 0)) for policy in policies]
+    )
     trace["car_policy_reason"].append([getattr(policy, "last_llm_reason", "") for policy in policies])
     trace["car_policy_basis"].append([getattr(policy, "last_llm_basis", "") for policy in policies])
     trace["car_policy_assessment"].append(
@@ -604,6 +607,9 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_policy_decision_counts=np.asarray(
             trace.get("car_policy_decision_counts", []), dtype=int
         ),
+        car_policy_decision_count=np.asarray(
+            trace.get("car_policy_decision_count", []), dtype=int
+        ),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
         car_parameter_ibr_score=np.asarray(
             trace.get("car_parameter_ibr_score", []), dtype=float
@@ -656,6 +662,34 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_offroad_recovery_heading_error=np.asarray(
             trace.get("car_offroad_recovery_heading_error", []), dtype=float
         ),
+        terminal_car_progress=np.asarray(
+            trace.get("terminal_car_progress", []), dtype=float
+        ),
+        terminal_car_lateral_offset=np.asarray(
+            trace.get("terminal_car_lateral_offset", []), dtype=float
+        ),
+        initial_car_progress=np.asarray(
+            trace.get("initial_car_progress", []), dtype=float
+        ),
+        random_seed=np.asarray(
+            -1 if trace.get("random_seed") is None else trace["random_seed"],
+            dtype=int,
+        ),
+        oracle_mode_names=np.asarray(
+            trace.get("oracle_mode_names", []), dtype=str
+        ),
+        oracle_mode_presets_json=np.asarray(
+            json.dumps(trace.get("oracle_mode_presets", {}), sort_keys=True)
+        ),
+        oracle_settings_json=np.asarray(
+            json.dumps(trace.get("oracle_settings", {}), sort_keys=True)
+        ),
+        oracle_decisions_json=np.asarray(
+            json.dumps(trace.get("oracle_decisions_by_car", []), sort_keys=True)
+        ),
+        oracle_mode_counts_json=np.asarray(
+            json.dumps(trace.get("oracle_mode_counts_by_car", []), sort_keys=True)
+        ),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -667,6 +701,33 @@ def save_simulation_trace(trace, track, params, output_path=None):
             trace.get("initial_lateral_offsets", []), dtype=float
         ),
         initial_speeds=np.asarray(trace.get("initial_speeds", []), dtype=float),
+        protocol_version=np.asarray(
+            trace.get("protocol_version", "unversioned"), dtype=str
+        ),
+        protocol_reference_version=np.asarray(
+            trace.get("protocol_reference_version", params.PROTOCOL_VERSION), dtype=str
+        ),
+        protocol_core_compatible=np.asarray(
+            trace.get("protocol_core_compatible", False), dtype=bool
+        ),
+        protocol_evaluation_scenario_compatible=np.asarray(
+            trace.get("protocol_evaluation_scenario_compatible", False), dtype=bool
+        ),
+        protocol_core_deviations_json=np.asarray(
+            json.dumps(trace.get("protocol_core_deviations", []), sort_keys=True)
+        ),
+        protocol_scenario_deviations_json=np.asarray(
+            json.dumps(trace.get("protocol_scenario_deviations", []), sort_keys=True)
+        ),
+        git_commit_sha=np.asarray(trace.get("git_commit_sha", "unknown"), dtype=str),
+        git_branch=np.asarray(trace.get("git_branch", "unknown"), dtype=str),
+        git_dirty=np.asarray(trace.get("git_dirty", True), dtype=bool),
+        git_status_porcelain=np.asarray(
+            trace.get("git_status_porcelain", "unknown"), dtype=str
+        ),
+        git_provenance_error=np.asarray(
+            trace.get("git_provenance_error", ""), dtype=str
+        ),
         track_csv=np.asarray(params.TRACK_CSV),
         raceline_csv=np.asarray(trace.get("raceline_csv", params.RACELINE_CSV)),
         track_scale=np.asarray(getattr(params, "TRACK_SCALE", 1.0)),

@@ -1,0 +1,214 @@
+{
+  "protocol_version": "K-Constrained-v1",
+  "document_revision": 2,
+  "status": "frozen",
+  "frozen_on": "2026-10-04",
+  "change_policy": "Any change to a frozen field requires a new protocol version.",
+  "research_contract": {
+    "primary_question": "Can an LLM make useful high-level racing decisions by directly selecting q, zeta, s1, s2, and s3 while the shared MPC retains actuator authority?",
+    "primary_action_space": "direct_five_parameter_selection",
+    "actuator_authority": "shared_mpc_only",
+    "comparison_rule": "change_exactly_one_predeclared_scientific_factor_per_comparison",
+    "empirical_priority": "clarity_and_reproducibility_over_positive_results_or_interface_complexity",
+    "negative_results": "preserve_and_report",
+    "post_hoc_tuning": "must_be_labelled_as_a_new_exploratory_iteration"
+  },
+  "plant": {
+    "model": "kinematic_bicycle",
+    "integration": "forward_euler",
+    "state": ["x_m", "y_m", "heading_rad", "speed_mps"],
+    "control": ["normalized_throttle", "normalized_steering"],
+    "lf_m": 0.11,
+    "lr_m": 0.23,
+    "steering_gain_rad": 0.34,
+    "steering_bias_rad": 0.0,
+    "acceleration_gain_mps2": 4.301075268817204,
+    "rolling_deceleration_mps2": 1.0,
+    "speed_bounds_mps": [0.0, 5.0],
+    "control_bounds": [-1.0, 1.0]
+  },
+  "mpc": {
+    "formulation": "constrained_local",
+    "coordinates": ["progress_s_m", "lateral_error_e_m", "heading_error_rad", "speed_mps"],
+    "dynamics": "geometric_frenet_kinematic_forward_euler",
+    "timestep_s": 0.1,
+    "horizon_steps": 10,
+    "horizon_s": 1.0,
+    "position_weight_diagonal": [1.0, 1.0],
+    "control_rate_weight_diagonal": [1.0, 1.0],
+    "velocity_tracking_weight": 10.0,
+    "heading_tracking_weight": 0.0,
+    "max_speed_mps": 5.0,
+    "max_speed_rate_mps2": 8.0,
+    "max_steering_command_rate_per_s": 4.0,
+    "track_boundary": "point_mass_center_with_registered_half_width",
+    "collision_constraint": "soft_p4_superellipse",
+    "minimum_longitudinal_separation_m": 0.428,
+    "minimum_lateral_separation_m": 0.285,
+    "maximum_constrained_opponents": 2,
+    "track_slack_weight": 1000.0,
+    "collision_slack_weight": 10000.0,
+    "friction_speed_limit_enabled": true,
+    "friction_coefficient": 1.6
+  },
+  "recovery": {
+    "trigger_abs_lateral_error_m": 0.55,
+    "speed_decay_strength": 3.0,
+    "heading_realign_strength": 1.0,
+    "inward_steering_command": 1.0,
+    "large_heading_error_rad": 1.0,
+    "throttle_boost": 0.2,
+    "low_speed_threshold_mps": 0.3,
+    "collision_front_decay": 5.0,
+    "collision_rear_decay": 20.0
+  },
+  "parameters": {
+    "order": ["q", "zeta", "s1", "s2", "s3"],
+    "bounds": {
+      "q": [1.0, 3.3333333333333335],
+      "zeta": [0.7224999999999999, 1.2100000000000002],
+      "s1": [0.1, 0.5],
+      "s2": [0.1, 0.5],
+      "s3": [0.0, 1.0]
+    },
+    "definitions": {
+      "q": "reference-trajectory position tracking weight",
+      "zeta": "raceline reference progression and reference-speed multiplier",
+      "s1": "maximum lateral passing/avoidance interaction amplitude in metres",
+      "s2": "longitudinal Gaussian interaction decay rate in inverse square metres",
+      "s3": "blocking response strength toward a faster rear vehicle"
+    }
+  },
+  "llm": {
+    "update_interval_s": 1.0,
+    "hold": "zero_order_hold_between_updates",
+    "allowed_output": "five_parameters_or_a_preset_within_the_same_bounds"
+  },
+  "tracks": {
+    "berlin": {
+      "centerline": "track_csv/berlin_2018.csv",
+      "centerline_sha256": "8f3777a3da39bc7f43f40d73a47779c29031045094bc1ea33fa345e9be0adf70",
+      "raceline": "track_csv/generated/berlin_mincurv_iqp_local.csv",
+      "raceline_sha256": "e7344dd19c8d268dfb11eadc2c395fa165c7941b11d830d3ad0767aa1af154a3",
+      "scale": 2.0,
+      "half_width_m": 0.44
+    },
+    "modena": {
+      "centerline": "track_csv/modena_2019.csv",
+      "centerline_sha256": "8f3ca38e1f67deb2e2243cec614b4642c57d13b9ad7b2f1296b14ab8bb6ee6c2",
+      "raceline": "track_csv/generated/modena_mincurv_iqp_local.csv",
+      "raceline_sha256": "64c232fa9f603831bdb0d70a6ec7ecf722d329bfec3763d858561f44845a457f",
+      "scale": 2.0,
+      "half_width_m": 0.37
+    },
+    "rounded_rectangle": {
+      "centerline": "track_csv/rounded_rectangle.csv",
+      "centerline_sha256": "1f96c19dce3410f8590d050e58ac0c8aaf022cf003b13880656d3fd3c3c71464",
+      "raceline": "track_csv/generated/rounded_rectangle_mincurv_iqp_local.csv",
+      "raceline_sha256": "d2c4d6899fabc216186b9402be18b7dbfc94b2317346a54e048e7b4e49acd53e",
+      "scale": 1.0,
+      "half_width_m": 0.5
+    }
+  },
+  "scenario_generation": {
+    "type": "deterministic_position_balanced_grid",
+    "evidence_class": "core_scan",
+    "claim_limit": "the_nine_deterministic_cells_are_not_broad_robustness_evidence",
+    "tracks": ["berlin", "modena", "rounded_rectangle"],
+    "cars": 3,
+    "ego_start_positions": [1, 2, 3],
+    "duration_s": 50.0,
+    "start_gap_m": 6.0,
+    "longitudinal_offsets_m": [0.0, 0.0, 0.0],
+    "lateral_offsets_m": [0.0, 0.0, 0.0],
+    "initial_speeds_mps": [0.0, 0.0, 0.0],
+    "seed": 0,
+    "randomness": "none_in_environment; stochastic policies must declare seed/model/settings",
+    "pairing": "same track, start position, grid, and seed for every compared policy",
+    "stochastic_policy_rule": "predeclare_repeat_count_and_seeds; report_variability; never_count_identical_deterministic_repeats_as_independent_samples"
+  },
+  "evaluation": {
+    "primary_metrics": [
+      "final_unwrapped_progress_m_by_car",
+      "progress_gain_m_by_car",
+      "win_rate_over_9_position_track_cells"
+    ],
+    "safety_metrics": [
+      "physical_collision_seconds",
+      "track_boundary_violation_seconds_by_car",
+      "offroad_recovery_seconds_by_car",
+      "maximum_track_slack_by_car",
+      "maximum_collision_slack_by_car",
+      "mpc_solver_failure_count_by_car",
+      "parse_error_count",
+      "timeout_count"
+    ],
+    "llm_metrics": [
+      "decision_count",
+      "error_count",
+      "mean_and_p95_latency_s",
+      "deadline_miss_count",
+      "prompt_and_output_tokens",
+      "mode_switch_count"
+    ],
+    "aggregation": "report_each_of_9_cells_then_macro_mean; no safety-progress scalarization",
+    "tie_rule_m": 1e-9,
+    "stochastic_reporting": "report_predeclared_repeats_seeds_and_variability",
+    "missing_or_failed_runs": "report_explicitly; do_not_silently_drop"
+  },
+  "experimental_arm_record": {
+    "required": [
+      "arm_id",
+      "stated_hypothesis",
+      "single_changed_factor",
+      "control_arm_id",
+      "policy_roster",
+      "scenario_ids",
+      "seeds",
+      "predeclared_repeat_count",
+      "prompt_text_or_hash",
+      "observation_schema_or_version",
+      "history_and_memory_setting",
+      "output_schema",
+      "parser_clipping_retry_timeout_and_fallback",
+      "model_identifier_checkpoint_or_quantization",
+      "decoding_settings",
+      "update_interval_s",
+      "observation_access_and_privileged_information",
+      "action_space_and_replanning_rate",
+      "compute_environment",
+      "baseline_artifacts_and_training_settings",
+      "git_commit_sha",
+      "git_dirty_status",
+      "result_class",
+      "expected_supporting_evidence",
+      "expected_rejecting_evidence"
+    ],
+    "result_classes": {
+      "exploratory": "diagnostic or tuning run; dirty trees allowed only when labelled",
+      "core_scan": "clean-commit paired nine-cell protocol evaluation",
+      "robustness": "clean-commit predeclared extension with stochastic repeats or additional stressors"
+    }
+  },
+  "baseline_and_claim_rules": {
+    "local_alpharacer": "may be the primary learned baseline; record exact checkpoint and training setting; do not claim reproduction of published alpha-RACER results",
+    "local_ibr": "heterogeneous local baseline; describe its actual implementation and interface; do not call it a literature reproduction without matching evidence",
+    "fixed_push": "measures_the_strength_of_one_constant_parameter_action",
+    "oracle_mode": "estimates_headroom_within_the_fixed_discrete_mode_library",
+    "direct_parameter_llm": "tests_the_less_restricted_five_parameter_interface",
+    "direct_actuation": "diagnostic_or_separate_action_space_study_not_the_primary_five_parameter_comparison",
+    "fairness_disclosure": "report_observation_access_action_space_replanning_rate_privileged_information_compute_and_fallback_behavior"
+  },
+  "provenance": {
+    "formal_results_require_clean_commit": true,
+    "record_commit_sha": true,
+    "record_dirty_status": true,
+    "dirty_tree_results": "exploratory_only"
+  },
+  "excluded": [
+    "dynamic_bicycle_model",
+    "upstream_simple_mpc",
+    "unregistered_tracks_or_racelines",
+    "changes_to_frozen_plant_mpc_recovery_timing_or_metrics"
+  ]
+}
