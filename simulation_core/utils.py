@@ -10,7 +10,8 @@ from config import params
 from policy import (
     AlphaRacerPolicy, BalancedRawLLMPolicy, CenterLinePolicy,
     EvidenceFirstLLMPolicy, ExplicitRuleLLMPolicy, IteratedBestResponsePolicy,
-    LLMAlphaRacerPolicy, ParameterIBRPolicy, RuleBasedPolicy,
+    FixedModePolicy, LLMAlphaRacerPolicy, OracleModePolicy,
+    ParameterIBRPolicy, RuleBasedPolicy,
     SelfPlayRLPolicy, SmoothedModeLLMPolicy, StaticAlphaRacerPolicy,
     StructuredBasisActionFirstLLMPolicy,
 )
@@ -60,6 +61,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   llm_model_name=None, llm_temperature=None,
                   llm_update_interval_seconds=None,
                   llm_observation_variant="baseline",
+                  oracle_commitment_seconds=None,
                   self_play_rl_model_path=None, self_play_rl_backend=None,
                   self_play_rl_strict_load=None, self_play_rl_action_order=None):
     """Construct one policy from canonical identity plus relevant overrides."""
@@ -70,6 +72,23 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
     if policy_type == "static_alpharacer":
         fixed = static_policy_params if static_policy_params is not None else alpharacer_params
         return StaticAlphaRacerPolicy(track, mpc, params=np.asarray(params.STATIC_POLICY_PARAMS if fixed is None else fixed, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, **common)
+    if policy_type == "fixed_push":
+        return FixedModePolicy(track, mpc, mode="push", raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, **common)
+    if policy_type == "oracle_mode":
+        return OracleModePolicy(
+            track,
+            mpc,
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
+            commitment_seconds=(
+                params.ORACLE_COMMITMENT_SECONDS
+                if oracle_commitment_seconds is None
+                else oracle_commitment_seconds
+            ),
+            decision_dt=params.CONTROL_DT,
+            **common,
+        )
     llm_classes = {
         "llm_alpharacer": LLMAlphaRacerPolicy,
         "llm_structured_action_first": StructuredBasisActionFirstLLMPolicy,

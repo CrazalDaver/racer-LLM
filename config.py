@@ -121,6 +121,11 @@ def duration_to_steps(duration_seconds, dt):
 
 
 class SimParams:
+    # Frozen experiment contract. Any change to its plant, MPC, recovery,
+    # track/raceline, timing, parameter space, scenarios, or metrics requires
+    # a new version; see protocols/K-Constrained-v1.json.
+    PROTOCOL_VERSION = "K-Constrained-v1"
+
     # ==================== SIMULATION TIMING ====================
 
     # The simulator, policies, and MPC all advance on the upstream 0.1 s step.
@@ -302,6 +307,21 @@ class SimParams:
         "overtake": np.array([1.0 / 0.80, 1.20, 0.45, 0.10, 0.00]),
         "block": np.array([1.0 / 0.75, 1.0, 0.10, 0.30, 0.70]),
     }
+    # Receding-horizon oracle defaults.  The oracle deliberately enumerates
+    # LLM_MODE_PRESETS at runtime instead of maintaining a second mode list.
+    # Its real-race dwell matches the current LLM cadence.  Three seconds
+    # matches the existing fixed-mode diagnostic horizon and is long enough
+    # for short overtaking/blocking effects while remaining configurable.
+    ORACLE_HORIZON_SECONDS = 3.0
+    ORACLE_COMMITMENT_SECONDS = LLM_UPDATE_INTERVAL_SECONDS
+    # The repository's primary race metric is progress.  Safety and relative
+    # progress remain explicit optional score terms rather than hidden reward
+    # shaping; every raw component is logged even when its weight is zero.
+    ORACLE_PROGRESS_WEIGHT = 1.0
+    ORACLE_RELATIVE_PROGRESS_WEIGHT = 0.0
+    ORACLE_COLLISION_PENALTY = 0.0
+    ORACLE_OFFTRACK_PENALTY_PER_SECOND = 0.0
+    ORACLE_TIE_TOLERANCE = 1.0e-9
     # Conservative fixed baseline within the upstream parameter ranges:
     # moderate tracking, slightly slower reference progression, small
     # overtaking displacement, and no blocking.

@@ -8,7 +8,8 @@ from typing import Literal, Sequence
 
 
 PolicyName = Literal[
-    "centerline", "static_alpharacer", "alpharacer", "ibr", "parameter_ibr",
+    "centerline", "static_alpharacer", "fixed_push", "oracle_mode",
+    "alpharacer", "ibr", "parameter_ibr",
     "llm_alpharacer", "llm_raw_balanced", "llm_evidence_first",
     "llm_structured_action_first", "llm_explicit_rules", "llm_smoothed_mode",
     "rule_based", "self_play_rl",
@@ -40,6 +41,7 @@ class SimulationConfig:
     policies: Sequence[str] = field(default_factory=lambda: ("centerline",))
     duration: float | None = None
     ego_position: int = 1
+    random_seed: int | None = None
 
     # Track and starting grid
     track_name: str | None = None
@@ -78,6 +80,16 @@ class SimulationConfig:
     llm_temperatures: Sequence[float | None] | None = None
     llm_update_interval: float | None = None
     llm_observation_variant: str = "baseline"
+
+    # Discrete receding-horizon oracle.  ``None`` uses the documented defaults
+    # in config.params, keeping ordinary simulations unchanged.
+    oracle_horizon_seconds: float | None = None
+    oracle_commitment_seconds: float | None = None
+    oracle_progress_weight: float | None = None
+    oracle_relative_progress_weight: float | None = None
+    oracle_collision_penalty: float | None = None
+    oracle_offtrack_penalty_per_second: float | None = None
+    oracle_tie_tolerance: float | None = None
 
     # Self-play RL
     rl_model_path: str | None = None
