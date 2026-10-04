@@ -80,6 +80,8 @@ def validate() -> list[str]:
         "params.OFFROAD_LOW_SPEED_THRESHOLD": (params.OFFROAD_LOW_SPEED_THRESHOLD, recovery["low_speed_threshold_mps"]),
         "params.COLLISION_FRONT_DECAY": (params.COLLISION_FRONT_DECAY, recovery["collision_front_decay"]),
         "params.COLLISION_REAR_DECAY": (params.COLLISION_REAR_DECAY, recovery["collision_rear_decay"]),
+        "params.VEHICLE_HALF_LENGTH": (params.VEHICLE_HALF_LENGTH, plant["vehicle_half_length_m"]),
+        "params.VEHICLE_HALF_WIDTH": (params.VEHICLE_HALF_WIDTH, plant["vehicle_half_width_m"]),
         "params.LLM_UPDATE_INTERVAL_SECONDS": (params.LLM_UPDATE_INTERVAL_SECONDS, llm["update_interval_s"]),
         "params.CAR_START_GAP": (params.CAR_START_GAP, scenario["start_gap_m"]),
         "params.TOTAL_TIME": (params.TOTAL_TIME, scenario["duration_s"]),
@@ -93,6 +95,10 @@ def validate() -> list[str]:
     for label, (actual, expected) in checks.items():
         if not _same(actual, expected):
             errors.append(f"{label}: expected {expected!r}, found {actual!r}")
+    if not _same(2.0 * params.VEHICLE_HALF_LENGTH, plant["vehicle_length_m"]):
+        errors.append("full vehicle length differs from the frozen manifest")
+    if not _same(2.0 * params.VEHICLE_HALF_WIDTH, plant["vehicle_width_m"]):
+        errors.append("full vehicle width differs from the frozen manifest")
 
     expected_names = tuple(manifest["parameters"]["order"])
     if tuple(params.ALPHARACER_PARAMETER_NAMES) != expected_names:

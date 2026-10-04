@@ -15,7 +15,9 @@ prompt architecture, or positive result.
 
 - **Plant:** four-state kinematic bicycle, forward Euler, normalized throttle
   and steering, `Lf=0.11 m`, `Lr=0.23 m`, steering gain `0.34 rad`,
-  acceleration `u_t*(20/4.65)-1 m/s²`, speed clipped to `[0,5] m/s`.
+  acceleration `u_t*(20/4.65)-1 m/s²`, speed clipped to `[0,5] m/s`. The
+  oriented-rectangle contact footprint is `0.36 m × 0.24 m` (half-length
+  `0.18 m`, half-width `0.12 m`).
 - **Controller:** local constrained Frenet MPC with state `[s,e,psi_err,v]`,
   geometric Frenet dynamics, `dt=0.1 s`, 10 steps (1.0 s), `Q=diag(1,1)`,
   `R=diag(1,1)`, velocity weight 10 and heading weight 0.
