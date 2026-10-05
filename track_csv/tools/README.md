@@ -32,7 +32,7 @@ The package pins an obsolete `quadprog` build. On macOS/ARM, replace it with:
 Generate the recommended Berlin candidate:
 
 ```bash
-.venv/bin/python train/raceline/optimize_raceline.py --track berlin
+.venv/bin/python track_csv/tools/optimize_raceline.py --track berlin
 ```
 
 Outputs are written under `track_csv/generated/` as a simulator-compatible CSV,

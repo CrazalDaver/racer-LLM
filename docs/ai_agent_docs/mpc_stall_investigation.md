@@ -100,7 +100,7 @@ question. It appeared after several earlier confounds were removed.
      `[54.12, 47.99, 40.84] m`
    - `result/sa034_new_raceline_screen/`: `Sa=0.34` candidate, progress
      `[62.43, 56.91, 51.09] m`
-   - raceline generation provenance: `train/raceline/README.md` and
+   - raceline generation provenance: `track_csv/tools/README.md` and
      `track_csv/generated/`
 
    The corrected raceline still improved the short static screen, so the entire

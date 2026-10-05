@@ -10,9 +10,7 @@ from typing import Literal, Sequence
 PolicyName = Literal[
     "centerline", "static_alpharacer", "fixed_push", "oracle_mode",
     "alpharacer", "ibr", "parameter_ibr",
-    "llm_alpharacer", "llm_raw_balanced", "llm_evidence_first",
-    "llm_structured_action_first", "llm_explicit_rules", "llm_smoothed_mode",
-    "rule_based", "self_play_rl",
+    "llm_alpharacer", "rule_based", "self_play_rl",
 ]
 CANONICAL_POLICY_NAMES = frozenset(PolicyName.__args__)
 LLM_OBSERVATION_VARIANTS = (

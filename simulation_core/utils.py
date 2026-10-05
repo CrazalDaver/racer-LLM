@@ -8,12 +8,10 @@ import numpy as np
 
 from config import params
 from policy import (
-    AlphaRacerPolicy, BalancedRawLLMPolicy, CenterLinePolicy,
-    EvidenceFirstLLMPolicy, ExplicitRuleLLMPolicy, IteratedBestResponsePolicy,
+    AlphaRacerPolicy, CenterLinePolicy, IteratedBestResponsePolicy,
     FixedModePolicy, LLMAlphaRacerPolicy, OracleModePolicy,
     ParameterIBRPolicy, RuleBasedPolicy,
-    SelfPlayRLPolicy, SmoothedModeLLMPolicy, StaticAlphaRacerPolicy,
-    StructuredBasisActionFirstLLMPolicy,
+    SelfPlayRLPolicy, StaticAlphaRacerPolicy,
 )
 from .config import validate_policy_name
 from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
@@ -94,11 +92,6 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
         )
     llm_classes = {
         "llm_alpharacer": LLMAlphaRacerPolicy,
-        "llm_structured_action_first": StructuredBasisActionFirstLLMPolicy,
-        "llm_evidence_first": EvidenceFirstLLMPolicy,
-        "llm_raw_balanced": BalancedRawLLMPolicy,
-        "llm_explicit_rules": ExplicitRuleLLMPolicy,
-        "llm_smoothed_mode": SmoothedModeLLMPolicy,
     }
     if policy_type in llm_classes:
         return llm_classes[policy_type](track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name, base_url=params.LLM_BASE_URL, timeout=params.LLM_TIMEOUT, temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode, observation_variant=llm_observation_variant, include_raceline_speed=params.LLM_INPUT_INCLUDE_RACELINE_SPEED if llm_include_raceline_speed is None else llm_include_raceline_speed, include_current_parameters=params.LLM_INPUT_INCLUDE_CURRENT_PARAMETERS if llm_include_current_parameters is None else llm_include_current_parameters, include_decision_feedback=params.LLM_INPUT_INCLUDE_DECISION_FEEDBACK if llm_include_decision_feedback is None else llm_include_decision_feedback, **common)

@@ -15,14 +15,14 @@ local vehicle model.
 Examples
 --------
     # Recommended Berlin candidate and diagnostic plot
-    .venv/bin/python train/raceline/optimize_raceline.py --track berlin
+    .venv/bin/python track_csv/tools/optimize_raceline.py --track berlin
 
     # Geometry ablation
-    .venv/bin/python train/raceline/optimize_raceline.py \
+    .venv/bin/python track_csv/tools/optimize_raceline.py \
         --track berlin --objective shortest
 
     # Add an explicit 2 cm center-point boundary margin
-    .venv/bin/python train/raceline/optimize_raceline.py \
+    .venv/bin/python track_csv/tools/optimize_raceline.py \
         --track berlin --boundary-margin 0.02
 
 Important arguments

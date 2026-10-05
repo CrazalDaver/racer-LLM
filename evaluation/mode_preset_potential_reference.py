@@ -291,14 +291,14 @@ Outputs
 Example
   .venv/bin/python evaluation/mode_preset_potential_reference.py \\
     --track berlin \\
-    --weight train/weights/alpha_racer/potential_local.pth \\
+    --weight policy/alpharacer/train/weights/potential_local.pth \\
     --output-dir result/mode_preset_potential_reference_berlin
 """,
     )
     parser.add_argument("--track", choices=("berlin", "modena", "rounded_rectangle"), default="berlin",
                         help="Registered track (default: berlin).")
     parser.add_argument("--weight", type=Path,
-                        default=Path("train/weights/alpha_racer/potential_local.pth"),
+                        default=Path("policy/alpharacer/train/weights/potential_local.pth"),
                         help="Local metadata-bearing potential checkpoint.")
     parser.add_argument("--rollout-seconds", type=float, default=3.0,
                         help="Duration of each scene (default: 3 s).")

@@ -15,7 +15,7 @@ try:
 except ImportError:
     nn = None
 
-from .utils import progress_delta, track_curvature_at, track_heading_error
+from ..utils import progress_delta, track_curvature_at, track_heading_error
 
 
 ALPHA_INPUT_SIZE = 39

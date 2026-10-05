@@ -528,13 +528,10 @@ def _add_case_args(parser):
     group.add_argument("--name", default=None)
     group.add_argument(
         "--suite",
-        choices=["llm-baselines", "llm-vs-ibr", "llm-params", "ibr-speed-cap"],
+        choices=["llm-params", "ibr-speed-cap"],
         default=None,
         help=(
-            "llm-baselines runs raw LLM, explicit-rule LLM, rule-only, "
-            "alpha-RACER, and IBR against two alpha-RACER opponents; "
-            "llm-vs-ibr runs the three LLM/rule candidates against two IBR "
-            "opponents; llm-params runs a direct five-parameter LLM against "
+            "llm-params runs a direct five-parameter LLM against "
             "both opponent types. Every candidate is tested at all three positions."
         ),
     )
@@ -787,25 +784,9 @@ def _sweep_kwargs_from_args(args):
 
 def _suite_definition(name, sweep_kwargs):
     """Return the output directory and policy rosters for one named suite."""
-    if name == "llm-baselines":
-        return Path("result/llm_baseline_suite"), {
-            "raw_llm": ["llm_alpharacer", "alpharacer", "alpharacer"],
-            "explicit_rule_llm": [
-                "llm_explicit_rules", "alpharacer", "alpharacer"
-            ],
-            "rule_only": ["rule_based", "alpharacer", "alpharacer"],
-            "local_alpharacer": ["alpharacer", "alpharacer", "alpharacer"],
-            "local_wang_ibr": ["ibr", "alpharacer", "alpharacer"],
-        }
-    if name == "llm-vs-ibr":
-        return Path("result/llm_vs_ibr_suite"), {
-            "raw_llm_vs_ibr": ["llm_alpharacer", "ibr", "ibr"],
-            "explicit_rule_llm_vs_ibr": ["llm_explicit_rules", "ibr", "ibr"],
-            "rule_only_vs_ibr": ["rule_based", "ibr", "ibr"],
-        }
     if name == "llm-params":
         sweep_kwargs["llm_output_mode"] = "params"
-        return Path("result/llm_params_effect_aware_suite"), {
+        return Path("result/direct_params_modular_v1_suite"), {
             "param_llm_vs_alpharacer": [
                 "llm_alpharacer", "alpharacer", "alpharacer"
             ],

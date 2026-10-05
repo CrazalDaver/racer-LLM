@@ -6,11 +6,11 @@ then reuse the saved model for simulation experiments.
 
 Paper-style training (long running)::
 
-    python -m train.self_play_rl --output self_play_rl_policy.zip
+    python -m policy.self_play_rl.train
 
 Quick pipeline check::
 
-    python -m train.self_play_rl --iterations 1 --steps-per-iteration 256 \
+    python -m policy.self_play_rl.train --iterations 1 --steps-per-iteration 256 \
         --num-envs 1 --episode-steps 50 --output /tmp/self_play_smoke.zip
 
 The paper appendix specifies 99 round-robin phases, 100K time steps per phase,
@@ -415,7 +415,10 @@ def train(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the alpha-RACER self-play PPO baseline.")
-    parser.add_argument("--output", default="self_play_rl_policy.zip")
+    parser.add_argument(
+        "--output",
+        default="policy/self_play_rl/weights/self_play_rl_policy.zip",
+    )
     parser.add_argument("--iterations", type=int, default=99)
     parser.add_argument("--steps-per-iteration", type=int, default=100_000)
     parser.add_argument(

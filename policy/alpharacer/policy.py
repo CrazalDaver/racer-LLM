@@ -7,12 +7,12 @@ try:
 except ImportError:
     torch = None
 
-from .alpha_network import (
+from .network import (
     ALPHA_PARAMETER_BOUNDS,
     SimpleNeuralNetwork,
     build_alpha_input,
 )
-from .mpc import MPCPolicy
+from ..mpc import MPCPolicy
 
 class AlphaRacerPolicy(MPCPolicy):
     """
@@ -33,7 +33,10 @@ class AlphaRacerPolicy(MPCPolicy):
     def __init__(
         self,
         *args,
-        weight_path="train/weights/alpha_racer/upstream/potential_myopic_mpc.pth",
+        weight_path=(
+            "policy/alpharacer/train/weights/upstream/"
+            "potential_myopic_mpc.pth"
+        ),
         search_points=7,
         search_iters=6,
         opt_style="grad",

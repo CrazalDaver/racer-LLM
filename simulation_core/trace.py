@@ -28,14 +28,7 @@ def create_simulation_trace(
     mpc_track_slack_weight,
     mpc_collision_slack_weight,
 ):
-    llm_policy_names = {
-        "llm_alpharacer",
-        "llm_structured_action_first",
-        "llm_evidence_first",
-        "llm_raw_balanced",
-        "llm_explicit_rules",
-        "llm_smoothed_mode",
-    }
+    llm_policy_names = {"llm_alpharacer"}
 
     def output_schema_json(policy):
         schema_builder = getattr(policy, "_output_schema", None)

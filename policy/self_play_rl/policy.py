@@ -7,8 +7,8 @@ import numpy as np
 from state import CarAction, CarState
 from track import RaceLine
 
-from .base import BasePolicy
-from .utils import progress_delta, track_curvature_at, track_heading_error
+from ..base import BasePolicy
+from ..utils import progress_delta, track_curvature_at, track_heading_error
 
 class SelfPlayRLPolicy(BasePolicy):
     """
@@ -103,7 +103,7 @@ class SelfPlayRLPolicy(BasePolicy):
             if suffix in {".pth", ".pt"}:
                 raise ValueError(
                     "Native Torch self-play checkpoints are unsupported; "
-                    "train with `python -m train.self_play_rl` and use its .zip output."
+                    "train with `python -m policy.self_play_rl.train` and use its .zip output."
                 )
             if self.backend in {"auto", "sb3", "ppo"} and suffix == ".zip":
                 self.model = self._load_sb3_policy(path)

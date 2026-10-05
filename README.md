@@ -7,13 +7,12 @@ steering authority.
 ## Repository map
 
 - `protocols/`: frozen experimental substrate and validation.
-- `policy/`: high-level policies and LLM prompts.
+- `policy/`: each learned policy together with its training code and weights.
 - `simulation_core/`: environment, observations, recording, and trace I/O.
 - `evaluation/`: reusable evaluation and preflight programs.
-- `train/`: training code, data locations, and model weights.
 - `track_csv/`: registered tracks and racelines.
 - `visualization/`: trace plotting, animation, reports, and Unity replay tools.
-- `docs/agent_context/`: indexed historical context for a new agent.
+- `docs/ai_agent_docs/`: indexed historical context for a new AI agent.
 - `unity/`: replay project source; generated Unity caches are not versioned.
 
 Read `AGENTS.md`, then `protocols/README.md`, before changing experiments.

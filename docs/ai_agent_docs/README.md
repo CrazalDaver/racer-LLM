@@ -1,4 +1,4 @@
-# Agent context index
+# AI agent documentation
 
 This directory collects historical research notes that previously lived in the
 repository root. New agents should read sources in this order:

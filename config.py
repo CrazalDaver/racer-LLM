@@ -335,7 +335,9 @@ class SimParams:
     # Canonical paper coordinates: q, zeta, s1, s2, s3. Official checkpoints
     # are adapted internally because they were trained in transformed coords.
     ALPHARACER_INITIAL_PARAMS = np.array([2.0, 0.95**2, 0.3, 0.2, 0.0])
-    POTENTIAL_FUNCTION_WEIGHT_PATH = "train/weights/alpha_racer/upstream/potential_myopic_mpc.pth"
+    POTENTIAL_FUNCTION_WEIGHT_PATH = (
+        "policy/alpharacer/train/weights/upstream/potential_myopic_mpc.pth"
+    )
     POTENTIAL_FUNCTION_OPT_STYLE = "grad"
     # Step size in normalized paper-parameter coordinates xi in [0,1]^15.
     POTENTIAL_FUNCTION_GRADIENT_RATE = 1e-4
@@ -351,8 +353,8 @@ class SimParams:
 
     # ==================== SELF-PLAY RL =========================
 
-    # Created by: python -m train.self_play_rl
-    SELF_PLAY_RL_MODEL_PATH = "self_play_rl_policy.zip"
+    # Created by: python -m policy.self_play_rl.train
+    SELF_PLAY_RL_MODEL_PATH = "policy/self_play_rl/weights/self_play_rl_policy.zip"
     SELF_PLAY_RL_BACKEND = "sb3"  # Paper-compatible Stable-Baselines3 PPO checkpoint.
     SELF_PLAY_RL_STRICT_LOAD = True  # Do not silently replace a missing trained PPO with the heuristic fallback.
     SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs

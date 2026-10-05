@@ -3,7 +3,7 @@
 import numpy as np
 
 from config import params as sim_params
-from ..alpha_network import ALPHA_PARAMETER_BOUNDS
+from ..alpharacer.network import ALPHA_PARAMETER_BOUNDS
 from ..mpc import MPCPolicy
 
 

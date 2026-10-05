@@ -20,7 +20,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from config import params
-from policy.alpha_network import (
+from policy.alpharacer.network import (
     ALPHA_INPUT_SIZE,
     ALPHA_PARAMETER_BOUNDS,
     ALPHA_VALUE_HIDDEN_SIZES,
@@ -32,9 +32,9 @@ from simulation_core.config import SimulationConfig
 from track import Track, configure_track, load_centerline_csv
 
 
-DEFAULT_DATA_PATH = Path("train/data/alpha_racer/rollouts.npz")
-DEFAULT_VALUE_DIR = Path("train/weights/alpha_racer/values")
-DEFAULT_POTENTIAL_PATH = Path("train/weights/alpha_racer/potential_local.pth")
+DEFAULT_DATA_PATH = Path("policy/alpharacer/train/data/rollouts.npz")
+DEFAULT_VALUE_DIR = Path("policy/alpharacer/train/weights/values")
+DEFAULT_POTENTIAL_PATH = Path("policy/alpharacer/train/weights/potential_local.pth")
 PARAMETERIZATION = "paper_q_zeta_s1_s2_s3"
 
 
@@ -377,7 +377,7 @@ Choices:
   --gamma          0..1; --validation-fraction 0..<1
 
 Example:
-  .venv/bin/python -m train.alpha_racer.alpha_potential_training \\
+  .venv/bin/python -m policy.alpharacer.train.training \\
       --groups 100 --duration 12 --track berlin --vehicle-model kinematic
 """,
     )
@@ -443,7 +443,7 @@ Example:
 
 if __name__ == "__main__":
     # Typical full run:
-    #   .venv/bin/python -m train.alpha_racer.alpha_potential_training \
+    #   .venv/bin/python -m policy.alpharacer.train.training \
     #       --groups 100 --duration 12
     # Existing rollouts/value weights/potential weights are reused. Add the
     # corresponding --force-* flag when a particular stage must be repeated.

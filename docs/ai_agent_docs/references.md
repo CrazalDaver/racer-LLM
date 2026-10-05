@@ -187,7 +187,7 @@ Limitations that must accompany results:
   https://github.com/TUMFTM/global_racetrajectory_optimization
   - Provides shortest-path, minimum-curvature, iterative minimum-curvature, and
     minimum-time trajectory optimization; LGPL-3.0.
-  - The local `train/raceline/optimize_raceline.py` reuses its geometry pipeline
+  - The local `track_csv/tools/optimize_raceline.py` reuses its geometry pipeline
     but constructs speed profiles from the local kinematic vehicle parameters.
 
 Recommended use for generalization experiments:

@@ -8,7 +8,7 @@ The complete cached pipeline is intentionally kept in one readable module.
 Run it from the repository root:
 
 ```bash
-.venv/bin/python -m train.alpha_racer.alpha_potential_training \
+.venv/bin/python -m policy.alpharacer.train.training \
   --groups 100 --duration 12
 ```
 
@@ -27,13 +27,13 @@ checkpoint are reused automatically. Use `--force-rollouts`, `--force-values`,
 or `--force-potential` to rebuild a stage. Rebuilding an upstream stage also
 rebuilds its dependent downstream stages.
 
-Locally generated artifacts live under `train/data/alpha_racer/` and
-`train/weights/alpha_racer/`. Released checkpoints live under
-`train/weights/alpha_racer/upstream/`; the runtime automatically adapts their
+Locally generated artifacts live under `policy/alpharacer/train/data/` and
+`policy/alpharacer/train/weights/`. Released checkpoints live under
+`policy/alpharacer/train/weights/upstream/`; the runtime automatically adapts their
 legacy input coordinates while exposing only paper theta=(q,zeta,s1,s2,s3).
 
 To evaluate a local model, set `SimParams.POTENTIAL_FUNCTION_WEIGHT_PATH` to
-`train/weights/alpha_racer/potential_local.pth`. The runtime loader accepts
+`policy/alpharacer/train/weights/potential_local.pth`. The runtime loader accepts
 both the new metadata-bearing checkpoint and the original raw state dict.
 
 The same choice can be made without editing configuration:
@@ -41,11 +41,11 @@ The same choice can be made without editing configuration:
 ```bash
 # Released checkpoint (legacy input adaptation is automatic)
 ./main.py --policies alpharacer alpharacer alpharacer \
-  --alpharacer-weight train/weights/alpha_racer/upstream/potential_myopic_mpc.pth
+  --alpharacer-weight policy/alpharacer/train/weights/upstream/potential_myopic_mpc.pth
 
 # Locally trained checkpoint (paper coordinates are detected from metadata)
 ./main.py --policies alpharacer alpharacer alpharacer \
-  --alpharacer-weight train/weights/alpha_racer/potential_local.pth
+  --alpharacer-weight policy/alpharacer/train/weights/potential_local.pth
 ```
 
 Both cases optimize normalized paper coordinates in `[0,1]^15`, reconstruct

@@ -12,20 +12,8 @@ from config import duration_to_steps, params as sim_params
 from simulation_core.config import LLM_OBSERVATION_VARIANTS
 from state import CarState
 
-from .mpc import MPCPolicy
-from .utils import angle_delta, progress_delta, track_curvature_at
-
-
-EVIDENCE_FIRST_BASIS_LABELS = (
-    "no_front_vehicle",
-    "closing_on_front_vehicle",
-    "front_vehicle_pulling_away",
-    "front_gap_approximately_constant",
-    "no_rear_vehicle",
-    "rear_vehicle_closing",
-    "rear_vehicle_falling_behind",
-    "rear_gap_approximately_constant",
-)
+from ..mpc import MPCPolicy
+from ..utils import angle_delta, progress_delta, track_curvature_at
 
 OBSERVATION_VARIANT_INSTRUCTIONS = {
     "all_opponents": (
@@ -947,87 +935,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self._oracle_rollout_frozen = True
 
 
-
-
-class ExplicitRuleLLMPolicy(LLMAlphaRacerPolicy):
-    """LLM baseline given the same ordered rules as the rule-only policy."""
-
-    def __init__(self, *args, **kwargs):
-        kwargs["output_mode"] = "mode"
-        kwargs["prompt_variant"] = "explicit_rules"
-        kwargs["system_prompt_path"] = (
-            Path(__file__).with_name("prompts") / "mode_explicit_rules_system.txt"
-        )
-        super().__init__(*args, **kwargs)
-
-
-class StructuredBasisActionFirstLLMPolicy(LLMAlphaRacerPolicy):
-    """Structured-basis control whose mode is generated before its basis."""
-
-    def __init__(self, *args, **kwargs):
-        kwargs["output_mode"] = "mode"
-        kwargs["prompt_variant"] = "structured_action_first_minimal_v2"
-        kwargs["system_prompt_path"] = (
-            Path(__file__).with_name("prompts")
-            / "mode_structured_action_first_system.txt"
-        )
-        super().__init__(*args, **kwargs)
-
-    def _output_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "mode": {
-                    "type": "string",
-                    "enum": list(self.mode_presets),
-                },
-                "basis": {
-                    "type": "string",
-                    "enum": list(EVIDENCE_FIRST_BASIS_LABELS),
-                },
-                "reason": {"type": "string", "maxLength": 120},
-            },
-            "required": ["mode", "basis", "reason"],
-            "additionalProperties": False,
-        }
-
-
-class EvidenceFirstLLMPolicy(LLMAlphaRacerPolicy):
-    """Detachable evidence-first variant of the raw mode policy.
-
-    It receives exactly the same numerical observation and uses the same mode
-    presets as :class:`LLMAlphaRacerPolicy`.  Only the response scaffold is
-    changed: the model first emits one verifiable scene-relation label, then a
-    mode, then a short explanation.  No basis-to-mode rule is supplied.
-    """
-
-    def __init__(self, *args, **kwargs):
-        kwargs["output_mode"] = "mode"
-        kwargs["prompt_variant"] = "evidence_first_minimal_v2"
-        kwargs["system_prompt_path"] = (
-            Path(__file__).with_name("prompts") / "mode_evidence_first_system.txt"
-        )
-        super().__init__(*args, **kwargs)
-
-    def _output_schema(self) -> dict:
-        # Property order is deliberate for Ollama's constrained generation:
-        # the observable basis is generated before the tactical mode.
-        return {
-            "type": "object",
-            "properties": {
-                "basis": {
-                    "type": "string",
-                    "enum": list(EVIDENCE_FIRST_BASIS_LABELS),
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": list(self.mode_presets),
-                },
-                "reason": {"type": "string", "maxLength": 120},
-            },
-            "required": ["basis", "mode", "reason"],
-            "additionalProperties": False,
-        }
 
 
 class RuleBasedPolicy(LLMAlphaRacerPolicy):
