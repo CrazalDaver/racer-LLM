@@ -31,11 +31,14 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 
-from collision import oriented_rectangle_overlap_cost
 from config import make_vehicle_params, params
 from state import CarState
 from track import Track, load_centerline_csv
-from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
+from vehicle_model import (
+    DynamicBicycleModel,
+    KinematicBicycleModel,
+    oriented_rectangle_overlap_cost,
+)
 
 
 OBSERVATION_SIZE = 15

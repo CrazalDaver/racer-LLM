@@ -32,7 +32,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from collision import oriented_rectangle_overlap_cost
 from config import make_vehicle_params, params
 from mpc_controller import MPCController
 from policy import StaticAlphaRacerPolicy, progress_delta
@@ -40,6 +39,7 @@ from simulation_core.observation import RaceObservation
 from simulation import create_vehicle_model
 from state import CarState
 from track import Track, load_centerline_csv, load_raceline_csv
+from vehicle_model import oriented_rectangle_overlap_cost
 
 
 MODES = ("stable", "push", "overtake", "block")

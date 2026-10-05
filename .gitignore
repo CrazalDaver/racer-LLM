@@ -17,6 +17,7 @@ myplot.png
 *.gif
 *.npz
 result/
+artifacts/
 
 # Legacy generated reports used to live in the repository root.  Current
 # experiment entry points write under result/; keep accidental regenerations
@@ -27,13 +28,7 @@ result/
 /llm_mode_report_assets/
 /simulation_trace*.mp4
 
-# Local manuscript reminders; intentionally not part of the repository.
-PAPER_NOTES.local.md
-EXPERIMENT_TODO.local.md
-PLATFORM_CODE_MAP.local.md
-MPC_STALL_INVESTIGATION.local.md
-PHYSICS_IMPLEMENTATION_DIFFERENCES.local.md
-REFERENCES.local.md
+# Local one-off JSON scratch files.
 *.local.json
 
 # Unity replay generated files (keep unity/Assets, Packages, ProjectSettings).

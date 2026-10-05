@@ -9,12 +9,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from collision import oriented_rectangle_overlap_cost
 from config import params
 from policy import progress_delta, track_heading_error
 from .observation import RaceObservation
 from state import CarAction, CarState
-from vehicle_model import neutral_throttle
+from vehicle_model import neutral_throttle, oriented_rectangle_overlap_cost
 
 
 @dataclass(frozen=True)
