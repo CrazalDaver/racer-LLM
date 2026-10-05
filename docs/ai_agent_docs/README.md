@@ -8,9 +8,12 @@ repository root. New agents should read sources in this order:
    experimental substrate.
 3. `protocols/direct-params-modular-v1.md` for the current direct-parameter LLM
    interface.
-4. `platform_code_map_historical.md` and
+4. `llm_param_minimal_experiment.md` for the proposed first stateless
+   direct-parameter capability experiment, opponent roster, controls, staged
+   execution, and interpretation rules.
+5. `platform_code_map_historical.md` and
    `physics_implementation_differences.md` for implementation background.
-5. The remaining files only when their topic is relevant.
+6. The remaining files only when their topic is relevant.
 
 Files marked historical are context, not current instructions or formal
 evidence. Current code, protocol manifests, and clean-commit results take

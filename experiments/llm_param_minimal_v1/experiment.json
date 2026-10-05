@@ -1,0 +1,154 @@
+{
+  "schema_version": "experiment-arm-v1",
+  "experiment_id": "llm-param-minimal-v1-comparison",
+  "protocol_version": "K-Constrained-v1",
+  "interface_schema": "direct_params_modular_v1",
+  "research_question": "Can a stateless LLM use the current numerical scene to select useful q, zeta, s1, s2, and s3 values while the shared MPC retains actuator authority?",
+  "single_changed_factor": "ego high-level five-parameter policy",
+  "neutral_parameters": [
+    1.3333333333333333,
+    0.9,
+    0.2,
+    0.3,
+    0.0
+  ],
+  "fixed_push_parameters": [
+    1.1764705882352942,
+    1.2,
+    0.1,
+    0.5,
+    0.0
+  ],
+  "opponents": {
+    "policies": [
+      "static_alpharacer",
+      "static_alpharacer"
+    ],
+    "parameters": [
+      1.3333333333333333,
+      0.9,
+      0.2,
+      0.3,
+      0.0
+    ]
+  },
+  "arms": {
+    "static-neutral-v1": {
+      "ego_policy": "static_alpharacer",
+      "purpose": "ordinary fixed-policy control"
+    },
+    "fixed-push-v1": {
+      "ego_policy": "fixed_push",
+      "purpose": "strong fixed-policy control"
+    },
+    "llm-param-minimal-v1": {
+      "ego_policy": "llm_alpharacer",
+      "purpose": "stateless direct-parameter candidate"
+    }
+  },
+  "llm": {
+    "model": "qwen2.5:7b",
+    "base_url": "http://localhost:11434",
+    "temperature": 0.0,
+    "update_interval_s": 1.0,
+    "output_mode": "params",
+    "initial_and_fallback_parameters": [
+      1.3333333333333333,
+      0.9,
+      0.2,
+      0.3,
+      0.0
+    ],
+    "input_modules": {
+      "base": true,
+      "raceline_speed": true,
+      "current_parameters": false,
+      "decision_feedback": false
+    },
+    "memory": "none",
+    "few_shot_examples": false,
+    "tactical_rules": false,
+    "parameter_smoothing": false,
+    "output_fields": [
+      "q",
+      "zeta",
+      "s1",
+      "s2",
+      "s3"
+    ]
+  },
+  "stages": {
+    "smoke": {
+      "result_class": "exploratory",
+      "arms": [
+        "llm-param-minimal-v1"
+      ],
+      "tracks": [
+        "rounded_rectangle"
+      ],
+      "ego_positions": [
+        2
+      ],
+      "duration_s": 15.0
+    },
+    "stage1": {
+      "result_class": "exploratory",
+      "arms": [
+        "static-neutral-v1",
+        "fixed-push-v1",
+        "llm-param-minimal-v1"
+      ],
+      "tracks": [
+        "berlin",
+        "modena",
+        "rounded_rectangle"
+      ],
+      "ego_positions": [
+        2
+      ],
+      "duration_s": 50.0
+    },
+    "stage2": {
+      "result_class": "core_scan",
+      "arms": [
+        "static-neutral-v1",
+        "fixed-push-v1",
+        "llm-param-minimal-v1"
+      ],
+      "tracks": [
+        "berlin",
+        "modena",
+        "rounded_rectangle"
+      ],
+      "ego_positions": [
+        1,
+        2,
+        3
+      ],
+      "duration_s": 50.0
+    }
+  },
+  "scenario": {
+    "cars": 3,
+    "start_gap_m": 6.0,
+    "initial_speeds_mps": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "seed": 0,
+    "repeat_count": 1
+  },
+  "frozen_runtime": {
+    "vehicle_model": "kinematic",
+    "mpc_formulation": "constrained_local",
+    "mpc_horizon_steps": 10,
+    "velocity_tracking_weight": 10.0,
+    "track_slack_weight": 1000.0,
+    "collision_slack_weight": 10000.0
+  },
+  "interpretation": {
+    "supporting_evidence": "The LLM is reliable and safe enough for further study, varies parameters with scene context, and improves on static-neutral in paired cells.",
+    "rejecting_evidence": "The LLM is unreliable, unsafe, effectively constant, or consistently worse than static-neutral after accounting for failures."
+  }
+}

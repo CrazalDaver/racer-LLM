@@ -18,6 +18,7 @@ myplot.png
 *.npz
 result/
 artifacts/
+experiments/*/results/
 
 # Legacy generated reports used to live in the repository root.  Current
 # experiment entry points write under result/; keep accidental regenerations
