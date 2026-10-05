@@ -80,6 +80,9 @@ class SimulationConfig:
     llm_temperatures: Sequence[float | None] | None = None
     llm_update_interval: float | None = None
     llm_observation_variant: str = "baseline"
+    llm_include_raceline_speed: bool | None = None
+    llm_include_current_parameters: bool | None = None
+    llm_include_decision_feedback: bool | None = None
 
     # Discrete receding-horizon oracle.  ``None`` uses the documented defaults
     # in config.params, keeping ordinary simulations unchanged.

@@ -277,6 +277,13 @@ class Race:
                     llm_temperature=self.resolved_llm_temperatures[car_idx],
                     llm_update_interval_seconds=config.llm_update_interval,
                     llm_observation_variant=config.llm_observation_variant,
+                    llm_include_raceline_speed=config.llm_include_raceline_speed,
+                    llm_include_current_parameters=(
+                        config.llm_include_current_parameters
+                    ),
+                    llm_include_decision_feedback=(
+                        config.llm_include_decision_feedback
+                    ),
                     oracle_commitment_seconds=self.oracle_commitment_seconds,
                     self_play_rl_model_path=config.rl_model_path,
                     self_play_rl_backend=config.rl_backend,
@@ -497,6 +504,21 @@ if __name__ == "__main__":
         choices=LLM_OBSERVATION_VARIANTS,
         default="baseline",
     )
+    parser.add_argument(
+        "--llm-include-raceline-speed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--llm-include-current-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--llm-include-decision-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
     parser.add_argument(
         "--mpc-velocity-track-weight",
@@ -603,6 +625,9 @@ if __name__ == "__main__":
         mpc_collision_slack=cli_args.mpc_collision_slack_weight,
         ibr_implementation=cli_args.ibr_implementation,
         llm_observation_variant=cli_args.llm_observation_variant,
+        llm_include_raceline_speed=cli_args.llm_include_raceline_speed,
+        llm_include_current_parameters=cli_args.llm_include_current_parameters,
+        llm_include_decision_feedback=cli_args.llm_include_decision_feedback,
         trace_output=output_path,
         show_plot=not cli_args.no_plot,
     )

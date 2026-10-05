@@ -312,6 +312,152 @@ def run_observation_variant_checks():
     ]
 
 
+def _capture_direct_parameter_scene(**module_flags):
+    """Build one direct-parameter prompt scene without contacting an LLM."""
+    race = Race(SimulationConfig(
+        policies=("llm_alpharacer", "static_alpharacer", "static_alpharacer"),
+        duration=0.1,
+        track_name="berlin",
+        start_gap=0.8,
+        start_s_offsets=(10.0, 12.8, 9.6),
+        start_e_offsets=(0.0, 0.1, -0.1),
+        start_speeds=(2.0, 1.85, 2.25),
+        llm_output_mode="params",
+        llm_include_raceline_speed=module_flags.get("raceline_speed", False),
+        llm_include_current_parameters=module_flags.get("current_parameters", False),
+        llm_include_decision_feedback=module_flags.get("decision_feedback", False),
+        save_trace=False,
+        show_plot=False,
+        quiet=True,
+    ))
+    race.environment.begin_step(0)
+    observation = race.environment.capture(race.policies)
+    ego = observation.car(0)
+    policy = race.policies[0]
+    scene = policy._scene_features(
+        ego.state,
+        ego.s,
+        opponents=observation.mpc_opponents(0),
+    )
+    return race, scene
+
+
+def run_direct_parameter_module_checks():
+    """Lock the direct-parameter base schema and independent module toggles."""
+    race, base = _capture_direct_parameter_scene()
+    policy = race.policies[0]
+    base_keys = {"ego_state", "traffic_state", "road_preview"}
+    assert set(base) == base_keys
+    assert set(base["ego_state"]) == {
+        "speed_mps",
+        "lateral_position_m",
+        "heading_error_rad",
+    }
+    opponents = base["traffic_state"]["all_opponents"]
+    assert len(opponents) == 2
+    assert [item["id"] for item in opponents] == [1, 2]
+    assert all(set(item) == {
+        "id",
+        "relative_longitudinal_position_m",
+        "relative_lateral_position_m",
+        "relative_speed_mps",
+    } for item in opponents)
+    road_samples = base["road_preview"]["samples_near_to_far"]
+    assert len(road_samples) == params.LLM_ROAD_PREVIEW_SAMPLE_COUNT
+    assert all(set(sample) == {
+        "distance_ahead_m",
+        "centerline_curvature_per_m",
+        "raceline_offset_m",
+    } for sample in road_samples)
+    assert policy.input_schema_version == "direct_params_modular_v1"
+    assert policy.input_modules == {
+        "base": True,
+        "raceline_speed": False,
+        "current_parameters": False,
+        "decision_feedback": False,
+    }
+    trace = race.recorder.trace
+    assert trace["car_llm_input_schema_versions"][0] == "direct_params_modular_v1"
+    assert trace["car_llm_include_raceline_speed"][0] is False
+    assert trace["car_llm_include_current_parameters"][0] is False
+    assert trace["car_llm_include_decision_feedback"][0] is False
+    assert json.loads(trace["car_llm_output_schemas"][0]) == policy._output_schema()
+
+    optional_modules = (
+        "raceline_speed",
+        "current_parameters",
+        "decision_feedback",
+    )
+    for module in optional_modules:
+        module_race, scene = _capture_direct_parameter_scene(**{module: True})
+        assert set(scene) == base_keys | {module}
+        without_module = json.loads(json.dumps(scene))
+        without_module.pop(module)
+        assert without_module == base
+        assert module_race.policies[0].input_modules[module] is True
+
+    all_race, all_modules = _capture_direct_parameter_scene(**{
+        module: True for module in optional_modules
+    })
+    assert set(all_modules) == base_keys | set(optional_modules)
+    assert len(
+        all_modules["raceline_speed"]["target_speed_mps_at_preview_points"]
+    ) == len(road_samples)
+    assert set(all_modules["current_parameters"]) == {
+        "q", "zeta", "s1", "s2", "s3"
+    }
+    assert all_modules["decision_feedback"] is None
+
+    feedback_policy = all_race.policies[0]
+    first_x, first_y = all_race.track.frenet_to_world(10.0, 0.0)
+    _, _, first_psi = all_race.track.interpolate(10.0)
+    feedback_policy._llm_call_count = 1
+    first = feedback_policy._direct_parameter_scene_features(
+        CarState(x=first_x, y=first_y, vx=2.0, psi=first_psi),
+        10.0,
+        opponents=[
+            {"car_idx": 1, "px": 12.0, "py": 0.1, "vx": 1.85},
+            {"car_idx": 2, "px": 8.0, "py": -0.1, "vx": 2.25},
+        ],
+    )
+    assert first["decision_feedback"] is None
+    feedback_policy._commit_decision_feedback_state()
+    next_x, next_y = all_race.track.frenet_to_world(11.0, 0.05)
+    _, _, next_psi = all_race.track.interpolate(11.0)
+    feedback_policy._llm_call_count = 11
+    second = feedback_policy._direct_parameter_scene_features(
+        CarState(x=next_x, y=next_y, vx=2.2, psi=next_psi),
+        11.0,
+        opponents=[
+            {"car_idx": 1, "px": 13.2, "py": 0.1, "vx": 1.85},
+            {"car_idx": 2, "px": 9.5, "py": -0.1, "vx": 2.25},
+        ],
+    )
+    feedback = second["decision_feedback"]
+    assert feedback["previous_progress_change_m"] == 1.0
+    assert feedback["previous_speed_change_mps"] == 0.2
+    assert feedback["previous_gap_changes"] == [
+        {"id": 1, "longitudinal_gap_change_m": 0.2},
+        {"id": 2, "longitudinal_gap_change_m": -0.5},
+    ]
+
+    output_schema = policy._output_schema()
+    parameter_names = ["q", "zeta", "s1", "s2", "s3"]
+    assert output_schema["required"] == parameter_names
+    assert list(output_schema["properties"]) == parameter_names
+    assert output_schema["additionalProperties"] is False
+    assert "basis" not in policy.system_prompt.lower()
+    assert "reason" not in policy.system_prompt.lower()
+
+    print("PASS modular direct-parameter LLM inputs", flush=True)
+    return {
+        "schema_version": policy.input_schema_version,
+        "base_modules": sorted(base_keys),
+        "optional_modules": list(optional_modules),
+        "default_optional_modules_enabled": [],
+    }
+
+
 def run_track_checks(seconds):
     results = []
     for track_name in ("berlin", "modena", "rounded_rectangle"):
@@ -366,6 +512,7 @@ def main():
         "observation_checks": run_observation_checks(),
         "observation_snapshot": run_observation_snapshot_check(),
         "observation_variants": run_observation_variant_checks(),
+        "direct_parameter_modules": run_direct_parameter_module_checks(),
         "interface_checks": run_interface_checks(),
         "track_checks": run_track_checks(args.track_seconds),
     }

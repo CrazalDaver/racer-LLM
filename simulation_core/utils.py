@@ -61,6 +61,9 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   llm_model_name=None, llm_temperature=None,
                   llm_update_interval_seconds=None,
                   llm_observation_variant="baseline",
+                  llm_include_raceline_speed=None,
+                  llm_include_current_parameters=None,
+                  llm_include_decision_feedback=None,
                   oracle_commitment_seconds=None,
                   self_play_rl_model_path=None, self_play_rl_backend=None,
                   self_play_rl_strict_load=None, self_play_rl_action_order=None):
@@ -98,7 +101,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
         "llm_smoothed_mode": SmoothedModeLLMPolicy,
     }
     if policy_type in llm_classes:
-        return llm_classes[policy_type](track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name, base_url=params.LLM_BASE_URL, timeout=params.LLM_TIMEOUT, temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode, observation_variant=llm_observation_variant, **common)
+        return llm_classes[policy_type](track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name, base_url=params.LLM_BASE_URL, timeout=params.LLM_TIMEOUT, temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode, observation_variant=llm_observation_variant, include_raceline_speed=params.LLM_INPUT_INCLUDE_RACELINE_SPEED if llm_include_raceline_speed is None else llm_include_raceline_speed, include_current_parameters=params.LLM_INPUT_INCLUDE_CURRENT_PARAMETERS if llm_include_current_parameters is None else llm_include_current_parameters, include_decision_feedback=params.LLM_INPUT_INCLUDE_DECISION_FEEDBACK if llm_include_decision_feedback is None else llm_include_decision_feedback, **common)
     if policy_type == "rule_based":
         return RuleBasedPolicy(track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, **common)
     if policy_type == "alpharacer":

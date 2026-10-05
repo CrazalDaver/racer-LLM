@@ -228,7 +228,31 @@ def _trace_llm_summary(data):
             selected = values[car_idx][valid_calls]
             return int(np.sum(selected[selected >= 0]))
 
+        input_schema_version = (
+            str(np.asarray(data["car_llm_input_schema_versions"])[car_idx])
+            if "car_llm_input_schema_versions" in data.files
+            else "unknown"
+        )
         summaries.append({
+            "input_schema_version": input_schema_version,
+            "input_modules": {
+                "base": input_schema_version == "direct_params_modular_v1",
+                "raceline_speed": (
+                    bool(np.asarray(data["car_llm_include_raceline_speed"])[car_idx])
+                    if "car_llm_include_raceline_speed" in data.files
+                    else False
+                ),
+                "current_parameters": (
+                    bool(np.asarray(data["car_llm_include_current_parameters"])[car_idx])
+                    if "car_llm_include_current_parameters" in data.files
+                    else False
+                ),
+                "decision_feedback": (
+                    bool(np.asarray(data["car_llm_include_decision_feedback"])[car_idx])
+                    if "car_llm_include_decision_feedback" in data.files
+                    else False
+                ),
+            },
             "prompt_variant": (
                 str(np.asarray(data["car_llm_prompt_variants"])[car_idx])
                 if "car_llm_prompt_variants" in data.files
@@ -596,13 +620,31 @@ def _add_sim_args(parser):
         "--llm-update-interval-seconds",
         type=float,
         default=None,
-        help="Wall-clock interval between LLM decisions (default: 1.0 s).",
+        help="Simulated-time interval between LLM decisions (default: 1.0 s).",
     )
     group.add_argument(
         "--llm-observation-variant",
         choices=LLM_OBSERVATION_VARIANTS,
         default="baseline",
         help="Select one independent LLM observation ablation.",
+    )
+    group.add_argument(
+        "--llm-include-raceline-speed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle the direct-parameter raceline_speed input module.",
+    )
+    group.add_argument(
+        "--llm-include-current-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle the direct-parameter current_parameters input module.",
+    )
+    group.add_argument(
+        "--llm-include-decision-feedback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Toggle the direct-parameter decision_feedback input module.",
     )
     group.add_argument(
         "--ibr-implementation",
@@ -730,6 +772,9 @@ def _sweep_kwargs_from_args(args):
         "llm_models": args.llm_models,
         "llm_update_interval": args.llm_update_interval_seconds,
         "llm_observation_variant": args.llm_observation_variant,
+        "llm_include_raceline_speed": args.llm_include_raceline_speed,
+        "llm_include_current_parameters": args.llm_include_current_parameters,
+        "llm_include_decision_feedback": args.llm_include_decision_feedback,
         "llm_temperature": args.llm_temperature,
         "llm_temperatures": args.llm_temperatures,
         "show_plot": args.show_plot,

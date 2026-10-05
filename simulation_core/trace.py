@@ -36,6 +36,13 @@ def create_simulation_trace(
         "llm_explicit_rules",
         "llm_smoothed_mode",
     }
+
+    def output_schema_json(policy):
+        schema_builder = getattr(policy, "_output_schema", None)
+        if not callable(schema_builder):
+            return ""
+        return json.dumps(schema_builder(), sort_keys=True, separators=(",", ":"))
+
     trace = SimulationTrace({
         "policy_names": resolved_policy_names,
         "car_alpharacer_weight_paths": [
@@ -80,11 +87,30 @@ def create_simulation_trace(
             str(getattr(policy, "observation_variant", "not_applicable"))
             for policy in policies
         ],
+        "car_llm_input_schema_versions": [
+            str(getattr(policy, "input_schema_version", "not_applicable"))
+            for policy in policies
+        ],
+        "car_llm_include_raceline_speed": [
+            bool(getattr(policy, "include_raceline_speed", False))
+            for policy in policies
+        ],
+        "car_llm_include_current_parameters": [
+            bool(getattr(policy, "include_current_parameters", False))
+            for policy in policies
+        ],
+        "car_llm_include_decision_feedback": [
+            bool(getattr(policy, "include_decision_feedback", False))
+            for policy in policies
+        ],
         "car_llm_system_prompt_paths": [
             str(getattr(policy, "system_prompt_path", "")) for policy in policies
         ],
         "car_llm_system_prompts": [
             str(getattr(policy, "system_prompt", "")) for policy in policies
+        ],
+        "car_llm_output_schemas": [
+            output_schema_json(policy) for policy in policies
         ],
         "llm_parameter_names": list(params.ALPHARACER_PARAMETER_NAMES),
         "llm_parameter_bounds": np.asarray(params.ALPHARACER_PARAMETER_BOUNDS).copy(),
@@ -578,11 +604,26 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_llm_observation_variants=np.asarray(
             trace.get("car_llm_observation_variants", []), dtype=str
         ),
+        car_llm_input_schema_versions=np.asarray(
+            trace.get("car_llm_input_schema_versions", []), dtype=str
+        ),
+        car_llm_include_raceline_speed=np.asarray(
+            trace.get("car_llm_include_raceline_speed", []), dtype=bool
+        ),
+        car_llm_include_current_parameters=np.asarray(
+            trace.get("car_llm_include_current_parameters", []), dtype=bool
+        ),
+        car_llm_include_decision_feedback=np.asarray(
+            trace.get("car_llm_include_decision_feedback", []), dtype=bool
+        ),
         car_llm_system_prompt_paths=np.asarray(
             trace.get("car_llm_system_prompt_paths", []), dtype=str
         ),
         car_llm_system_prompts=np.asarray(
             trace.get("car_llm_system_prompts", []), dtype=str
+        ),
+        car_llm_output_schemas=np.asarray(
+            trace.get("car_llm_output_schemas", []), dtype=str
         ),
         llm_parameter_names=np.asarray(
             trace.get("llm_parameter_names", params.ALPHARACER_PARAMETER_NAMES),

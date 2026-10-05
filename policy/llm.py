@@ -72,6 +72,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         system_prompt_path=None,
         prompt_variant="raw",
         observation_variant="baseline",
+        include_raceline_speed=False,
+        include_current_parameters=False,
+        include_decision_feedback=False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -95,7 +98,34 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 f"Unknown LLM observation variant: {self.observation_variant}"
             )
         if self.response_format == "params" and self.prompt_variant == "raw":
-            self.prompt_variant = "direct_params_effect_aware"
+            self.prompt_variant = "direct_params_modular_v1"
+        self.input_schema_version = (
+            "direct_params_modular_v1"
+            if self.response_format == "params"
+            else "mode_legacy_v1"
+        )
+        self.include_raceline_speed = bool(include_raceline_speed)
+        self.include_current_parameters = bool(include_current_parameters)
+        self.include_decision_feedback = bool(include_decision_feedback)
+        if self.response_format != "params" and any((
+            self.include_raceline_speed,
+            self.include_current_parameters,
+            self.include_decision_feedback,
+        )):
+            raise ValueError(
+                "Direct-parameter input-module flags require output_mode='params'"
+            )
+        self.input_modules = {
+            "base": True,
+            "raceline_speed": self.include_raceline_speed,
+            "current_parameters": self.include_current_parameters,
+            "decision_feedback": self.include_decision_feedback,
+        }
+        if self.response_format == "params" and self.observation_variant != "baseline":
+            raise ValueError(
+                "Direct-parameter policies use independent input-module booleans; "
+                "legacy llm_observation_variant values apply only to mode policies"
+            )
         if self.response_format not in {"mode", "params"}:
             raise ValueError(f"Unknown LLM response format: {output_mode}")
         self.llm_decision_history = []
@@ -138,8 +168,10 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "- ego.lap_progress_percent: ego progress around the current lap, from 0 to 100.\n",
                 "",
             )
-        variant_instruction = OBSERVATION_VARIANT_INSTRUCTIONS.get(
-            self.observation_variant
+        variant_instruction = (
+            OBSERVATION_VARIANT_INSTRUCTIONS.get(self.observation_variant)
+            if self.response_format == "mode"
+            else None
         )
         if variant_instruction:
             self.system_prompt = f"{self.system_prompt}\n\n{variant_instruction}"
@@ -307,7 +339,147 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "ttc_seconds": ttc_seconds,  # null if donot approach
         }
 
+    def _direct_parameter_road_modules(self, current_s: float) -> tuple[dict, dict]:
+        """Build factual road and optional speed modules on one shared grid."""
+        preview_length = max(float(sim_params.LLM_ROAD_PREVIEW_LENGTH_METERS), 0.0)
+        sample_count = max(int(sim_params.LLM_ROAD_PREVIEW_SAMPLE_COUNT), 1)
+        distances = np.linspace(0.0, preview_length, sample_count)
+        road_samples = []
+        target_speeds = []
+        centerline_s_hint = current_s
+        for distance in distances:
+            sample_s = current_s + float(distance)
+            raceline_offset = None
+            raceline_speed = None
+            if self.raceline is not None:
+                center_x, center_y, _ = self.track.interpolate(sample_s)
+                raceline_idx = self.raceline.nearest_index(center_x, center_y)
+                raceline_state = self._raceline_frenet_point(
+                    float(self.raceline.s[raceline_idx]),
+                    centerline_s_hint=centerline_s_hint,
+                )
+                centerline_s_hint = raceline_state["track_s"]
+                raceline_offset = raceline_state["lateral_e"]
+                raceline_speed = raceline_state["speed"]
+            road_samples.append({
+                "distance_ahead_m": self._rounded(distance, digits=1),
+                "centerline_curvature_per_m": self._rounded(
+                    track_curvature_at(self.track, sample_s), digits=3
+                ),
+                "raceline_offset_m": self._rounded(raceline_offset, digits=3),
+            })
+            target_speeds.append(self._rounded(raceline_speed, digits=2))
+        return (
+            {"samples_near_to_far": road_samples},
+            {"target_speed_mps_at_preview_points": target_speeds},
+        )
+
+    def _direct_parameter_feedback(
+        self, state: CarState, current_s: float, opponents
+    ):
+        current_gaps = {
+            int(opponent.get("car_idx", -1)): abs(
+                float(progress_delta(
+                    opponent["px"], current_s, self.track.total_length
+                ))
+            )
+            for opponent in opponents
+        }
+        current = {
+            "control_call": self._llm_call_count,
+            "s": float(current_s),
+            "speed": max(float(state.vx), 0.0),
+            "gaps": current_gaps,
+        }
+        self._pending_decision_feedback_state = current
+        previous = self._previous_decision_feedback_state
+        if previous is None:
+            return None
+        gap_changes = [
+            {
+                "id": car_idx,
+                "longitudinal_gap_change_m": self._rounded(
+                    current_gaps[car_idx] - previous["gaps"][car_idx], digits=2
+                ),
+            }
+            for car_idx in sorted(current_gaps.keys() & previous["gaps"].keys())
+        ]
+        return {
+            "previous_progress_change_m": self._rounded(
+                current["s"] - previous["s"], digits=2
+            ),
+            "previous_speed_change_mps": self._rounded(
+                current["speed"] - previous["speed"], digits=2
+            ),
+            "previous_gap_changes": gap_changes,
+        }
+
+    def _direct_parameter_scene_features(
+        self, state: CarState, current_s: float, opponents=None
+    ) -> dict:
+        """Return the modular, rule-free direct-parameter observation."""
+        _, current_e = self.track.project(
+            state.x,
+            state.y,
+            s_hint=current_s,
+            search_radius=8.0,
+            psi_hint=state.psi,
+            max_heading_error=math.pi / 2.0,
+        )
+        _, _, center_heading = self.track.interpolate(current_s)
+        raw_opponents = sorted(
+            opponents or [], key=lambda opponent: int(opponent.get("car_idx", -1))
+        )
+        traffic = []
+        for opponent in raw_opponents:
+            traffic.append({
+                "id": int(opponent.get("car_idx", -1)),
+                "relative_longitudinal_position_m": self._rounded(
+                    progress_delta(
+                        opponent["px"], current_s, self.track.total_length
+                    ),
+                    digits=2,
+                ),
+                "relative_lateral_position_m": self._rounded(
+                    float(opponent.get("py", current_e)) - float(current_e),
+                    digits=3,
+                ),
+                "relative_speed_mps": self._rounded(
+                    max(float(opponent.get("vx", 0.0)), 0.0)
+                    - max(float(state.vx), 0.0),
+                    digits=2,
+                ),
+            })
+        road_preview, raceline_speed = self._direct_parameter_road_modules(current_s)
+        scene = {
+            "ego_state": {
+                "speed_mps": self._rounded(max(float(state.vx), 0.0), digits=2),
+                "lateral_position_m": self._rounded(current_e, digits=3),
+                "heading_error_rad": self._rounded(
+                    angle_delta(float(state.psi), center_heading), digits=3
+                ),
+            },
+            "traffic_state": {"all_opponents": traffic},
+            "road_preview": road_preview,
+        }
+        if self.include_raceline_speed:
+            scene["raceline_speed"] = raceline_speed
+        if self.include_current_parameters:
+            scene["current_parameters"] = {
+                name: self._rounded(value)
+                for name, value in zip(("q", "zeta", "s1", "s2", "s3"), self.params)
+            }
+        if self.include_decision_feedback:
+            scene["decision_feedback"] = self._direct_parameter_feedback(
+                state, current_s, raw_opponents
+            )
+        return scene
+
     def _scene_features(self, state: CarState, current_s: float, opponents=None) -> dict:
+        if self.response_format == "params":
+            return self._direct_parameter_scene_features(
+                state, current_s, opponents=opponents
+            )
         _, current_py = self.track.project(
             state.x,
             state.y,
@@ -481,22 +653,7 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         payload = self._scene_features(state, current_s, opponents=opponents)  # real-time scene features
         # Preserve the existing trace field without duplicating a second
         # assessment block inside the model input.
-        self.last_required_assessment = {
-            "ego": payload["ego"].copy(),
-            "traffic": payload["traffic"].copy(),
-            "road_preview": payload["road_preview"].copy(),
-        }
-
-        # additional info for param mode, including parameter bounds and current values
-        if self.response_format == "params":
-            payload["parameter_bounds"] = {
-                name: {"min": float(bounds[0]), "max": float(bounds[1])}
-                for name, bounds in self.param_bounds.items()
-            }
-            payload["current_parameters"] = {
-                name: self._rounded(value)
-                for name, value in zip(("q", "zeta", "s1", "s2", "s3"), self.params)
-            }
+        self.last_required_assessment = json.loads(json.dumps(payload))
         # Whitespace keeps the structured observation readable in raw prompt
         # logs while preserving valid JSON and the exact same data semantics.
         return json.dumps(payload, indent=2, ensure_ascii=True)
@@ -524,9 +681,10 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 lo, hi = self.param_bounds[name]
                 properties[name] = {"type": "number", "minimum": float(lo), "maximum": float(hi)}
                 required.append(name)
-        properties["basis"] = {"type": "string", "maxLength": 40}
-        properties["reason"] = {"type": "string", "maxLength": 120}
-        required.extend(["basis", "reason"])
+        if self.response_format == "mode":
+            properties["basis"] = {"type": "string", "maxLength": 40}
+            properties["reason"] = {"type": "string", "maxLength": 120}
+            required.extend(["basis", "reason"])
         return {
             "type": "object",
             "properties": properties,

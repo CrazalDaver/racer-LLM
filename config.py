@@ -265,6 +265,12 @@ class SimParams:
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.0
     LLM_UPDATE_INTERVAL_SECONDS = 1.0
+    # Direct-parameter input modules. The base always contains ego_state,
+    # every opponent in traffic_state, and road_preview. Non-base modules are
+    # independent switches so later ablations change one factor at a time.
+    LLM_INPUT_INCLUDE_RACELINE_SPEED = False
+    LLM_INPUT_INCLUDE_CURRENT_PARAMETERS = False
+    LLM_INPUT_INCLUDE_DECISION_FEEDBACK = False
     # Maximum number of executed modes exposed in
     # memory.recent_modes_oldest_to_newest.
     LLM_RECENT_MODES_MAX_LENGTH = 1

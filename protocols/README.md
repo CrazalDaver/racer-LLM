@@ -101,6 +101,10 @@ mode library remains a candidate interface and is retained as a contribution
 only if it shows measurable headroom and a defensible advantage over direct or
 fixed parameters.
 
+The current direct-selection observation contract is documented separately as
+[`direct_params_modular_v1`](direct-params-modular-v1.md). Its optional input
+modules are experimental-arm factors, not changes to the frozen substrate.
+
 For every arm, preserve:
 
 - the stated hypothesis and single changed factor;
