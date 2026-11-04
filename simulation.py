@@ -6,7 +6,6 @@ import numpy as np
 
 from config import duration_to_steps, make_vehicle_params, params
 from mpc_controller import MPCController
-from mpc_upstream_simple import UpstreamSimpleMPCController
 from visualization.plotting import plot_simulation_results
 from policy import progress_delta
 from simulation_core.environment import RaceEnvironment
@@ -205,18 +204,8 @@ class Race:
             if config.mpc_formulation is None
             else str(config.mpc_formulation)
         )
-        controller_types = {
-            "constrained_local": MPCController,
-            "upstream_simple": UpstreamSimpleMPCController,
-        }
-        if self.resolved_mpc_formulation not in controller_types:
-            raise ValueError(
-                "mpc_formulation must be one of "
-                f"{sorted(controller_types)}, got {self.resolved_mpc_formulation!r}"
-            )
-        controller_type = controller_types[self.resolved_mpc_formulation]
-        if self.resolved_mpc_formulation == "upstream_simple":
-            self.mpc_velocity_track_weight = 0.0
+        if self.resolved_mpc_formulation != "constrained_local":
+            raise ValueError("Only the constrained_local MPC is supported")
 
         self.mpcs, self.policies = [], []
         self.vehicle_models, self.states = [], []
@@ -226,7 +215,7 @@ class Race:
                 if config.mpc_horizon is None and policy_name == "ibr"
                 else self.mpc_horizon
             )
-            mpc = controller_type(
+            mpc = MPCController(
                 dt=params.MPC_DT,
                 horizon=car_mpc_horizon,
                 Q=params.Q,
@@ -615,12 +604,6 @@ if __name__ == "__main__":
         help="Override the quadratic MPC collision-avoidance slack weight.",
     )
     parser.add_argument(
-        "--mpc-formulation",
-        choices=["constrained_local", "upstream_simple"],
-        default=None,
-        help="Select the local constrained or detachable upstream-style MPC.",
-    )
-    parser.add_argument(
         "--raceline-csv",
         default=None,
         metavar="CSV",
@@ -697,7 +680,6 @@ if __name__ == "__main__":
         start_gap=cli_args.start_gap,
         start_speeds=cli_args.initial_speeds,
         initial_speed=0.0,
-        mpc_formulation=cli_args.mpc_formulation,
         mpc_min_state_speed=cli_args.mpc_min_state_speed,
         mpc_velocity_weight=cli_args.mpc_velocity_track_weight,
         mpc_track_slack=cli_args.mpc_track_slack_weight,

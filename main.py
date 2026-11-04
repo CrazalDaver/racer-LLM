@@ -687,12 +687,6 @@ def _add_sim_args(parser):
         help="Override the quadratic MPC collision-avoidance slack weight.",
     )
     group.add_argument(
-        "--mpc-formulation",
-        choices=["constrained_local", "upstream_simple"],
-        default=None,
-        help="Select the local constrained or simplified upstream-style MPC.",
-    )
-    group.add_argument(
         "--raceline-csv",
         type=Path,
         default=None,
@@ -917,7 +911,6 @@ def _sweep_kwargs_from_args(args):
         "mpc_track_slack": args.mpc_track_slack_weight,
         "mpc_collision_slack": args.mpc_collision_slack_weight,
         "mpc_horizon": args.mpc_horizon,
-        "mpc_formulation": args.mpc_formulation,
         "static_params": args.static_params,
         "alpha_params": args.alpha_params,
         "alpha_weight_path": args.alpharacer_weight,

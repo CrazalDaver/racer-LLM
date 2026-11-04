@@ -54,7 +54,7 @@ class SimulationConfig:
 
     # Vehicle and MPC
     vehicle_model: str | None = None
-    mpc_formulation: str | None = None
+    mpc_formulation: str | None = None  # Replay compatibility; only constrained_local is supported.
     mpc_horizon: int | None = None
     mpc_min_state_speed: float | None = None
     mpc_velocity_weight: float | None = None

@@ -258,8 +258,7 @@ class SimParams:
     # ==================== MPC CONTROL AND COST =================
 
     MPC_DT = 0.1
-    # Optional detachable comparison profile.  ``constrained_local`` remains
-    # the default and preserves all existing experiments.
+    # Controller identifier retained in saved traces and replay settings.
     MPC_FORMULATION = "constrained_local"
 
     MPC_HORIZON = 10
