@@ -70,7 +70,8 @@ class ProjectablePath:
             if result is not None:
                 return result
         if allow_global_fallback:
-            return self._project_impl(x, y)
+            # Search globally, but retain the hint for cumulative progress.
+            return self._project_impl(x, y, s_hint=s_hint)
         raise ValueError("Projection failed within the local progress window.")
 
     def _project_impl(
