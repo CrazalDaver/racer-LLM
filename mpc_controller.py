@@ -212,10 +212,9 @@ class MPCController:
             symbolic=True,
         )
 
-    def _vehicle_dynamics_np(self, xk, uk):  # in numpy
-        curvature = float(np.interp(
-            float(xk[0]), self._curvature_grid, self._curvature_values
-        ))
+    def _vehicle_dynamics_np(self, xk, uk):  # Numeric rollout for the warm start.
+        # Query the same B-spline as the NLP's symbolic prediction.
+        curvature = float(self.curvature_fn(float(xk[0])))
         return kinematic_frenet_step(
             xk,
             uk,
