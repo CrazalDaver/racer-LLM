@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-import pickle
 import time
 
-import casadi as cs
 import numpy as np
 
 from config import duration_to_steps, params
 from policy import progress_delta
-
-
-def _discard_branch_log(*_args, **_kwargs):
-    """Silence expected solver recovery messages inside hypothetical branches."""
+from .runtime_snapshot import RuntimeSnapshotter
 
 
 class OracleRolloutEvaluator:
@@ -33,6 +28,7 @@ class OracleRolloutEvaluator:
 
     def __init__(self, race):
         self.race = race
+        self.snapshotter = RuntimeSnapshotter(race)
         config = race.config
 
         def resolved(value, default):
@@ -122,42 +118,11 @@ class OracleRolloutEvaluator:
         }
 
     def _snapshot_runtime(self) -> bytes:
-        # tqdm-bound logger methods are presentation state, not control state,
-        # and are not reliably pickleable.  Replace them only while taking the
-        # atomic pre-action snapshot, then restore the real policies unchanged.
-        saved_loggers = [policy.log_fn for policy in self.race.policies]
-        try:
-            for policy in self.race.policies:
-                policy.log_fn = print
-            with cs.global_pickle_context():
-                return pickle.dumps(
-                    (
-                        self.race.environment,
-                        self.race.policies,
-                        self.race.mpcs,
-                    ),
-                    protocol=pickle.HIGHEST_PROTOCOL,
-                )
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not serialize the simulator state for oracle rollouts"
-            ) from exc
-        finally:
-            for policy, logger in zip(self.race.policies, saved_loggers):
-                policy.log_fn = logger
+        return self.snapshotter.capture()
 
     @staticmethod
     def _restore_runtime(snapshot: bytes):
-        try:
-            with cs.global_unpickle_context():
-                environment, policies, mpcs = pickle.loads(snapshot)
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not independently restore an oracle rollout branch"
-            ) from exc
-        for policy in policies:
-            policy.log_fn = _discard_branch_log
-        return environment, policies, mpcs
+        return RuntimeSnapshotter.restore(snapshot)
 
     @staticmethod
     def _relative_to_best_opponent(progress, ego_idx):

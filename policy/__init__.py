@@ -1,4 +1,4 @@
-from .alpharacer import AlphaRacerPolicy
+from .alpharacer import AlphaRacerPolicy, ModeAlphaRacerPolicy
 from .ibr import (
     IteratedBestResponsePolicy,
     ParameterIBRPolicy,
@@ -21,6 +21,7 @@ __all__ = [
     "FixedModePolicy",
     "LLMAlphaRacerPolicy",
     "MPCPolicy",
+    "ModeAlphaRacerPolicy",
     "OracleModePolicy",
     "RuleBasedPolicy",
     "SelfPlayRLPolicy",

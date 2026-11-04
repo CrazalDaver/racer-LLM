@@ -163,6 +163,15 @@ class Race:
         self.mpc_horizon = (
             params.MPC_HORIZON if config.mpc_horizon is None else int(config.mpc_horizon)
         )
+        self.mpc_min_state_speed = (
+            params.MPC_MIN_STATE_SPEED
+            if config.mpc_min_state_speed is None
+            else float(config.mpc_min_state_speed)
+        )
+        if not 0.0 <= self.mpc_min_state_speed <= params.MAX_STATE_SPEED:
+            raise ValueError(
+                "mpc_min_state_speed must be within [0, MAX_STATE_SPEED]"
+            )
         self.mpc_velocity_track_weight = (
             params.VELOCITY_TRACK_WEIGHT
             if config.mpc_velocity_weight is None
@@ -228,6 +237,7 @@ class Race:
                 track_width=params.TRACK_WIDTH,
                 track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
                 max_state_speed=params.MAX_STATE_SPEED,
+                min_state_speed=self.mpc_min_state_speed,
                 velocity_track_weight=self.mpc_velocity_track_weight,
                 heading_track_weight=params.HEADING_TRACK_WEIGHT,
                 track_length=self.track.total_length,
@@ -277,6 +287,7 @@ class Race:
                     llm_temperature=self.resolved_llm_temperatures[car_idx],
                     llm_update_interval_seconds=config.llm_update_interval,
                     llm_observation_variant=config.llm_observation_variant,
+                    llm_prompt_module=config.llm_prompt_module,
                     llm_include_raceline_speed=config.llm_include_raceline_speed,
                     llm_include_current_parameters=(
                         config.llm_include_current_parameters
@@ -344,6 +355,7 @@ class Race:
             states=self.states,
             vehicle_models=self.vehicle_models,
             initial_progress=initial_progress,
+            curvature_fn=self.mpcs[0].curvature_fn,
         )
         self.oracle_evaluator = (
             OracleRolloutEvaluator(self)
@@ -353,6 +365,11 @@ class Race:
             )
             else None
         )
+        self.potential_regret_evaluator = None
+        if self.config.potential_regret_enabled:
+            from evaluation.potential_regret import PotentialRegretEvaluator
+
+            self.potential_regret_evaluator = PotentialRegretEvaluator(self)
         self.recorder = TraceRecorder(self)
         self.reporter = _ProgressReporter(
             self, self.total_steps, report_steps
@@ -367,6 +384,21 @@ class Race:
             self.environment.begin_step(step)
             observation = self.environment.capture(self.policies)
 
+            regret_snapshot = None
+            regret_decision_count = None
+            regret_previous_theta = None
+            if (
+                self.potential_regret_evaluator is not None
+                and self.potential_regret_evaluator.decision_due()
+            ):
+                regret_snapshot = self.potential_regret_evaluator.capture()
+                regret_decision_count = int(
+                    getattr(self.policies[self.ego_idx], "policy_decision_count", 0)
+                )
+                regret_previous_theta = np.asarray(
+                    self.policies[self.ego_idx].params, dtype=float
+                ).copy()
+
             # Oracle branches are evaluated from this single pre-action
             # snapshot.  Applying the winning preset changes policy state only;
             # the real environment is advanced exactly once below.
@@ -380,12 +412,41 @@ class Race:
                         policy.apply_oracle_decision(decision)
 
             # ----- B. Ask every policy to act -----
-            actions = tuple(
-                policy.get_action(observation) for policy in self.policies
-            )
+            try:
+                actions=[]
+                for car_idx,policy in enumerate(self.policies):
+                    actions.append(policy.get_action(observation))
+                actions=tuple(actions)
+            except RuntimeError as exc:
+                self.recorder.trace['failure']=dict(step=step,time=observation.sim_time,
+                    car_idx=car_idx,error=str(exc),solver_diagnostics=getattr(
+                        self.mpcs[car_idx],'last_diagnostics',{}).copy())
+                break
+
+            if regret_snapshot is not None:
+                self.potential_regret_evaluator.evaluate(
+                    regret_snapshot,
+                    observation,
+                    step,
+                    regret_decision_count,
+                    regret_previous_theta,
+                )
 
             # ----- C. Advance physics by one step -----
             transition = self.environment.step(actions)
+            for policy,action in zip(self.policies,transition.actions):
+                policy.last_u=np.array([action.throttle,action.steer])
+
+            for car_idx, policy in enumerate(self.policies):
+                record_events = getattr(policy, "record_interval_events", None)
+                if callable(record_events):
+                    record_events(
+                        collision=transition.contact_active[car_idx],
+                        off_track=(
+                            abs(transition.next_e[car_idx])
+                            > self.recorder.track_half_width
+                        ),
+                    )
 
             # ----- D. Record and report the result -----
             self.recorder.record(step, transition, self.environment)
@@ -505,6 +566,11 @@ if __name__ == "__main__":
         default="baseline",
     )
     parser.add_argument(
+        "--llm-prompt-module",
+        choices=["base", "base_plus_mechanics"],
+        default="base",
+    )
+    parser.add_argument(
         "--llm-include-raceline-speed",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -520,6 +586,13 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
+    parser.add_argument(
+        "--mpc-min-state-speed",
+        type=float,
+        default=None,
+        metavar="MPS",
+        help="Override the predicted-state speed lower bound.",
+    )
     parser.add_argument(
         "--mpc-velocity-track-weight",
         type=float,
@@ -578,6 +651,11 @@ if __name__ == "__main__":
             output_path = output_path.with_suffix(".npz")
         output_path.parent.mkdir(parents=True, exist_ok=True)
     if (
+        cli_args.mpc_min_state_speed is not None
+        and not 0.0 <= cli_args.mpc_min_state_speed <= params.MAX_STATE_SPEED
+    ):
+        parser.error("--mpc-min-state-speed must be within [0, MAX_STATE_SPEED]")
+    if (
         cli_args.mpc_track_slack_weight is not None
         and cli_args.mpc_track_slack_weight < 0.0
     ):
@@ -620,11 +698,13 @@ if __name__ == "__main__":
         start_speeds=cli_args.initial_speeds,
         initial_speed=0.0,
         mpc_formulation=cli_args.mpc_formulation,
+        mpc_min_state_speed=cli_args.mpc_min_state_speed,
         mpc_velocity_weight=cli_args.mpc_velocity_track_weight,
         mpc_track_slack=cli_args.mpc_track_slack_weight,
         mpc_collision_slack=cli_args.mpc_collision_slack_weight,
         ibr_implementation=cli_args.ibr_implementation,
         llm_observation_variant=cli_args.llm_observation_variant,
+        llm_prompt_module=cli_args.llm_prompt_module,
         llm_include_raceline_speed=cli_args.llm_include_raceline_speed,
         llm_include_current_parameters=cli_args.llm_include_current_parameters,
         llm_include_decision_feedback=cli_args.llm_include_decision_feedback,

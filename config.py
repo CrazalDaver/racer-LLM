@@ -5,6 +5,8 @@ This module contains shared defaults used when an override is absent.
 """
 
 import copy
+from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -24,6 +26,30 @@ ALPHARACER_PARAMETER_BOUNDS = np.asarray(
     ],
     dtype=float,
 )
+
+
+ROOT = Path(__file__).resolve().parent
+TRACK_DIR = ROOT / "track"
+
+
+@dataclass(frozen=True)
+class TrackConfig:
+    csv_name: str           # input centerline; two columns x,y
+    scale: float            # multiply source x/y by this to obtain physical m
+    half_width_m: float     # center-to-boundary distance, excluding car width
+
+    @property
+    def path(self) -> Path:
+        return TRACK_DIR / "csv" / self.csv_name
+
+
+# Original centerline assets and their original simulator scale/width.
+TRACKS = {
+    "berlin": TrackConfig("berlin_2018.csv", 2.0, 0.44),
+    "modena": TrackConfig("modena_2019.csv", 2.0, 0.37),
+    "rounded_rectangle": TrackConfig("rounded_rectangle.csv", 1.0, 0.50),
+}
+
 
 
 class DynamicParams:
@@ -109,7 +135,9 @@ class DynamicParams:
 
 
 def make_vehicle_params(vehicle_model_type):
-    return DynamicParams(vehicle_model_type)
+    vehicle = DynamicParams(vehicle_model_type)
+    vehicle.INTEGRATION_SUBSTEPS = params.DBM_INTEGRATION_SUBSTEPS
+    return vehicle
 
 
 def duration_to_steps(duration_seconds, dt):
@@ -121,10 +149,8 @@ def duration_to_steps(duration_seconds, dt):
 
 
 class SimParams:
-    # Frozen experiment contract. Any change to its plant, MPC, recovery,
-    # track/raceline, timing, parameter space, scenarios, or metrics requires
-    # a new version; see protocols/K-Constrained-v1.json.
-    PROTOCOL_VERSION = "K-Constrained-v1"
+    # Development status only; the simulation substrate is not frozen.
+    DEVELOPMENT_STATUS = "in-progress"
 
     # ==================== SIMULATION TIMING ====================
 
@@ -137,9 +163,9 @@ class SimParams:
 
     # ==================== TRACK AND START GRID =================
 
-    TRACK_CSV = "track_csv/berlin_2018.csv"
+    TRACK_CSV = str(TRACKS["berlin"].path)
     # Locally recomputed minimum-curvature raceline (Sa = 0.34).
-    RACELINE_CSV = "track_csv/generated/berlin_mincurv_iqp_local.csv"
+    RACELINE_CSV = str(TRACK_DIR / "berlin_raceline.csv")
     TRACK_SCALE = 2.0
     TRACK_HALF_WIDTH = 0.44
     TRACK_WIDTH = 2.0 * TRACK_HALF_WIDTH
@@ -148,7 +174,8 @@ class SimParams:
 
     # ==================== VEHICLE AND CONTACT ==================
 
-    VEHICLE_MODEL = "kinematic"
+    VEHICLE_MODEL = "dbm"
+    DBM_INTEGRATION_SUBSTEPS = 50  # approved RK4 substeps per SIM_DT
     VEHICLE_HALF_LENGTH = 0.18
     VEHICLE_HALF_WIDTH = 0.12
     # Upstream-style asymmetric overlap decay applied once per 0.1 s step.
@@ -204,6 +231,10 @@ class SimParams:
     # It progressively limits steering at high speed using a friction proxy.
     MPC_ENFORCE_FRICTION_SPEED_LIMIT = True
     MPC_FRICTION_COEFFICIENT = 1.6
+    # Optional speed floor. This lower bound applies only to
+    # MPC-predicted future states (k=1..N), not the measured state at k=0 or
+    # the physical plant's [0, MAX_STATE_SPEED] speed bounds.
+    MPC_MIN_STATE_SPEED = 0.0
 
     # ==================== RECOVERY AND LIVENESS ================
 
@@ -224,10 +255,6 @@ class SimParams:
     OFFROAD_INWARD_STEER = 1.0
     OFFROAD_LARGE_HEADING_ERROR = 1.0
     OFFROAD_THROTTLE_BOOST = 0.2
-    # Kinematic-model compatibility: below this speed, force at least the
-    # neutral throttle plus the upstream +0.2 boost so an aligned car cannot
-    # remain trapped at the zero-acceleration equilibrium.
-    OFFROAD_LOW_SPEED_THRESHOLD = 0.3
     # ==================== MPC CONTROL AND COST =================
 
     MPC_DT = 0.1
@@ -242,7 +269,7 @@ class SimParams:
 
     # Shared reference-speed tracking term.  It helps prevent the zero-speed
     # receding-horizon equilibrium observed around the Berlin hairpin.
-    VELOCITY_TRACK_WEIGHT = 10.0
+    VELOCITY_TRACK_WEIGHT = 0.0
     HEADING_TRACK_WEIGHT = 0.0 # weight for heading tracking in MPC cost
     MAX_VEL_RATE = 8.0
     MAX_STATE_SPEED = 5.0
@@ -270,6 +297,8 @@ class SimParams:
     # independent switches so later ablations change one factor at a time.
     LLM_INPUT_INCLUDE_RACELINE_SPEED = False
     LLM_INPUT_INCLUDE_CURRENT_PARAMETERS = False
+    # One-step memory containing the previous complete observation, executed
+    # parameters, and ego collision/off-track events over the decision interval.
     LLM_INPUT_INCLUDE_DECISION_FEEDBACK = False
     # Maximum number of executed modes exposed in
     # memory.recent_modes_oldest_to_newest.

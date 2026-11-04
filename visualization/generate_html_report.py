@@ -265,7 +265,8 @@ def generate_report(
     result_paths,
     output="simulation_report.html",
     animation_stride=2,
-    animation_interval=30,
+    animation_interval=None,
+    animation_speed=1.0,
     animation_dpi=80,
     plot_dpi=110,
     include_animation=True,
@@ -340,6 +341,7 @@ def generate_report(
                     trace_path,
                     stride=animation_stride,
                     interval=animation_interval,
+                    playback_speed=animation_speed,
                     save_path=gif_path,
                     dpi=animation_dpi,
                 )
@@ -478,8 +480,12 @@ def parse_args():
     )
     
     parser.add_argument("-o", "--output", default=str(DEFAULT_REPORT_PATH))
-    parser.add_argument("--stride", type=int, default=2, help="Animation frame stride.")
-    parser.add_argument("--interval", type=int, default=30, help="GIF frame interval in ms.")
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Playback speed relative to simulation time (default: 1.0).",
+    )
     parser.add_argument("--animation-dpi", type=int, default=80)
     parser.add_argument("--plot-dpi", type=int, default=110)
     parser.add_argument("--no-animation", action="store_true")
@@ -497,8 +503,9 @@ if __name__ == "__main__":
     generate_report(
         selected_paths,
         output=args.output,
-        animation_stride=args.stride,
-        animation_interval=args.interval,
+        animation_stride=1,
+        animation_interval=None,
+        animation_speed=args.speed,
         animation_dpi=args.animation_dpi,
         plot_dpi=args.plot_dpi,
         include_animation=not args.no_animation,

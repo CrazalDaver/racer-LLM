@@ -9,7 +9,7 @@ from typing import Literal, Sequence
 
 PolicyName = Literal[
     "centerline", "static_alpharacer", "fixed_push", "oracle_mode",
-    "alpharacer", "ibr", "parameter_ibr",
+    "alpharacer", "mode_alpharacer", "ibr", "parameter_ibr",
     "llm_alpharacer", "rule_based", "self_play_rl",
 ]
 CANONICAL_POLICY_NAMES = frozenset(PolicyName.__args__)
@@ -20,6 +20,7 @@ LLM_OBSERVATION_VARIANTS = (
     "raceline_speed",
     "decision_feedback",
 )
+LLM_PROMPT_MODULES = ("base", "base_plus_mechanics", "mode_v2")
 
 
 def validate_policy_name(name: str) -> str:
@@ -55,6 +56,7 @@ class SimulationConfig:
     vehicle_model: str | None = None
     mpc_formulation: str | None = None
     mpc_horizon: int | None = None
+    mpc_min_state_speed: float | None = None
     mpc_velocity_weight: float | None = None
     mpc_track_slack: float | None = None
     mpc_collision_slack: float | None = None
@@ -78,6 +80,7 @@ class SimulationConfig:
     llm_temperatures: Sequence[float | None] | None = None
     llm_update_interval: float | None = None
     llm_observation_variant: str = "baseline"
+    llm_prompt_module: str = "base"
     llm_include_raceline_speed: bool | None = None
     llm_include_current_parameters: bool | None = None
     llm_include_decision_feedback: bool | None = None
@@ -91,6 +94,16 @@ class SimulationConfig:
     oracle_collision_penalty: float | None = None
     oracle_offtrack_penalty_per_second: float | None = None
     oracle_tie_tolerance: float | None = None
+
+    # Optional learned-potential paired-rollout diagnostic. Disabled by
+    # default so existing simulations do not load a network or branch state.
+    potential_regret_enabled: bool = False
+    potential_regret_weight_path: str | Path | None = None
+    potential_regret_horizon_seconds: float = 1.0
+    potential_regret_sobol_points: int = 8
+    potential_regret_max_iterations: int = 40
+    potential_regret_optimizer_seed: int = 0
+    potential_regret_device: str | None = None
 
     # Self-play RL
     rl_model_path: str | None = None

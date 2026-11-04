@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import numpy as np
 
 try:
@@ -9,8 +7,9 @@ except ImportError:
 
 from .network import (
     ALPHA_PARAMETER_BOUNDS,
-    SimpleNeuralNetwork,
+    alpha_network_input,
     build_alpha_input,
+    load_potential_checkpoint,
 )
 from ..mpc import MPCPolicy
 
@@ -49,30 +48,13 @@ class AlphaRacerPolicy(MPCPolicy):
         if torch is None:
             raise ImportError("PyTorch is required to use AlphaRacerPolicy.")
 
-        self.weight_path = Path(weight_path)
-        if not self.weight_path.exists():
-            raise FileNotFoundError(f"alpha-RACER weight file not found: {self.weight_path}")
-
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.potential_function = SimpleNeuralNetwork().to(self.device)
-        checkpoint = torch.load(str(self.weight_path), map_location=self.device)
-        # Local checkpoints include experiment metadata; released upstream
-        # files are raw state dicts. Supporting both keeps the baseline intact.
-        wrapped_checkpoint = isinstance(checkpoint, dict) and "state_dict" in checkpoint
-        state_dict = checkpoint["state_dict"] if wrapped_checkpoint else checkpoint
-        metadata = checkpoint.get("metadata", {}) if wrapped_checkpoint else {}
-        if wrapped_checkpoint and "parameterization" not in metadata:
-            raise ValueError(
-                "Local alpha-RACER checkpoint metadata must declare its parameterization; "
-                "retrain or add parameterization='paper_q_zeta_s1_s2_s3'."
-            )
-        # Released files are raw state dicts and are the only implicitly
-        # legacy format. Locally produced wrapped checkpoints are explicit.
-        self.weight_parameterization = metadata.get("parameterization", "upstream_transformed")
-        if self.weight_parameterization not in {"paper_q_zeta_s1_s2_s3", "upstream_transformed"}:
-            raise ValueError(f"Unsupported alpha-RACER checkpoint parameterization: {self.weight_parameterization}")
-        self.potential_function.load_state_dict(state_dict)
-        self.potential_function.eval()
+        (
+            self.weight_path,
+            self.potential_function,
+            self.weight_metadata,
+            self.weight_parameterization,
+        ) = load_potential_checkpoint(weight_path, self.device)
 
         self.search_points = max(2, int(search_points))
         self.search_iters = max(1, int(search_iters))
@@ -91,6 +73,7 @@ class AlphaRacerPolicy(MPCPolicy):
         ).copy()
         self.current_mode = "potential"
         self.joint_params = np.repeat(self.opponent_default_params[None, :], 3, axis=0)
+        self._oracle_rollout_frozen = False
         if self.car_idx is not None and 0 <= self.car_idx < 3:
             self.joint_params[self.car_idx] = self.params
         # This is this agent's own estimate of the joint policy parameters.
@@ -104,16 +87,10 @@ class AlphaRacerPolicy(MPCPolicy):
 
     def _network_input(self, paper_input):
         """Convert only legacy checkpoint inputs, preserving autograd."""
-        if self.weight_parameterization == "paper_q_zeta_s1_s2_s3":
-            return paper_input
-        state_features = paper_input[..., :-15]
-        theta = paper_input[..., -15:].reshape(*paper_input.shape[:-1], 3, 5)
-        q, zeta, s1, s2, s3 = theta.unbind(dim=-1)
-        upstream = torch.stack(
-            (s1, s2, 0.5 / torch.clamp(q, min=1e-6), torch.sqrt(torch.clamp(zeta, min=0.0)), s3),
-            dim=-1,
+        return alpha_network_input(
+            paper_input,
+            self.weight_parameterization,
         )
-        return torch.cat((state_features, upstream.reshape(*paper_input.shape[:-1], 15)), dim=-1)
 
     def _potential(self, paper_input):
         return self.potential_function(self._network_input(paper_input))
@@ -170,16 +147,22 @@ class AlphaRacerPolicy(MPCPolicy):
                 {
                     "px": car.s,
                     "py": car.e,
-                    "vx": car.state.vx,
-                    "vy": car.state.vy,
+                    "vx": car.vx_body,
+                    "vy": car.vy_body,
                     "omega": car.state.omega,
                     "psi": car.state.psi,
+                    "heading_error": -car.heading_error,  # network uses tangent minus body
                     "state": car.state,
                 }
             )
         if len(cars) < 3:
             raise ValueError("AlphaRacerPolicy requires a three-car RaceObservation")
-        joint = self._maximize_joint_params(cars, self.joint_params)
-        self.joint_params = joint.copy()
-        self.params = joint[self.car_idx].copy()
+        if not self._oracle_rollout_frozen:
+            joint = self._maximize_joint_params(cars, self.joint_params)
+            self.joint_params = joint.copy()
+            self.params = joint[self.car_idx].copy()
         return super().get_action(observation)
+
+    def freeze_for_oracle_rollout(self):
+        """Hold the current high-level parameters in a diagnostic branch."""
+        self._oracle_rollout_frozen = True

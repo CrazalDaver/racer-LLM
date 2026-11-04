@@ -4,6 +4,7 @@ import casadi as cs
 import numpy as np
 
 from config import GRAVITY
+from track.track import frenet_denominator
 
 
 def oriented_rectangle_overlap_cost(state_a, state_b, half_length, half_width):
@@ -109,13 +110,8 @@ def kinematic_frenet_step(
     # bound keeps those recovery iterates finite without changing ordinary
     # in-bound dynamics.
     if curvature_mode == "geometric":
-        margin = float(minimum_denominator)
-        smoothing = 1.0e-4
-        denominator = 0.5 * (
-            raw_denominator
-            + margin
-            + trig.sqrt((raw_denominator - margin) ** 2 + smoothing**2)
-        )
+        denominator = frenet_denominator(
+            raw_denominator, minimum=float(minimum_denominator), sqrt=trig.sqrt)
     else:
         denominator = raw_denominator
     path_heading_rate = (
@@ -149,6 +145,7 @@ class DynamicBicycleModel:
     def __init__(self, dt, db_params):
         self.dt = dt
         self.p = db_params
+        self.last_control = np.zeros(2)
 
     def _dbm_dxdt(self, state, target_vel, target_steer):
         x, y, psi, vx, vy, omega = state
@@ -185,14 +182,21 @@ class DynamicBicycleModel:
         target_vel = float(np.clip(target_vel, 0.0, 1.0))
         target_steer = float(np.clip(target_steer, -1.0, 1.0))
 
+        self.last_control = np.array([target_vel, target_steer])
         def f(s, tv, ts):
             return self._dbm_dxdt(s, tv, ts)
 
-        k1 = f(state, target_vel, target_steer)
-        k2 = f(state + 0.5 * self.dt * k1, target_vel, target_steer)
-        k3 = f(state + 0.5 * self.dt * k2, target_vel, target_steer)
-        k4 = f(state + self.dt * k3, target_vel, target_steer)
-        next_state = state + self.dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+        substeps = int(getattr(self.p, "INTEGRATION_SUBSTEPS", 1))
+        if substeps < 1:
+            raise ValueError("INTEGRATION_SUBSTEPS must be positive")
+        h = self.dt / substeps
+        next_state = np.array(state, dtype=float, copy=True)
+        for _ in range(substeps):
+            k1 = f(next_state, target_vel, target_steer)
+            k2 = f(next_state + 0.5 * h * k1, target_vel, target_steer)
+            k3 = f(next_state + 0.5 * h * k2, target_vel, target_steer)
+            k4 = f(next_state + h * k3, target_vel, target_steer)
+            next_state = next_state + h / 6.0 * (k1 + 2*k2 + 2*k3 + k4)
         next_state[2] = wrap_angle(next_state[2])
         return next_state
 

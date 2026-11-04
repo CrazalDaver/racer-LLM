@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -52,12 +53,14 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         base_url="http://localhost:11434",
         timeout=3.0,
         temperature=0.0,
+        thinking=False,
         update_interval_seconds=1.0,
         decision_dt=None,
         history_length=None,
         output_mode="auto", # Public compatibility option selecting the LLM response format: "mode", "params", or "auto".
         param_bounds=None,
         system_prompt_path=None,
+        prompt_module="base",
         prompt_variant="raw",
         observation_variant="baseline",
         include_raceline_speed=False,
@@ -69,7 +72,11 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.retry_count = 0
+        self.fallback_behavior = "hold_previous_parameters_on_error"
+        self.num_predict = 192
         self.temperature = float(np.clip(temperature, 0.0, 2.0))
+        self.thinking = bool(thinking)
         self.update_interval_seconds = max(float(update_interval_seconds), 0.0)
         self.decision_dt = sim_params.CONTROL_DT if decision_dt is None else float(decision_dt)
         self._update_interval_calls = duration_to_steps(
@@ -79,6 +86,18 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             history_length = sim_params.LLM_RECENT_MODES_MAX_LENGTH
         self.history_length = max(0, int(history_length))
         self.response_format = self._resolve_response_format(output_mode, model_name)
+        self.prompt_module = str(prompt_module)
+        if self.prompt_module not in {"base", "base_plus_mechanics", "mode_v2"}:
+            raise ValueError(f"Unknown LLM prompt module: {self.prompt_module}")
+        if self.prompt_module == "base_plus_mechanics" and self.response_format != "params":
+            raise ValueError("Prompt mechanics module requires output_mode='params'")
+        if self.prompt_module == "mode_v2" and self.response_format != "mode":
+            raise ValueError("Mode-v2 prompt requires output_mode='mode'")
+        self.prompt_module_version = {
+            "base": "none",
+            "base_plus_mechanics": "mechanics_v1",
+            "mode_v2": "mode_v2",
+        }[self.prompt_module]
         self.prompt_variant = str(prompt_variant)
         self.observation_variant = str(observation_variant)
         if self.observation_variant not in LLM_OBSERVATION_VARIANTS:
@@ -87,14 +106,28 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             )
         if self.response_format == "params" and self.prompt_variant == "raw":
             self.prompt_variant = "direct_params_modular_v1"
-        self.input_schema_version = (
-            "direct_params_modular_v1"
-            if self.response_format == "params"
-            else "mode_legacy_v1"
-        )
         self.include_raceline_speed = bool(include_raceline_speed)
         self.include_current_parameters = bool(include_current_parameters)
         self.include_decision_feedback = bool(include_decision_feedback)
+        if (
+            self.response_format == "params"
+            and self.include_decision_feedback
+            and self.prompt_variant == "direct_params_modular_v1"
+        ):
+            self.prompt_variant = "direct_params_memory_feedback_v1"
+        self.input_schema_version = (
+            (
+                "direct_params_memory_feedback_v1"
+                if self.include_decision_feedback
+                else "direct_params_modular_v1"
+            )
+            if self.response_format == "params"
+            else (
+                "mode_all_opponents_v1"
+                if self.observation_variant == "all_opponents"
+                else "mode_legacy_v1"
+            )
+        )
         if self.response_format != "params" and any((
             self.include_raceline_speed,
             self.include_current_parameters,
@@ -122,6 +155,10 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self._last_llm_done_reason = ""
         self._last_llm_eval_count = -1
         self._last_llm_prompt_eval_count = -1
+        self._last_llm_prompt_eval_cached_count = -1
+        self._last_llm_prompt_eval_duration_ns = -1
+        self._last_llm_load_duration_ns = -1
+        self._last_llm_eval_duration_ns = -1
         self._last_llm_latency_seconds = np.nan
         self._llm_call_count = 0
         self.policy_decision_count = 0
@@ -145,12 +182,33 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         self.last_explicit_rule_consistent = True
         self._previous_decision_feedback_state = None
         self._pending_decision_feedback_state = None
+        self._previous_prompt_observation = None
+        self._previous_selected_parameters = None
+        self._interval_collision = False
+        self._interval_off_track = False
         self._oracle_rollout_frozen = False
         if system_prompt_path is None:
-            filename = "params_system.txt" if self.response_format == "params" else "mode_system.txt"
+            if self.response_format == "params":
+                filename = "params_system.txt"
+            elif self.prompt_module == "mode_v2":
+                filename = "mode_system_v2.txt"
+            else:
+                filename = "mode_system.txt"
             system_prompt_path = Path(__file__).with_name("prompts") / filename
         self.system_prompt_path = Path(system_prompt_path)
         self.system_prompt = self.system_prompt_path.read_text(encoding="utf-8").strip()
+        self.system_prompt_component_paths = [str(self.system_prompt_path)]
+        if self.prompt_module == "base_plus_mechanics":
+            mechanics_path = self.system_prompt_path.with_name(
+                "params_mechanics_module.txt"
+            )
+            mechanics_prompt = mechanics_path.read_text(encoding="utf-8").strip()
+            self.system_prompt = f"{self.system_prompt}\n\n{mechanics_prompt}"
+            self.system_prompt_component_paths.append(str(mechanics_path))
+        self.system_prompt_component_sha256 = {
+            path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for path in self.system_prompt_component_paths
+        }
         if self.observation_variant == "no_lap_progress":
             self.system_prompt = self.system_prompt.replace(
                 "- ego.lap_progress_percent: ego progress around the current lap, from 0 to 100.\n",
@@ -163,6 +221,9 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         )
         if variant_instruction:
             self.system_prompt = f"{self.system_prompt}\n\n{variant_instruction}"
+        self.system_prompt_sha256 = hashlib.sha256(
+            self.system_prompt.encode("utf-8")
+        ).hexdigest()
 
     def _resolve_response_format(self, output_mode, model_name) -> str:
         # Select discrete-mode or direct-parameter responses from the explicit option or model name.
@@ -362,46 +423,6 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             {"target_speed_mps_at_preview_points": target_speeds},
         )
 
-    def _direct_parameter_feedback(
-        self, state: CarState, current_s: float, opponents
-    ):
-        current_gaps = {
-            int(opponent.get("car_idx", -1)): abs(
-                float(progress_delta(
-                    opponent["px"], current_s, self.track.total_length
-                ))
-            )
-            for opponent in opponents
-        }
-        current = {
-            "control_call": self._llm_call_count,
-            "s": float(current_s),
-            "speed": max(float(state.vx), 0.0),
-            "gaps": current_gaps,
-        }
-        self._pending_decision_feedback_state = current
-        previous = self._previous_decision_feedback_state
-        if previous is None:
-            return None
-        gap_changes = [
-            {
-                "id": car_idx,
-                "longitudinal_gap_change_m": self._rounded(
-                    current_gaps[car_idx] - previous["gaps"][car_idx], digits=2
-                ),
-            }
-            for car_idx in sorted(current_gaps.keys() & previous["gaps"].keys())
-        ]
-        return {
-            "previous_progress_change_m": self._rounded(
-                current["s"] - previous["s"], digits=2
-            ),
-            "previous_speed_change_mps": self._rounded(
-                current["speed"] - previous["speed"], digits=2
-            ),
-            "previous_gap_changes": gap_changes,
-        }
-
     def _direct_parameter_scene_features(
         self, state: CarState, current_s: float, opponents=None
     ) -> dict:
@@ -457,11 +478,45 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 name: self._rounded(value)
                 for name, value in zip(("q", "zeta", "s1", "s2", "s3"), self.params)
             }
-        if self.include_decision_feedback:
-            scene["decision_feedback"] = self._direct_parameter_feedback(
-                state, current_s, raw_opponents
-            )
         return scene
+
+    def record_interval_events(self, *, collision: bool, off_track: bool):
+        """Accumulate ego events until the next high-level LLM decision."""
+        if self.response_format != "params" or not self.include_decision_feedback:
+            return
+        self._interval_collision = self._interval_collision or bool(collision)
+        self._interval_off_track = self._interval_off_track or bool(off_track)
+
+    def _memory_prompt_payload(self, current_observation: dict) -> dict:
+        previous_step = None
+        if self._previous_prompt_observation is not None:
+            previous_step = {
+                "observation": json.loads(json.dumps(
+                    self._previous_prompt_observation
+                )),
+                "selected_parameters": dict(self._previous_selected_parameters),
+                "events_during_interval": {
+                    "collision": bool(self._interval_collision),
+                    "off_track": bool(self._interval_off_track),
+                },
+            }
+        return {
+            "previous_step": previous_step,
+            "current_observation": current_observation,
+        }
+
+    def _commit_memory_step(self, current_observation: dict):
+        if self.response_format != "params" or not self.include_decision_feedback:
+            return
+        self._previous_prompt_observation = json.loads(json.dumps(
+            current_observation
+        ))
+        self._previous_selected_parameters = {
+            name: self._rounded(value)
+            for name, value in zip(("q", "zeta", "s1", "s2", "s3"), self.params)
+        }
+        self._interval_collision = False
+        self._interval_off_track = False
 
     def _scene_features(self, state: CarState, current_s: float, opponents=None) -> dict:
         if self.response_format == "params":
@@ -638,7 +693,14 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self.llm_decision_history = self.llm_decision_history[-self.history_length:]
 
     def _prompt(self, state: CarState, current_s: float, opponents=None) -> str:
-        payload = self._scene_features(state, current_s, opponents=opponents)  # real-time scene features
+        current_observation = self._scene_features(
+            state, current_s, opponents=opponents
+        )
+        payload = (
+            self._memory_prompt_payload(current_observation)
+            if self.response_format == "params" and self.include_decision_feedback
+            else current_observation
+        )
         # Preserve the existing trace field without duplicating a second
         # assessment block inside the model input.
         self.last_required_assessment = json.loads(json.dumps(payload))
@@ -680,22 +742,34 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             "additionalProperties": False,
         }
 
+    def _llm_request_payload(self, prompt: str) -> dict:
+        """Build the exact request body, exposed for provenance preflight."""
+        return {
+            "model": self.model_name,
+            "system": self.system_prompt,
+            "prompt": prompt,
+            "format": self._output_schema(),
+            "think": self.thinking,
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.num_predict,
+            },
+        }
+
     def _query_llm(self, prompt: str) -> dict:
         self._last_raw_llm_response = ""
         self._last_llm_done_reason = ""
         self._last_llm_eval_count = -1
         self._last_llm_prompt_eval_count = -1
+        self._last_llm_prompt_eval_cached_count = -1
+        self._last_llm_prompt_eval_duration_ns = -1
+        self._last_llm_load_duration_ns = -1
+        self._last_llm_eval_duration_ns = -1
         self._last_llm_latency_seconds = np.nan
         
         # ollama query
-        payload = {
-            "model": self.model_name,
-            "system": self.system_prompt,  # local file that describes tasks definition and mode explanation
-            "prompt": prompt,
-            "format": self._output_schema(),
-            "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": 192},
-        }
+        payload = self._llm_request_payload(prompt)
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/api/generate",
@@ -711,10 +785,23 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             self._last_llm_latency_seconds = time.perf_counter() - started
             # print(raw)
         body = json.loads(raw)
+
+        def response_integer(name):
+            value = body.get(name)
+            return -1 if value is None else int(value)
+
         self._last_raw_llm_response = str(body.get("response", ""))
         self._last_llm_done_reason = str(body.get("done_reason", ""))
-        self._last_llm_eval_count = int(body.get("eval_count") or -1)
-        self._last_llm_prompt_eval_count = int(body.get("prompt_eval_count") or -1)
+        self._last_llm_eval_count = response_integer("eval_count")
+        self._last_llm_prompt_eval_count = response_integer("prompt_eval_count")
+        self._last_llm_prompt_eval_cached_count = response_integer(
+            "prompt_eval_cached_count"
+        )
+        self._last_llm_prompt_eval_duration_ns = response_integer(
+            "prompt_eval_duration"
+        )
+        self._last_llm_load_duration_ns = response_integer("load_duration")
+        self._last_llm_eval_duration_ns = response_integer("eval_duration")
         return self._extract_json(self._last_raw_llm_response)
 
     def _record_llm_raw_io(self, prompt: str, error=None):
@@ -728,6 +815,12 @@ class LLMAlphaRacerPolicy(MPCPolicy):
                 "done_reason": self._last_llm_done_reason,
                 "eval_count": self._last_llm_eval_count,
                 "prompt_eval_count": self._last_llm_prompt_eval_count,
+                "prompt_eval_cached_count": (
+                    self._last_llm_prompt_eval_cached_count
+                ),
+                "prompt_eval_duration_ns": self._last_llm_prompt_eval_duration_ns,
+                "load_duration_ns": self._last_llm_load_duration_ns,
+                "eval_duration_ns": self._last_llm_eval_duration_ns,
                 "latency_seconds": self._last_llm_latency_seconds,
             }
         )
@@ -918,11 +1011,13 @@ class LLMAlphaRacerPolicy(MPCPolicy):
             if not self._warned_llm_error:
                 self._log(f"LLM policy failed once, reusing last parameters: {exc}")
                 self._warned_llm_error = True
+        if self.response_format == "params" and self.include_decision_feedback:
+            self._commit_memory_step(json.loads(prompt)["current_observation"])
         self._commit_decision_feedback_state()
 
-    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
+    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None, *, current_e=None) -> np.ndarray:
         self.update_params_from_llm(state, current_s, opponents=opponents)
-        return super().get_reference_trajectory(state, current_s, opponents=opponents)
+        return super().get_reference_trajectory(state, current_s, opponents=opponents, current_e=current_e)
 
     def freeze_for_oracle_rollout(self):
         """Freeze external high-level calls inside a hypothetical branch.
@@ -933,6 +1028,10 @@ class LLMAlphaRacerPolicy(MPCPolicy):
         frozen by the rollout evaluator.
         """
         self._oracle_rollout_frozen = True
+
+    def llm_decision_due(self):
+        """Whether the next control call is a scheduled high-level update."""
+        return self._llm_call_count % self._update_interval_calls == 0
 
 
 
@@ -978,8 +1077,8 @@ class RuleBasedPolicy(LLMAlphaRacerPolicy):
         self.params = self.mode_presets[self.current_mode].copy()
         self.last_rule_params = self.params.copy()
 
-    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None) -> np.ndarray:
+    def get_reference_trajectory(self, state: CarState, current_s: float, opponents=None, *, current_e=None) -> np.ndarray:
         self.update_params_from_rules(state, current_s, opponents=opponents)
         return MPCPolicy.get_reference_trajectory(
-            self, state, current_s, opponents=opponents
+            self, state, current_s, opponents=opponents, current_e=current_e
         )

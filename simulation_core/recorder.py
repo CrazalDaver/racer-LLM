@@ -2,11 +2,13 @@
 
 from pathlib import Path
 import subprocess
+import hashlib
+import json
+from dataclasses import asdict
 
 import numpy as np
 
 from config import duration_to_steps, params
-from track import TRACKS
 from .trace import (
     create_simulation_trace,
     record_simulation_step,
@@ -49,25 +51,30 @@ class TraceRecorder:
             initial_lateral_offsets=race.initial_lateral_offsets,
             initial_speeds=race.initial_speeds,
             vehicle_model_type=race.vehicle_model_type,
+            mpc_min_state_speed=race.mpc_min_state_speed,
             mpc_velocity_track_weight=race.mpc_velocity_track_weight,
             mpc_track_slack_weight=race.mpc_track_slack_weight,
             mpc_collision_slack_weight=race.mpc_collision_slack_weight,
         )
         self.trace["raceline_csv"] = race.selected_raceline
-        core_deviations = self._protocol_core_deviations(race)
-        scenario_deviations = self._protocol_scenario_deviations(race)
-        self.trace["protocol_reference_version"] = params.PROTOCOL_VERSION
-        self.trace["protocol_version"] = (
-            params.PROTOCOL_VERSION if not core_deviations else "unversioned"
-        )
-        self.trace["protocol_core_deviations"] = core_deviations
-        self.trace["protocol_scenario_deviations"] = scenario_deviations
-        self.trace["protocol_core_compatible"] = not core_deviations
-        self.trace["protocol_evaluation_scenario_compatible"] = (
-            not core_deviations and not scenario_deviations
-        )
+        self.trace["development_status"] = params.DEVELOPMENT_STATUS
         git_provenance = self._git_provenance()
         self.trace.update(git_provenance)
+        root=Path(__file__).resolve().parents[1]
+        self.trace['source_sha256']={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
+            for folder in (root,root/'simulation_core',root/'policy',root/'policy/alpharacer',root/'track') for p in folder.glob('*.py')}
+        self.trace['input_sha256']={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in map(Path,(params.TRACK_CSV,race.selected_raceline))}
+        self.trace['vehicle_parameters']=vars(race.vehicle_models[0].p).copy()
+        self.trace['initial_states']=[state.to_array().tolist() for state in race.environment.states]
+        self.trace['simulation_config']=asdict(race.config)
+        self.trace['result_class']='exploratory'
+        self.trace['mpc_prediction_model']='kinematic'
+        self.trace['mpc_prediction_states']=4
+        self.trace['mpc_settings']={name:(value.tolist() if isinstance(value,np.ndarray) else value)
+            for name in ('dt','horizon','Q','R','min_speed','max_speed','velocity_track_weight',
+                'heading_track_weight','enforce_track_boundary','enforce_collision_avoidance',
+                'collision_superellipse_exponent','friction_coefficient','enforce_friction_speed_limit')
+            if (value:=getattr(race.mpcs[0],name,None)) is not None}
         self.trace["mpc_horizon"] = int(race.mpc_horizon)
         self.trace["mpc_formulation"] = race.resolved_mpc_formulation
         self.trace["random_seed"] = race.random_seed
@@ -81,6 +88,11 @@ class TraceRecorder:
             name: np.asarray(values, dtype=float).tolist()
             for name, values in params.LLM_MODE_PRESETS.items()
         }
+        self.trace["potential_regret_settings"] = (
+            {}
+            if race.potential_regret_evaluator is None
+            else race.potential_regret_evaluator.settings_dict()
+        )
 
         self.traj_x, self.traj_y, self.velocities = [], [], []
         self.lateral_errors, self.longitudinal_positions = [], []
@@ -125,87 +137,7 @@ class TraceRecorder:
             "git_provenance_error": error,
         }
 
-    @staticmethod
-    def _protocol_core_deviations(race):
-        """List runtime choices that may not carry the frozen protocol label."""
-        deviations = []
 
-        def check(name, actual, expected):
-            if isinstance(expected, float):
-                matches = bool(np.isclose(float(actual), expected, rtol=0.0, atol=1e-12))
-            else:
-                matches = actual == expected
-            if not matches:
-                deviations.append(f"{name}={actual!r} (expected {expected!r})")
-
-        check("vehicle_model", race.vehicle_model_type, "kinematic")
-        check("mpc_formulation", race.resolved_mpc_formulation, "constrained_local")
-        check("mpc_horizon", race.mpc_horizon, params.MPC_HORIZON)
-        check("velocity_track_weight", race.mpc_velocity_track_weight, 10.0)
-        check("track_slack_weight", race.mpc_track_slack_weight, 1.0e3)
-        check("collision_slack_weight", race.mpc_collision_slack_weight, 1.0e4)
-        effective_llm_interval = (
-            params.LLM_UPDATE_INTERVAL_SECONDS
-            if race.llm_update_interval_seconds is None
-            else race.llm_update_interval_seconds
-        )
-        check("llm_update_interval_seconds", effective_llm_interval, 1.0)
-
-        selected_pair = (params.TRACK_CSV, race.selected_raceline)
-        selected_spec = next(
-            (
-                spec
-                for spec in TRACKS.values()
-                if (spec.centerline, spec.raceline) == selected_pair
-            ),
-            None,
-        )
-        if selected_spec is None:
-            deviations.append(
-                "track/raceline pair is not registered in K-Constrained-v1: "
-                f"{selected_pair!r}"
-            )
-        else:
-            check("track_scale", params.TRACK_SCALE, float(selected_spec.scale))
-            check(
-                "track_half_width",
-                params.TRACK_HALF_WIDTH,
-                float(selected_spec.half_width),
-            )
-            check(
-                "mpc_constraint_half_width",
-                params.MPC_CONSTRAINT_HALF_WIDTH,
-                float(selected_spec.half_width),
-            )
-        return deviations
-
-    @staticmethod
-    def _protocol_scenario_deviations(race):
-        """List departures from one cell of the canonical 3x3 evaluation grid."""
-        deviations = []
-        simulation_time = (
-            params.TOTAL_TIME if race.total_time is None else float(race.total_time)
-        )
-        expected = (
-            ("num_cars", race.num_cars, 3),
-            ("duration_s", simulation_time, 50.0),
-            ("start_gap_m", race.start_gap, 6.0),
-        )
-        for name, actual, target in expected:
-            if not np.isclose(float(actual), float(target), rtol=0.0, atol=1e-12):
-                deviations.append(f"{name}={actual!r} (expected {target!r})")
-        if race.random_seed != 0:
-            deviations.append(f"random_seed={race.random_seed!r} (expected 0)")
-        for name, actual in (
-            ("initial_longitudinal_offsets", race.initial_longitudinal_offsets),
-            ("initial_lateral_offsets", race.initial_lateral_offsets),
-            ("initial_speeds", race.initial_speeds),
-        ):
-            if np.shape(actual) != (3,) or not np.allclose(actual, 0.0):
-                deviations.append(f"{name} must be three zeros")
-        if race.ego_position not in (1, 2, 3):
-            deviations.append("ego_position must be one of 1, 2, 3")
-        return deviations
 
     def _ref_component_snapshot(self, policy, name):
         values = np.full(self.ref_component_horizon, np.nan, dtype=float)
@@ -239,7 +171,14 @@ class TraceRecorder:
         )
         self.trace["collision"][-1] = transition.contact_happened
         self.trace["collision_overlap"][-1] = transition.contact_max_overlap
+        self.trace["car_collision"].append(list(transition.contact_active))
 
+        self.trace.setdefault('car_next_state',[]).append([state.to_array().tolist() for state in environment.states])
+        self.trace.setdefault('car_next_px',[]).append(list(transition.next_s))
+        self.trace.setdefault('car_next_py',[]).append(list(transition.next_e))
+        self.trace.setdefault('car_requested_action',[]).append([getattr(policy,'last_requested_action',np.array([action.throttle,action.steer])).tolist() for policy,action in zip(race.policies,transition.actions)])
+        self.trace.setdefault('car_mpc_solve_seconds',[]).append([m.last_diagnostics['solve_seconds'] for m in race.mpcs])
+        self.trace.setdefault('car_mpc_constraint_residual',[]).append([m.last_diagnostics.get('residual') if m.last_diagnostics.get('residual') is not None else np.nan for m in race.mpcs])
         ego_policy = race.policies[self.ego_idx]
         ego_mpc = race.mpcs[self.ego_idx]
         ego_trace_state = transition.trace_states[self.ego_idx]
@@ -293,6 +232,18 @@ class TraceRecorder:
             "llm_raw_prompt_eval_counts": (
                 lambda item: item.get("prompt_eval_count", -1), -1
             ),
+            "llm_raw_prompt_eval_cached_counts": (
+                lambda item: item.get("prompt_eval_cached_count", -1), -1
+            ),
+            "llm_raw_prompt_eval_durations_ns": (
+                lambda item: item.get("prompt_eval_duration_ns", -1), -1
+            ),
+            "llm_raw_load_durations_ns": (
+                lambda item: item.get("load_duration_ns", -1), -1
+            ),
+            "llm_raw_eval_durations_ns": (
+                lambda item: item.get("eval_duration_ns", -1), -1
+            ),
             "llm_raw_latency_seconds": (
                 lambda item: item.get("latency_seconds", np.nan), np.nan
             ),
@@ -322,6 +273,32 @@ class TraceRecorder:
             }
             for history in oracle_histories
         ]
+        mode_alpharacer_histories = [
+            list(getattr(policy, "mode_alpharacer_decision_history", []))
+            for policy in self.race.policies
+        ]
+        self.trace["mode_alpharacer_decisions_by_car"] = (
+            mode_alpharacer_histories
+        )
+        self.trace["mode_alpharacer_mode_counts_by_car"] = [
+            {
+                mode: sum(
+                    decision.get("selected_mode") == mode
+                    for decision in history
+                )
+                for mode in params.LLM_MODE_PRESETS
+            }
+            for history in mode_alpharacer_histories
+        ]
+        regret_evaluator = self.race.potential_regret_evaluator
+        self.trace["potential_regret_decisions"] = (
+            [] if regret_evaluator is None else regret_evaluator.decisions
+        )
+        self.trace["potential_regret_snapshot_validation"] = (
+            {}
+            if regret_evaluator is None
+            else regret_evaluator.snapshot_validation
+        )
 
         terminal_s, terminal_e = self.race.environment.project_current()
         self.trace["terminal_car_progress"] = [float(value) for value in terminal_s]
@@ -334,7 +311,18 @@ class TraceRecorder:
             for idx in range(self.race.num_cars)
         ]
 
+        self.trace['simulated_duration_seconds']=len(self.trace['time'])*params.SIM_DT
+        self.trace['terminal_states']=[state.to_array().tolist() for state in self.race.environment.states]
+        self.trace['terminal_progress']=list(terminal_s)
         if self.race.save_trace:
+            output=Path(self.race.config.trace_output or params.TRACE_OUTPUT)
+            output.parent.mkdir(parents=True,exist_ok=True)
+            keys=('source_sha256','input_sha256','vehicle_parameters','mpc_settings','initial_states',
+                  'simulation_config','git_commit_sha','git_dirty','result_class','development_status',
+                  'mpc_prediction_model','mpc_prediction_states')
+            metadata={key:self.trace[key] for key in keys}
+            metadata['failure']=self.trace.get('failure')
+            (output.parent/'manifest.json').write_text(json.dumps(metadata,indent=2,default=str)+'\n')
             save_simulation_trace(
                 self.trace,
                 self.race.track,

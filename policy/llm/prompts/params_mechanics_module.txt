@@ -1,0 +1,175 @@
+Additional exact mechanics for the current K-Constrained-v2 simulator are
+given below.  These equations describe how the supplied five parameters enter
+the reference generator and MPC.  They do not prescribe which parameter values
+to select.
+
+Notation and control pipeline:
+- The high-level parameter vector is theta = (q, zeta, s1, s2, s3).
+- The MPC state is x = (s, e, psi_error, v), where s is progress along the
+  centerline, e is signed lateral displacement from the centerline, psi_error
+  is vehicle heading minus centerline heading, and v is longitudinal speed.
+- The normalized MPC control is u = (u_throttle, u_steer), with both entries in
+  [-1, 1].
+- The computation is theta -> reference trajectory -> constrained MPC -> first
+  control u_0.  There is no direct closed-form map from theta to u_0 because
+  u_0 is the first element of a finite-horizon constrained optimization.
+
+Reference-trajectory generation:
+
+At each horizon step k, let (s_race,k, e_race,k, v_race,k) be the sampled
+raceline state.  The source point on the raceline advances according to
+
+  source_raceline_s_(k+1)
+    = source_raceline_s_k + zeta * v_race,k * dt.
+
+The reference speed is
+
+  v_ref,k = clip(zeta * v_race,k, 0, 5).
+
+Only the nearest opponent currently ahead and the nearest opponent currently
+behind are used by the competitive reference generator.  Unless an explicit
+opponent plan is supplied, each opponent is predicted with constant
+longitudinal speed and constant lateral position:
+
+  s_j,k = s_j,0 + k * dt * v_j,
+  e_j,k = e_j,0.
+
+Define the wrapped longitudinal difference at horizon step k as
+
+  delta_s_j,k = wrapped_progress(s_race,k - s_j,k),
+
+and define the current lateral difference as
+
+  delta_e_j = e_ego,current - e_j,current.
+
+The overtaking or avoidance contribution of opponent j is
+
+  magnitude_ot_j,k
+    = max((s1 - abs(delta_e_j))
+          * exp(-s2 * delta_s_j,k^2),
+          0),
+
+  p_ot_j,k = sign(delta_e_j) * magnitude_ot_j,k.
+
+The contribution is accumulated separately for the selected opponent ahead
+and the selected opponent behind.  If delta_e_j is exactly zero, sign(0) is
+zero in the current implementation.
+
+For an opponent that is currently behind, the blocking contribution is active
+only when the predicted opponent is faster than the reference motion and the
+reference point remains ahead of that opponent.  Its value is
+
+  speed_factor_j,k
+    = 1 - exp(-s3 * max(v_j,k - zeta * v_race,k, 0)),
+
+  proximity_j,k = exp(-s2 * delta_s_j,k^2),
+
+  p_bl_j,k
+    = (e_j,k - e_race,k) * speed_factor_j,k * proximity_j,k.
+
+The lateral reference is
+
+  e_ref,k
+    = clip(e_race,k
+           + sum_j p_ot_j,k
+           + sum_j p_bl_j,k,
+           -e_ref_limit,
+           e_ref_limit).
+
+The reference supplied to the Frenet MPC therefore contains
+(s_ref,k, e_ref,k, v_ref,k) for k = 0,...,N.  Parameters zeta, s1, s2, and s3
+enter this reference-generation process.  Parameter q does not alter the
+reference; it multiplies the MPC position-tracking cost described below.
+
+Kinematic prediction model:
+
+The horizon timestep is dt = 0.1 seconds and the wheelbase is
+L = L_f + L_r = 0.11 + 0.23 = 0.34 metres.  The physical steering angle and
+longitudinal acceleration used by the kinematic model are
+
+  delta = 0.34 * u_steer,
+  a = (20 / 4.65) * u_throttle - 1.
+
+Let kappa(s) be centerline curvature and let
+
+  raw_d = 1 - kappa(s) * e,
+
+  d = 0.5 * (raw_d + 0.05
+             + sqrt((raw_d - 0.05)^2 + (1e-4)^2)).
+
+One forward-Euler Frenet prediction step is
+
+  s_next
+    = s + dt * v * cos(psi_error) / d,
+
+  e_next
+    = e + dt * v * sin(psi_error),
+
+  psi_error_next
+    = psi_error
+      + dt * (v / L * tan(delta)
+              - v * cos(psi_error) * kappa(s) / d),
+
+  v_next
+    = v + dt * a.
+
+The simulator plant uses the same throttle, steering and acceleration maps in
+global coordinates:
+
+  x_next = x + dt * v * cos(psi),
+  y_next = y + dt * v * sin(psi),
+  psi_next = psi + dt * v / L * tan(delta),
+  v_next = v + dt * a,
+
+followed by the simulator's configured state bounds and environment handling.
+
+MPC optimization:
+
+The MPC horizon has N = 10 control steps, corresponding to 1.0 second.  Its
+inputs at one solve are:
+- the measured initial Frenet state x_0 = (s, e, psi_error, v);
+- the reference sequence (s_ref,k, e_ref,k, v_ref,k), k = 0,...,N;
+- the previous applied control u_previous;
+- q;
+- predicted Frenet positions of at most the nearest opponent ahead and nearest
+  opponent behind, together with flags indicating whether those slots are
+  active.
+
+Its decision variables are:
+- predicted states X_0,...,X_N;
+- controls U_0,...,U_(N-1);
+- non-negative track-boundary slack variables;
+- non-negative collision-avoidance slack variables.
+
+With Q = identity and R = identity, the objective is
+
+  J = sum_(k=0)^N [
+        q * ((s_k - s_ref,k)^2 + (e_k - e_ref,k)^2)
+        + 10 * (v_k - v_ref,k)^2
+      ]
+      + sum_(k=0)^(N-1) ||U_k - U_(k-1)||_2^2
+      + 1000 * ||track_slack||_2^2
+      + 10000 * ||collision_slack||_2^2,
+
+where U_(-1) is the previous applied control.  The configured heading-tracking
+weight is zero, so heading error has no separate objective term in this
+protocol; it still affects the dynamics and feasibility.
+
+The optimization enforces:
+- X_0 equal to the measured initial state;
+- the Frenet dynamics at every prediction step;
+- u_throttle and u_steer in [-1, 1];
+- predicted speed in [0.05, 5] m/s for steps 1,...,N; the measured step 0 is
+  excluded from this lower bound;
+- steering-command change no greater than 0.4 per 0.1-second MPC step;
+- the configured friction-based lateral-speed proxy;
+- soft track-boundary constraints using non-negative track slack;
+- soft collision exclusion constraints using non-negative collision slack and
+  a fourth-order superellipse for each active constrained opponent.
+
+The nonlinear program is solved by IPOPT.  The control-plan initial guess is
+formed by shifting the preceding successful MPC control plan by one step; if no
+such plan exists, the previous applied control is repeated across the horizon.
+The MPC returns the optimized control sequence and applies only its first
+control U_0.  The optimization is repeated at the next control update using the
+new measured state.

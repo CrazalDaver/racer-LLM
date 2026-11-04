@@ -5,14 +5,17 @@ checkpoints structurally identical to the models used at inference time.
 """
 
 import math
+from pathlib import Path
 
 import numpy as np
 
 from config import params
 
 try:
+    import torch
     import torch.nn as nn
 except ImportError:
+    torch = None
     nn = None
 
 from ..utils import progress_delta, track_curvature_at, track_heading_error
@@ -47,6 +50,59 @@ class SimpleNeuralNetwork(nn.Module if nn is not None else object):
             shape = x.shape
             x = self.batch_norm(x.reshape(-1, shape[-1])).reshape(shape)
         return self.fc(x)
+
+
+def load_potential_checkpoint(weight_path, device):
+    """Load one raw-upstream or metadata-bearing local potential checkpoint."""
+    if torch is None:
+        raise ImportError("PyTorch is required for alpha-RACER models.")
+    path = Path(weight_path)
+    if not path.exists():
+        raise FileNotFoundError(f"alpha-RACER weight file not found: {path}")
+    model = SimpleNeuralNetwork().to(device)
+    checkpoint = torch.load(str(path), map_location=device)
+    wrapped = isinstance(checkpoint, dict) and "state_dict" in checkpoint
+    metadata = checkpoint.get("metadata", {}) if wrapped else {}
+    if wrapped and "parameterization" not in metadata:
+        raise ValueError(
+            "Local alpha-RACER checkpoint metadata must declare its "
+            "parameterization; retrain or add "
+            "parameterization='paper_q_zeta_s1_s2_s3'."
+        )
+    parameterization = metadata.get("parameterization", "upstream_transformed")
+    if parameterization not in {
+        "paper_q_zeta_s1_s2_s3",
+        "upstream_transformed",
+    }:
+        raise ValueError(
+            f"Unsupported alpha-RACER checkpoint parameterization: {parameterization}"
+        )
+    model.load_state_dict(checkpoint["state_dict"] if wrapped else checkpoint)
+    model.eval()
+    return path, model, metadata, parameterization
+
+
+def alpha_network_input(paper_input, parameterization):
+    """Convert paper theta only for legacy upstream checkpoint inputs."""
+    if parameterization == "paper_q_zeta_s1_s2_s3":
+        return paper_input
+    state_features = paper_input[..., :-15]
+    theta = paper_input[..., -15:].reshape(*paper_input.shape[:-1], 3, 5)
+    q, zeta, s1, s2, s3 = theta.unbind(dim=-1)
+    upstream = torch.stack(
+        (
+            s1,
+            s2,
+            0.5 / torch.clamp(q, min=1e-6),
+            torch.sqrt(torch.clamp(zeta, min=0.0)),
+            s3,
+        ),
+        dim=-1,
+    )
+    return torch.cat(
+        (state_features, upstream.reshape(*paper_input.shape[:-1], 15)),
+        dim=-1,
+    )
 
 
 def paper_to_upstream_alpha_params(paper_params):
@@ -86,7 +142,8 @@ def build_alpha_input(track, mpc_dt, mpc_horizon, cars, joint_params):
         blocks.append(
             [
                 float(car["py"]),
-                track_heading_error(track, psi, float(car["px"])),
+                (float(car["heading_error"]) if "heading_error" in car else
+                 track_heading_error(track, psi, float(car["px"]))),
                 float(car.get("vx", getattr(state, "vx", 0.0))),
                 float(car.get("vy", getattr(state, "vy", 0.0))),
                 float(car.get("omega", getattr(state, "omega", 0.0))),

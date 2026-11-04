@@ -1,0 +1,9 @@
+# Python 3.9.6. Numeric stack from old local environment; TUM version from official repo.
+numpy==2.0.2
+scipy==1.13.1
+matplotlib==3.9.4
+quadprog==0.1.13
+trajectory-planning-helpers==0.76
+casadi==3.7.2
+pillow==11.3.0
+torch==2.8.0

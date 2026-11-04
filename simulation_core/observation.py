@@ -14,6 +14,7 @@ from typing import Optional
 import numpy as np
 
 from state import CarState
+from track import Track
 
 def _progress_delta(s_a, s_b, total_length):
     return math.atan2(
@@ -48,6 +49,31 @@ class CarObservation:
     policy_params: Optional[np.ndarray]
     predicted_frenet_plan: Optional[np.ndarray]
 
+    # Cached derived values for this tick; vx/vy above remain body components.
+    track_heading: Optional[float] = None
+    heading_error: Optional[float] = None
+    curvature: Optional[float] = None
+    vx_world: Optional[float] = None
+    vy_world: Optional[float] = None
+    speed_mps: Optional[float] = None
+    s_dot: Optional[float] = None
+    e_dot: Optional[float] = None
+
+    @property
+    def vx_body(self):
+        return self.vx
+
+    @property
+    def vy_body(self):
+        return self.vy
+
+    @property
+    def kinematic_state(self):
+        """Forward-only MPC initial state [unwrapped s,e,chi,body vx]."""
+        if self.heading_error is None:
+            raise ValueError("A projected observation is required for MPC initialization")
+        return np.array([self.s,self.e,self.heading_error,max(self.vx_body,0.)])
+
     @property
     def state(self):
         """Return an independent legacy ``CarState`` for MPC/model code."""
@@ -67,18 +93,24 @@ class RaceObservation:
 
     sim_time: float
     cars: tuple[CarObservation, ...]
+    _track: object = None
+    _curvature: object = None
 
     @classmethod
-    def from_runtime(cls, policies, states, car_s, car_e, sim_time):
+    def from_runtime(cls, policies, states, car_s, car_e, sim_time, *, track=None, curvature_fn=None):
         """Capture state and previous policy outputs before any new action is chosen."""
         if not (len(policies) == len(states) == len(car_s) == len(car_e)):
             raise ValueError("policies, states, car_s, and car_e must have equal length")
+        track = policies[0].track if track is None else track
+        curvature_fn = policies[0].mpc.curvature_fn if curvature_fn is None else curvature_fn
         cars = []
         for idx, (policy, state) in enumerate(zip(policies, states)):
             params = getattr(policy, "params", None)
             if params is not None and np.asarray(params).shape != (5,):
                 params = None
             plan = getattr(policy, "predicted_frenet_plan", None)
+            frame = track.state_kinematics(state, car_s[idx], car_e[idx],
+                float(curvature_fn(car_s[idx] % track.total_length)))
             cars.append(
                 CarObservation(
                     car_idx=idx,
@@ -96,9 +128,11 @@ class RaceObservation:
                     ),
                     policy_params=_readonly_copy(params),
                     predicted_frenet_plan=_readonly_copy(plan),
+                    **frame,
                 )
             )
-        return cls(sim_time=float(sim_time), cars=tuple(cars))
+        return cls(sim_time=float(sim_time), cars=tuple(cars),
+                   _track=track, _curvature=curvature_fn)
 
     def car(self, car_idx):
         return self.cars[int(car_idx)]
@@ -116,6 +150,13 @@ class RaceObservation:
             key=lambda other: abs(_progress_delta(other.s, ego.s, track_length)),
         )
 
+    def _progress_rate(self, car):
+        if car.s_dot is not None:
+            return car.s_dot
+        # Compatibility for manually constructed observations in offline callers.
+        return Track.state_kinematics(self._track, car.state, car.s, car.e,
+            float(self._curvature(car.s % self._track.total_length)))["s_dot"]
+
     def mpc_opponents(self, ego_idx):
         """Return the legacy opponent records consumed by shared MPC/reference code."""
         opponents = []
@@ -125,7 +166,11 @@ class RaceObservation:
                 "car_idx": car.car_idx,
                 "px": car.s,
                 "py": car.e,
-                "vx": max(car.vx, 0.0),
+                "s_dot": self._progress_rate(car),
+                "e_dot": car.e_dot,
+                "vx_body": car.vx_body,
+                "vy_body": car.vy_body,
+                "vx": self._progress_rate(car),  # legacy alias for forecast ds/dt
                 "vy": car.vy,
                 "omega": car.omega,
                 "psi": car.psi,

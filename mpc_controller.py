@@ -1,6 +1,20 @@
+"""Frenet MPC: track a reference trajectory and return throttle/steering commands.
+
+MPCPolicy supplies the reference; solve() returns a control plan and its first
+command. The predictor uses X=[s,e,heading_error,v] and normalized U=[throttle,
+steer], while the environment executes the six-state DBM. Following the tracking
+and input-change objective of alpha-RACER Eq.(1), the default local problem is:
+
+    min J = sum(k=0..N) q * ||p_k - p_ref_k||_Q^2  # tracking position
+          + sum(k=0..N-1) ||u_k - u_(k-1)||_R^2    # control change rate penalty 
+          + rho_track * ||eps_track||^2 + rho_collision * ||eps_collision||^2  # soft constraints
+    p_k = [s_k, e_k]; u_(-1) is the previous executed command.
+"""
+
 from config import GRAVITY
 from vehicle_model import kinematic_frenet_step
 
+import time
 import numpy as np
 import casadi as cs
 
@@ -17,6 +31,11 @@ class MPCController:
     ``[s, e, psi_error, v]``.  This directly represents the paper's
     longitudinal/lateral tracking and track constraint instead of projecting
     symbolic Cartesian predictions through a future reference cross-section.
+
+    Methods:
+        - solve: solve the MPC problem and return the first control action.
+        - _vehicle_dynamics: symbolic CasADi dynamics for the optimization problem.
+        - _build_problem: construct the CasADi NLP problem with objective and constraints.
     """
 
     _instance_counter = 0
@@ -34,6 +53,7 @@ class MPCController:
         track_boundary_slack=0.0,
         track_constraint_half_width=None,
         max_state_speed=5.0,
+        min_state_speed=0.0,
         velocity_track_weight=0.0,
         heading_track_weight=0.0,
         track_length=None,
@@ -63,6 +83,7 @@ class MPCController:
             self.track_constraint_half_width = float(track_constraint_half_width)
         self.track_boundary_slack = self.track_constraint_half_width - self.track_half_width
         self.max_speed = max_state_speed
+        self.min_speed = float(min_state_speed)
         self.velocity_track_weight = velocity_track_weight
         self.heading_track_weight = heading_track_weight
         self.track_length = None if track_length is None else float(track_length)
@@ -76,6 +97,7 @@ class MPCController:
         self.collision_slack_weight = float(collision_slack_weight)
         self.enforce_friction_speed_limit = bool(enforce_friction_speed_limit)
         self.friction_coefficient = float(friction_coefficient)
+
         if track is None:
             raise ValueError("Frenet MPC requires the project Track instance")
         self.track = track
@@ -85,8 +107,11 @@ class MPCController:
             raise ValueError("collision_superellipse_exponent must be an even integer >= 2")
         if self.track_slack_weight < 0.0 or self.collision_slack_weight < 0.0:
             raise ValueError("MPC slack weights must be non-negative")
+        if self.min_speed < 0.0 or self.min_speed > self.max_speed:
+            raise ValueError("MPC minimum state speed must be within [0, max_state_speed]")
         if self.friction_coefficient <= 0.0:
             raise ValueError("MPC friction coefficient must be positive")
+        
         self.last_loss = np.nan
         self.last_track_loss = np.nan
         self.last_action_loss = np.nan
@@ -97,6 +122,8 @@ class MPCController:
         self.last_collision_slack_loss = np.nan
         self.last_track_slack_plan = None
         self.last_collision_slack_plan = None
+        self.last_diagnostics = dict(success=False, status="not_run", residual=None,
+                                     solve_seconds=0., iterations=0, cost=None)
         self.last_solver_success = True
         self.last_solver_status = "not_run"
         self.last_recovery_active = False
@@ -185,7 +212,7 @@ class MPCController:
             symbolic=True,
         )
 
-    def _vehicle_dynamics_np(self, xk, uk):
+    def _vehicle_dynamics_np(self, xk, uk):  # in numpy
         curvature = float(np.interp(
             float(xk[0]), self._curvature_grid, self._curvature_values
         ))
@@ -198,8 +225,17 @@ class MPCController:
             curvature_mode="geometric",
         )
 
-    def _make_x0_mpc(self, x0, current_s):
+    def _make_x0_mpc(self, x0, current_s, frenet_state=None):
         current_s = float(current_s)
+        if frenet_state is not None:
+            initial = np.asarray(frenet_state,dtype=float).copy()
+            if initial.shape != (4,) or not np.isfinite(initial).all():
+                raise ValueError("frenet_state must be finite [s,e,chi,body_vx]")
+            if not np.isclose(initial[0],current_s,rtol=0.,atol=1e-6):
+                raise ValueError("frenet_state and current_s refer to different projections")
+            initial[0] %= self.track.total_length
+            return initial
+        # Legacy/offline callers without a shared observation retain projection.
         _, lateral_e = self.track.project(
             float(x0[0]),
             float(x0[1]),
@@ -279,7 +315,7 @@ class MPCController:
                     plan_idx = min(k, len(opponent["px_plan"]) - 1)
                     predicted_s = float(opponent["px_plan"][plan_idx])
                 else:
-                    predicted_s = float(opponent["px"]) + k * self.dt * float(opponent.get("vx", 0.0))
+                    predicted_s = float(opponent["px"]) + k * self.dt * float(opponent.get("s_dot", opponent.get("vx", 0.0)))
                 if "py_plan" in opponent and len(opponent["py_plan"]):
                     plan_idx = min(k, len(opponent["py_plan"]) - 1)
                     predicted_e = float(opponent["py_plan"][plan_idx])
@@ -526,6 +562,7 @@ class MPCController:
         nlp = {"x": self.x_opt, "p": self.p_opt, "f": cost, "g": self.g}
         opts = {"ipopt.print_level": 0, "print_time": False, "ipopt.max_iter": 500}
         self.solver = cs.nlpsol("mpc_solver", "ipopt", nlp, opts)
+        self.g_fn = cs.Function("mpc_residual", [self.x_opt, self.p_opt], [self.g])
         self.loss_fn = cs.Function(
             "mpc_loss_parts",
             [self.x_opt, self.p_opt],
@@ -602,11 +639,12 @@ class MPCController:
         q_weight=1.0,
         opponents=None,
         current_s=None,
+        frenet_state=None,
     ):
         if current_s is None:
             raise ValueError("current_s is required by the Frenet MPC")
         ref_traj = self._localize_reference(ref_traj, current_s)
-        x0_mpc = self._make_x0_mpc(x0, current_s)
+        x0_mpc = self._make_x0_mpc(x0, current_s, frenet_state=frenet_state)
         if (
             self.last_control_plan is not None
             and np.shape(self.last_control_plan) == (self.n_controls, self.horizon)
@@ -650,19 +688,20 @@ class MPCController:
         lbx = np.full(self.n_opt, -np.inf)
         ubx = np.full(self.n_opt, np.inf)
 
-        # State bounds: x, y unbounded; psi unbounded; v in [0, max_speed] for predicted states.
+        # State bounds: x, y unbounded; psi unbounded; v in
+        # [min_speed, max_speed] for predicted states.
         # Do not bound k=0 here: it is fixed by the measured initial condition, and a DBM
         # rollout can briefly exceed the MPC speed bound, which would make the problem
         # infeasible before the controller has a chance to brake.
         for k in range(1, self.horizon + 1):
-            lbx[k * self.n_states + 3] = 0.0
+            lbx[k * self.n_states + 3] = self.min_speed
             ubx[k * self.n_states + 3] = self.max_speed
 
         # Control bounds: longitudinal command in [-1, 1], steering command in [-1, 1].
         # Negative longitudinal commands act as braking, matching the alpha-RACER convention.
         u_start = self.n_x
         for k in range(self.horizon):
-            lbx[u_start + k * 2] = -1.0
+            lbx[u_start + k * 2] = -1.0 if self.p.ros_kinematic else 0.0
             ubx[u_start + k * 2] = 1.0
             lbx[u_start + k * 2 + 1] = -1.0
             ubx[u_start + k * 2 + 1] = 1.0
@@ -677,20 +716,36 @@ class MPCController:
         lbg = np.zeros(self.n_total)
         ubg = np.zeros(self.n_total)
         lbg[self.n_eq:] = -np.inf
+        solve_start = time.perf_counter()
         try:
             sol = self.solver(x0=x_init, lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg, p=p_val)
         except Exception as exc:
             stats = self.solver.stats()
             self.last_solver_success = False
             self.last_solver_status = stats.get("return_status", type(exc).__name__)
+            self.last_diagnostics = dict(success=False,status=self.last_solver_status,
+                solve_seconds=time.perf_counter()-solve_start,residual=None,
+                iterations=int(stats.get("iter_count",0)),cost=None,error=str(exc))
             raise RuntimeError(self.last_solver_status) from exc
         stats = self.solver.stats()
         self.last_solver_success = bool(stats.get("success", False))
         self.last_solver_status = stats.get("return_status", "unknown")
+        self.last_diagnostics = dict(success=self.last_solver_success,status=self.last_solver_status,
+            solve_seconds=time.perf_counter()-solve_start,residual=None,
+            iterations=int(stats.get("iter_count",0)),cost=None)
         if not self.last_solver_success:
             raise RuntimeError(f"{self.last_solver_status}")
 
         x_opt = sol["x"].full().flatten()
+        if not np.isfinite(x_opt).all():
+            self.last_solver_success = False
+            self.last_diagnostics.update(success=False,status="nonfinite_solution")
+            raise RuntimeError("nonfinite_solution")
+        residual = np.asarray(self.g_fn(x_opt,p_val)).ravel()
+        self.last_diagnostics['residual'] = float(max(
+            np.max(np.abs(residual[:self.n_eq])),
+            np.max(np.maximum(residual[self.n_eq:],0)),
+            np.max(np.maximum(lbx-x_opt,0)),np.max(np.maximum(x_opt-ubx,0))))
         self._store_loss_parts(x_opt, p_val)
         self.last_state_plan = x_opt[:self.n_x].reshape(self.horizon + 1, self.n_states).T
         # Diagnostics and Parameter-IBR use continuous race progress, whereas
@@ -705,4 +760,7 @@ class MPCController:
             self.max_constrained_opponents,
         ).T
         self.last_control_plan = u_opt
+        self.last_diagnostics.update(cost=float(self.last_loss),
+            slack=float(np.max(self.last_track_slack_plan)),
+            collision_slack=float(np.max(self.last_collision_slack_plan)) if self.last_collision_slack_plan.size else 0.)
         return u_opt, u_opt[:, 0]

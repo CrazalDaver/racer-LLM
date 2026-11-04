@@ -1,42 +1,24 @@
+.venv/
 __pycache__/
 *.py[cod]
 .DS_Store
 
-# Manuscripts, rendered figures, reports, and local experiment logs.
-*.tex
-*.pdf
-*.html
-*.log
-LLM-racer-experiment record*/
-logs/
+# Local agent instructions, review notes, and disposable verification artifacts.
+/AGENTS.md
+/agent/
+/test/agent/
 
-.idea/
-Figure_*.png
-myplot.png
+# Generated simulations and training artifacts.
+/result/
+/outputs/
+/artifacts/
+*.npz
+*.log
+*.prof
 *.png
 *.gif
-*.npz
-result/
-artifacts/
-experiments/*/results/
-
-# Legacy generated reports used to live in the repository root.  Current
-# experiment entry points write under result/; keep accidental regenerations
-# out of source control as well.
-/position_sweep_report.html
-/simulation_report_noSafeGuard.html
-/llm_modes_report.html
-/llm_mode_report_assets/
-/simulation_trace*.mp4
-
-# Local one-off JSON scratch files.
-*.local.json
-
-# Unity replay generated files (keep unity/Assets, Packages, ProjectSettings).
-unity/Library/
-unity/Logs/
-unity/Temp/
-unity/UserSettings/
-unity_build/
-unity*_build.log
-*_unity_frames/
+*.mp4
+*.html
+/policy/alpharacer/train/data/
+/policy/alpharacer/train/weights/*
+!/policy/alpharacer/train/weights/upstream/

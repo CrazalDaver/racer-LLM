@@ -24,6 +24,7 @@ def create_simulation_trace(
     initial_lateral_offsets,
     initial_speeds,
     vehicle_model_type,
+    mpc_min_state_speed,
     mpc_velocity_track_weight,
     mpc_track_slack_weight,
     mpc_collision_slack_weight,
@@ -43,6 +44,13 @@ def create_simulation_trace(
         ],
         "car_alpharacer_weight_parameterizations": [
             str(getattr(policy, "weight_parameterization", "")) for policy in policies
+        ],
+        "car_high_level_update_interval_seconds": [
+            float(getattr(policy, "update_interval_seconds", np.nan))
+            for policy in policies
+        ],
+        "car_mode_alpharacer_candidate_counts": [
+            len(getattr(policy, "joint_mode_candidates", ())) for policy in policies
         ],
         "car_ibr_implementations": [
             str(getattr(policy, "implementation", "")) for policy in policies
@@ -73,8 +81,32 @@ def create_simulation_trace(
             else np.nan
             for idx in range(num_cars)
         ],
+        "car_llm_thinking": [
+            bool(getattr(policy, "thinking", False)) for policy in policies
+        ],
+        "car_llm_timeout_seconds": [
+            float(getattr(policy, "timeout", np.nan)) for policy in policies
+        ],
+        "car_llm_retry_counts": [
+            int(getattr(policy, "retry_count", 0)) for policy in policies
+        ],
+        "car_llm_fallback_behaviors": [
+            str(getattr(policy, "fallback_behavior", "not_applicable"))
+            for policy in policies
+        ],
+        "car_llm_num_predict": [
+            int(getattr(policy, "num_predict", 0)) for policy in policies
+        ],
         "car_llm_prompt_variants": [
             str(getattr(policy, "prompt_variant", "not_applicable")) for policy in policies
+        ],
+        "car_llm_prompt_modules": [
+            str(getattr(policy, "prompt_module", "not_applicable"))
+            for policy in policies
+        ],
+        "car_llm_prompt_module_versions": [
+            str(getattr(policy, "prompt_module_version", "not_applicable"))
+            for policy in policies
         ],
         "car_llm_observation_variants": [
             str(getattr(policy, "observation_variant", "not_applicable"))
@@ -102,6 +134,23 @@ def create_simulation_trace(
         "car_llm_system_prompts": [
             str(getattr(policy, "system_prompt", "")) for policy in policies
         ],
+        "car_llm_system_prompt_component_paths_json": [
+            json.dumps(
+                getattr(policy, "system_prompt_component_paths", []),
+                sort_keys=True,
+            )
+            for policy in policies
+        ],
+        "car_llm_system_prompt_component_sha256_json": [
+            json.dumps(
+                getattr(policy, "system_prompt_component_sha256", {}),
+                sort_keys=True,
+            )
+            for policy in policies
+        ],
+        "car_llm_system_prompt_sha256": [
+            str(getattr(policy, "system_prompt_sha256", "")) for policy in policies
+        ],
         "car_llm_output_schemas": [
             output_schema_json(policy) for policy in policies
         ],
@@ -121,6 +170,7 @@ def create_simulation_trace(
         "initial_speeds": initial_speeds.copy(),
         "vehicle_model": vehicle_model_type,
         "mpc_state_coordinates": "frenet",
+        "mpc_min_state_speed": mpc_min_state_speed,
         "velocity_track_weight": mpc_velocity_track_weight,
         "ibr_speed_weight": mpc_velocity_track_weight,
         "heading_track_weight": params.HEADING_TRACK_WEIGHT,
@@ -459,13 +509,25 @@ def record_simulation_step(
 
 
 def save_simulation_trace(trace, track, params, output_path=None):
-    if not trace["time"]:
+    if not trace["time"] and not trace.get("failure"):
         return
 
     output_path = params.TRACE_OUTPUT if output_path is None else output_path
 
     np.savez(
         output_path,
+        mpc_prediction_model=np.asarray(trace['mpc_prediction_model']),
+        mpc_prediction_states=np.asarray(trace['mpc_prediction_states']),
+        car_mpc_solve_seconds=np.asarray(trace.get('car_mpc_solve_seconds',[])),
+        car_mpc_constraint_residual=np.asarray(trace.get('car_mpc_constraint_residual',[])),
+        car_next_state=np.asarray(trace.get('car_next_state',[])),
+        car_next_px=np.asarray(trace.get('car_next_px',[])),
+        car_next_py=np.asarray(trace.get('car_next_py',[])),
+        car_requested_action=np.asarray(trace.get('car_requested_action',[])),
+        terminal_states=np.asarray(trace['terminal_states']),
+        terminal_progress=np.asarray(trace['terminal_progress']),
+        simulated_duration_seconds=np.asarray(trace['simulated_duration_seconds']),
+        failure_json=np.asarray(json.dumps(trace.get('failure')),dtype=str),
         time=np.asarray(trace["time"]),
         x=np.asarray(trace["x"]),
         y=np.asarray(trace["y"]),
@@ -541,6 +603,7 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_ref_p_ref_e=np.asarray(trace["car_ref_p_ref_e"]),
         collision=np.asarray(trace["collision"]),
         collision_overlap=np.asarray(trace.get("collision_overlap", []), dtype=float),
+        car_collision=np.asarray(trace.get("car_collision", []), dtype=bool),
         px=np.asarray(trace["px"]),
         py=np.asarray(trace["py"]),
         ref_px=np.asarray(trace["ref_px"]),
@@ -586,13 +649,40 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_alpharacer_weight_parameterizations=np.asarray(
             trace.get("car_alpharacer_weight_parameterizations", []), dtype=str
         ),
+        car_high_level_update_interval_seconds=np.asarray(
+            trace.get("car_high_level_update_interval_seconds", []), dtype=float
+        ),
+        car_mode_alpharacer_candidate_counts=np.asarray(
+            trace.get("car_mode_alpharacer_candidate_counts", []), dtype=int
+        ),
         car_ibr_implementations=np.asarray(
             trace.get("car_ibr_implementations", []), dtype=str
         ),
         llm_model_names=np.asarray(trace.get("llm_model_names", []), dtype=str),
         llm_temperatures=np.asarray(trace.get("llm_temperatures", []), dtype=float),
+        car_llm_thinking=np.asarray(
+            trace.get("car_llm_thinking", []), dtype=bool
+        ),
+        car_llm_timeout_seconds=np.asarray(
+            trace.get("car_llm_timeout_seconds", []), dtype=float
+        ),
+        car_llm_retry_counts=np.asarray(
+            trace.get("car_llm_retry_counts", []), dtype=int
+        ),
+        car_llm_fallback_behaviors=np.asarray(
+            trace.get("car_llm_fallback_behaviors", []), dtype=str
+        ),
+        car_llm_num_predict=np.asarray(
+            trace.get("car_llm_num_predict", []), dtype=int
+        ),
         car_llm_prompt_variants=np.asarray(
             trace.get("car_llm_prompt_variants", []), dtype=str
+        ),
+        car_llm_prompt_modules=np.asarray(
+            trace.get("car_llm_prompt_modules", []), dtype=str
+        ),
+        car_llm_prompt_module_versions=np.asarray(
+            trace.get("car_llm_prompt_module_versions", []), dtype=str
         ),
         car_llm_observation_variants=np.asarray(
             trace.get("car_llm_observation_variants", []), dtype=str
@@ -615,6 +705,15 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_llm_system_prompts=np.asarray(
             trace.get("car_llm_system_prompts", []), dtype=str
         ),
+        car_llm_system_prompt_component_paths_json=np.asarray(
+            trace.get("car_llm_system_prompt_component_paths_json", []), dtype=str
+        ),
+        car_llm_system_prompt_component_sha256_json=np.asarray(
+            trace.get("car_llm_system_prompt_component_sha256_json", []), dtype=str
+        ),
+        car_llm_system_prompt_sha256=np.asarray(
+            trace.get("car_llm_system_prompt_sha256", []), dtype=str
+        ),
         car_llm_output_schemas=np.asarray(
             trace.get("car_llm_output_schemas", []), dtype=str
         ),
@@ -634,6 +733,18 @@ def save_simulation_trace(trace, track, params, output_path=None):
         llm_raw_eval_counts=np.asarray(trace.get("llm_raw_eval_counts", []), dtype=int),
         llm_raw_prompt_eval_counts=np.asarray(
             trace.get("llm_raw_prompt_eval_counts", []), dtype=int
+        ),
+        llm_raw_prompt_eval_cached_counts=np.asarray(
+            trace.get("llm_raw_prompt_eval_cached_counts", []), dtype=int
+        ),
+        llm_raw_prompt_eval_durations_ns=np.asarray(
+            trace.get("llm_raw_prompt_eval_durations_ns", []), dtype=np.int64
+        ),
+        llm_raw_load_durations_ns=np.asarray(
+            trace.get("llm_raw_load_durations_ns", []), dtype=np.int64
+        ),
+        llm_raw_eval_durations_ns=np.asarray(
+            trace.get("llm_raw_eval_durations_ns", []), dtype=np.int64
         ),
         llm_raw_latency_seconds=np.asarray(
             trace.get("llm_raw_latency_seconds", []), dtype=float
@@ -724,6 +835,28 @@ def save_simulation_trace(trace, track, params, output_path=None):
         oracle_mode_counts_json=np.asarray(
             json.dumps(trace.get("oracle_mode_counts_by_car", []), sort_keys=True)
         ),
+        mode_alpharacer_decisions_json=np.asarray(
+            json.dumps(
+                trace.get("mode_alpharacer_decisions_by_car", []), sort_keys=True
+            )
+        ),
+        mode_alpharacer_mode_counts_json=np.asarray(
+            json.dumps(
+                trace.get("mode_alpharacer_mode_counts_by_car", []), sort_keys=True
+            )
+        ),
+        potential_regret_settings_json=np.asarray(
+            json.dumps(trace.get("potential_regret_settings", {}), sort_keys=True)
+        ),
+        potential_regret_decisions_json=np.asarray(
+            json.dumps(trace.get("potential_regret_decisions", []), sort_keys=True)
+        ),
+        potential_regret_snapshot_validation_json=np.asarray(
+            json.dumps(
+                trace.get("potential_regret_snapshot_validation", {}),
+                sort_keys=True,
+            )
+        ),
         ego_index=np.asarray(trace.get("ego_index", 0)),
         ego_position=np.asarray(trace.get("ego_position", 1)),
         start_ranks=np.asarray(trace.get("start_ranks", [])),
@@ -735,23 +868,8 @@ def save_simulation_trace(trace, track, params, output_path=None):
             trace.get("initial_lateral_offsets", []), dtype=float
         ),
         initial_speeds=np.asarray(trace.get("initial_speeds", []), dtype=float),
-        protocol_version=np.asarray(
-            trace.get("protocol_version", "unversioned"), dtype=str
-        ),
-        protocol_reference_version=np.asarray(
-            trace.get("protocol_reference_version", params.PROTOCOL_VERSION), dtype=str
-        ),
-        protocol_core_compatible=np.asarray(
-            trace.get("protocol_core_compatible", False), dtype=bool
-        ),
-        protocol_evaluation_scenario_compatible=np.asarray(
-            trace.get("protocol_evaluation_scenario_compatible", False), dtype=bool
-        ),
-        protocol_core_deviations_json=np.asarray(
-            json.dumps(trace.get("protocol_core_deviations", []), sort_keys=True)
-        ),
-        protocol_scenario_deviations_json=np.asarray(
-            json.dumps(trace.get("protocol_scenario_deviations", []), sort_keys=True)
+        development_status=np.asarray(
+            trace.get("development_status", "in-progress"), dtype=str
         ),
         git_commit_sha=np.asarray(trace.get("git_commit_sha", "unknown"), dtype=str),
         git_branch=np.asarray(trace.get("git_branch", "unknown"), dtype=str),
@@ -785,9 +903,6 @@ def save_simulation_trace(trace, track, params, output_path=None):
             params.OFFROAD_LARGE_HEADING_ERROR
         ),
         offroad_throttle_boost=np.asarray(params.OFFROAD_THROTTLE_BOOST),
-        offroad_low_speed_threshold=np.asarray(
-            params.OFFROAD_LOW_SPEED_THRESHOLD
-        ),
         velocity_track_weight=np.asarray(
             trace.get("velocity_track_weight", params.VELOCITY_TRACK_WEIGHT)
         ),
@@ -804,6 +919,9 @@ def save_simulation_trace(trace, track, params, output_path=None):
         mpc_dt=np.asarray(params.MPC_DT),
         mpc_horizon=np.asarray(
             trace.get("mpc_horizon", params.MPC_HORIZON)
+        ),
+        mpc_min_state_speed=np.asarray(
+            trace.get("mpc_min_state_speed", params.MPC_MIN_STATE_SPEED)
         ),
         mpc_formulation=np.asarray(
             trace.get("mpc_formulation", params.MPC_FORMULATION)

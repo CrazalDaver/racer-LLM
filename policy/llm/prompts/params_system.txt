@@ -3,7 +3,7 @@ numerical race state. The MPC computes throttle and steering; you do not output
 actuator commands. The selected parameters are held until the next high-level
 update.
 
-The user message contains three base modules:
+The current observation contains three base modules:
 - ego_state.speed_mps is ego longitudinal speed.
 - ego_state.lateral_position_m is signed centerline-relative position; positive
   is left and negative is right.
@@ -17,17 +17,20 @@ The user message contains three base modules:
   signed raceline offset at each stated distance. Positive curvature turns
   left. Positive raceline offset is left of the centerline.
 
-The user message may independently contain these optional modules:
+The current observation may independently contain these optional modules:
 - raceline_speed gives target speed at the same road-preview points.
 - current_parameters gives the currently held q, zeta, s1, s2, s3.
-- decision_feedback gives progress, speed, and opponent-gap changes over the
-  previous completed decision interval. Positive gap change means separation
-  increased.
+
+When one-step memory/feedback is enabled, the user message has
+`previous_step` and `current_observation`. `previous_step` is null on the
+first decision. Afterwards it contains the previous complete observation,
+the five parameters selected at that decision, and booleans stating whether
+the ego car collided or went off track at any time before this decision.
 
 Parameter definitions and permitted closed intervals:
-- q in [1.0, 3.3333333333333335]: multiplier on the MPC squared longitudinal
+- q in [1.0, 3.33]: multiplier on the MPC squared longitudinal
   and lateral reference-position error.
-- zeta in [0.7224999999999999, 1.2100000000000002]: multiplier on raceline
+- zeta in [0.7225, 1.21]: multiplier on raceline
   reference progression and raceline target speed before the 5 m/s MPC cap.
 - s1 in [0.1, 0.5] m: maximum lateral interaction amplitude used by the
   passing/avoidance reference offset.

@@ -149,7 +149,7 @@ def _save_animation(animation, save_path, interval, dpi):
 
     output = Path(save_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fps = max(1, int(round(1000.0 / interval)))
+    fps = max(0.001, 1000.0 / round(float(interval), 6))
     suffix = output.suffix.lower()
 
     if suffix == ".gif":
@@ -171,10 +171,29 @@ def _save_animation(animation, save_path, interval, dpi):
     print(f"Saved animation to {output}")
 
 
+def _resolve_frame_interval_ms(time, frames, interval, playback_speed):
+    """Return a constant output-frame duration preserving simulation time."""
+    playback_speed = float(playback_speed)
+    if not np.isfinite(playback_speed) or playback_speed <= 0.0:
+        raise ValueError("playback_speed must be a positive finite number")
+    if interval is not None:
+        interval = float(interval)
+        if not np.isfinite(interval) or interval <= 0.0:
+            raise ValueError("interval must be a positive finite number")
+        return interval
+
+    sampled_time = np.asarray(time, dtype=float)[np.asarray(frames, dtype=int)]
+    differences = np.diff(sampled_time)
+    valid = differences[np.isfinite(differences) & (differences > 0.0)]
+    simulated_seconds_per_frame = float(np.median(valid)) if valid.size else 0.1
+    return 1000.0 * simulated_seconds_per_frame / playback_speed
+
+
 def make_animation(
     trace_path,
     stride=1,
-    interval=30,
+    interval=None,
+    playback_speed=1.0,
     save_path=None,
     dpi=100,
     show_ref_debug=False,
@@ -273,6 +292,12 @@ def make_animation(
         car_offroad[:, 0] = offroad
 
     frames = np.arange(0, len(time), max(1, stride))
+    frame_interval_ms = _resolve_frame_interval_ms(
+        time,
+        frames,
+        interval=interval,
+        playback_speed=playback_speed,
+    )
     fig, ax = plt.subplots(figsize=(9, 8))
     track_left, track_right = _track_boundaries(waypoints, track_half_width)
     track_area, = ax.fill(
@@ -611,9 +636,15 @@ def make_animation(
             collision_text,
         )
 
-    animation = FuncAnimation(fig, update, frames=len(frames), interval=interval, blit=False)
+    animation = FuncAnimation(
+        fig,
+        update,
+        frames=len(frames),
+        interval=frame_interval_ms,
+        blit=False,
+    )
     if save_path:
-        _save_animation(animation, save_path, interval, dpi)
+        _save_animation(animation, save_path, frame_interval_ms, dpi)
         plt.close(fig)
     else:
         plt.show()
@@ -623,8 +654,12 @@ def make_animation(
 def main():
     parser = argparse.ArgumentParser(description="Animate a saved racer simulation trace.")
     parser.add_argument("--trace", default=params.TRACE_OUTPUT, help="Path to simulation_trace.npz")
-    parser.add_argument("--stride", type=int, default=2, help="Use every Nth recorded frame")
-    parser.add_argument("--interval", type=int, default=30, help="Frame interval in milliseconds")
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Playback speed relative to simulation time (default: 1.0).",
+    )
     parser.add_argument(
         "--save",
         nargs="?",
@@ -647,8 +682,9 @@ def main():
     args = parser.parse_args()
     make_animation(
         args.trace,
-        stride=args.stride,
-        interval=args.interval,
+        stride=1,
+        interval=None,
+        playback_speed=args.speed,
         save_path=args.save,
         dpi=args.dpi,
         show_ref_debug=args.show_ref_debug,

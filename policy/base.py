@@ -1,3 +1,7 @@
+"""
+Base class for all driving policies, including MPC and RL policies.
+Unifiedly defined as a template.
+"""
 import abc
 
 import numpy as np
@@ -9,8 +13,16 @@ from track import Track
 class BasePolicy(abc.ABC):
     """
     Common interface and observable state shared by every driving policy.
-    ``get_action(observation)`` returns the selected throttle/steering command
-    from one immutable, complete control-tick race observation.
+    ``get_action(observation)`` that gives [throttle, steer] control commands for the car controlled by this policy.
+
+    Attributes:
+        - track: Track: The track on which this policy is operating.
+        - mpc: MPC: The MPC instance used by this policy, if any.
+        - car_idx: Optional[int]: The index of the car controlled by this policy, if any.
+        - policy_name: Optional[str]: The name of this policy, if any.
+
+    Methods:
+        - get_action(observation) -> CarAction: Return the control action selected by this policy.
     """
 
     def __init__(self, track: Track, mpc, car_idx=None, policy_name=None):

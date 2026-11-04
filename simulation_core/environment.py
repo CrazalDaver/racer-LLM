@@ -13,7 +13,7 @@ from config import params
 from policy import progress_delta, track_heading_error
 from .observation import RaceObservation
 from state import CarAction, CarState
-from vehicle_model import neutral_throttle, oriented_rectangle_overlap_cost
+from vehicle_model import oriented_rectangle_overlap_cost
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,7 @@ class StepResult:
     next_e: tuple[float, ...]
     offroad_active: tuple[bool, ...]
     offroad_heading_errors: tuple[float, ...]
+    contact_active: tuple[bool, ...]
     contact_happened: bool
     contact_max_overlap: float
 
@@ -35,8 +36,9 @@ class StepResult:
 class RaceEnvironment:
     """Own mutable physical state and advance it through a small step API."""
 
-    def __init__(self, track, states, vehicle_models, initial_progress):
+    def __init__(self, track, states, vehicle_models, initial_progress, curvature_fn=None):
         self.track = track
+        self.curvature_fn = curvature_fn
         self.states = states
         self.vehicle_models = vehicle_models
         self.progress_s = np.asarray(initial_progress, dtype=float)
@@ -77,7 +79,8 @@ class RaceEnvironment:
         """Capture the complete policy observation for the current tick."""
         self._require_active_step()
         return RaceObservation.from_runtime(
-            policies, self.states, self.car_s, self.car_e, self.sim_time
+            policies, self.states, self.car_s, self.car_e, self.sim_time,
+            track=self.track, curvature_fn=self.curvature_fn
         )
 
     def step(self, actions):
@@ -92,11 +95,12 @@ class RaceEnvironment:
         trace_states = tuple(
             CarState.from_array(state.to_array()) for state in self.states
         )
-        next_s, next_e, contact_happened, max_overlap = (
+        next_s, next_e, contact_active, contact_happened, max_overlap = (
             self._integrate_and_resolve_contacts(actions)
         )
         return StepResult(
-            actions=tuple(actions),
+            actions=tuple(CarAction(*model.last_control) if hasattr(model,"last_control") else action
+                          for model,action in zip(self.vehicle_models,actions)),
             trace_states=trace_states,
             previous_s=tuple(car_s),
             previous_e=tuple(car_e),
@@ -104,6 +108,7 @@ class RaceEnvironment:
             next_e=tuple(next_e),
             offroad_active=tuple(offroad_active),
             offroad_heading_errors=tuple(heading_errors),
+            contact_active=tuple(contact_active),
             contact_happened=contact_happened,
             contact_max_overlap=max_overlap,
         )
@@ -144,14 +149,6 @@ class RaceEnvironment:
                 ) * steer_blend
                 if abs(heading) > params.OFFROAD_LARGE_HEADING_ERROR:
                     actions[idx].throttle += params.OFFROAD_THROTTLE_BOOST
-                if state.vx < params.OFFROAD_LOW_SPEED_THRESHOLD:
-                    neutral = neutral_throttle(
-                        state.vx, self.vehicle_models[idx].p
-                    )
-                    actions[idx].throttle = max(
-                        actions[idx].throttle,
-                        neutral + params.OFFROAD_THROTTLE_BOOST,
-                    )
 
             actions[idx].throttle = float(
                 np.clip(actions[idx].throttle, -1.0, 1.0)
@@ -170,6 +167,7 @@ class RaceEnvironment:
 
         next_s, next_e = self.project_current()
         scales = np.ones(len(self.states))
+        contact_active = np.zeros(len(self.states), dtype=bool)
         max_overlap = 0.0
         for i in range(len(self.states)):
             for j in range(i + 1, len(self.states)):
@@ -185,9 +183,9 @@ class RaceEnvironment:
                 delta = progress_delta(
                     next_s[i], next_s[j], self.track.total_length
                 )
-                if delta == 0.0:
-                    continue
-                front, rear = (i, j) if delta > 0.0 else (j, i)
+                contact_active[i] = True
+                contact_active[j] = True
+                front, rear = (i, j) if delta >= 0.0 else (j, i)  # official tie ordering
                 scales[front] *= np.exp(
                     -params.COLLISION_FRONT_DECAY
                     * overlap
@@ -202,4 +200,4 @@ class RaceEnvironment:
             if scale < 1.0:
                 self.states[idx].vx *= scale
                 self.states[idx].vy *= scale
-        return next_s, next_e, happened, float(max_overlap)
+        return next_s, next_e, contact_active, happened, float(max_overlap)

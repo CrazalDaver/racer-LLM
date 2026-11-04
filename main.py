@@ -1,4 +1,4 @@
-#!/Users/lee/racer-LLM/.venv/bin/python
+#!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 import argparse
 import contextlib
@@ -8,7 +8,7 @@ import re
 import sys
 from pathlib import Path
 
-from simulation_core.config import LLM_OBSERVATION_VARIANTS
+from simulation_core.config import LLM_OBSERVATION_VARIANTS, LLM_PROMPT_MODULES
 
 try:
     import argcomplete
@@ -202,6 +202,24 @@ def _trace_llm_summary(data):
     prompt_tokens = np.asarray(
         data.get("llm_raw_prompt_eval_counts", np.empty((car_count, 0))), dtype=float
     )
+    cached_prompt_tokens = np.asarray(
+        data.get(
+            "llm_raw_prompt_eval_cached_counts", np.empty((car_count, 0))
+        ),
+        dtype=float,
+    )
+    prompt_eval_durations_ns = np.asarray(
+        data.get("llm_raw_prompt_eval_durations_ns", np.empty((car_count, 0))),
+        dtype=float,
+    )
+    load_durations_ns = np.asarray(
+        data.get("llm_raw_load_durations_ns", np.empty((car_count, 0))),
+        dtype=float,
+    )
+    eval_durations_ns = np.asarray(
+        data.get("llm_raw_eval_durations_ns", np.empty((car_count, 0))),
+        dtype=float,
+    )
 
     summaries = []
     decision_counts = (
@@ -223,10 +241,32 @@ def _trace_llm_summary(data):
         mode_switches = int(np.sum(update_modes[1:] != update_modes[:-1])) if update_modes.size > 1 else 0
 
         def token_sum(values):
-            if values.ndim != 2:
+            if values.ndim != 2 or values.shape[1] != valid_calls.size:
                 return 0
             selected = values[car_idx][valid_calls]
             return int(np.sum(selected[selected >= 0]))
+
+        def optional_count_sum(values):
+            if values.ndim != 2 or values.shape[1] != valid_calls.size:
+                return None
+            selected = values[car_idx][valid_calls]
+            selected = selected[selected >= 0]
+            return int(np.sum(selected)) if selected.size else None
+
+        def duration_sum_seconds(values):
+            if values.ndim != 2 or values.shape[1] != valid_calls.size:
+                return None
+            selected = values[car_idx][valid_calls]
+            selected = selected[selected >= 0]
+            return float(np.sum(selected) / 1.0e9) if selected.size else None
+
+        prompt_total = token_sum(prompt_tokens)
+        cached_total = optional_count_sum(cached_prompt_tokens)
+        cache_fraction = (
+            float(cached_total / prompt_total)
+            if cached_total is not None and prompt_total > 0
+            else None
+        )
 
         input_schema_version = (
             str(np.asarray(data["car_llm_input_schema_versions"])[car_idx])
@@ -236,7 +276,10 @@ def _trace_llm_summary(data):
         summaries.append({
             "input_schema_version": input_schema_version,
             "input_modules": {
-                "base": input_schema_version == "direct_params_modular_v1",
+                "base": input_schema_version in {
+                    "direct_params_modular_v1",
+                    "direct_params_memory_feedback_v1",
+                },
                 "raceline_speed": (
                     bool(np.asarray(data["car_llm_include_raceline_speed"])[car_idx])
                     if "car_llm_include_raceline_speed" in data.files
@@ -258,6 +301,44 @@ def _trace_llm_summary(data):
                 if "car_llm_prompt_variants" in data.files
                 else "unknown"
             ),
+            "prompt_module": (
+                str(np.asarray(data["car_llm_prompt_modules"])[car_idx])
+                if "car_llm_prompt_modules" in data.files
+                else "unknown"
+            ),
+            "prompt_module_version": (
+                str(np.asarray(data["car_llm_prompt_module_versions"])[car_idx])
+                if "car_llm_prompt_module_versions" in data.files
+                else "unknown"
+            ),
+            "rendered_system_prompt_sha256": (
+                str(np.asarray(data["car_llm_system_prompt_sha256"])[car_idx])
+                if "car_llm_system_prompt_sha256" in data.files
+                else "unknown"
+            ),
+            "thinking": (
+                bool(np.asarray(data["car_llm_thinking"])[car_idx])
+                if "car_llm_thinking" in data.files else None
+            ),
+            "timeout_seconds": (
+                (
+                    float(np.asarray(data["car_llm_timeout_seconds"])[car_idx])
+                    if np.isfinite(
+                        np.asarray(data["car_llm_timeout_seconds"], dtype=float)[car_idx]
+                    )
+                    else None
+                )
+                if "car_llm_timeout_seconds" in data.files
+                else None
+            ),
+            "retry_count": (
+                int(np.asarray(data["car_llm_retry_counts"])[car_idx])
+                if "car_llm_retry_counts" in data.files else None
+            ),
+            "fallback_behavior": (
+                str(np.asarray(data["car_llm_fallback_behaviors"])[car_idx])
+                if "car_llm_fallback_behaviors" in data.files else "unknown"
+            ),
             "observation_variant": (
                 str(np.asarray(data["car_llm_observation_variants"])[car_idx])
                 if "car_llm_observation_variants" in data.files
@@ -269,8 +350,19 @@ def _trace_llm_summary(data):
             "mean_latency_seconds": float(np.mean(latency_values)) if latency_values.size else None,
             "p95_latency_seconds": float(np.percentile(latency_values, 95)) if latency_values.size else None,
             "deadline_miss_count": int(np.sum(latency_values > decision_deadline)),
-            "prompt_tokens": token_sum(prompt_tokens),
+            "prompt_tokens": prompt_total,
+            "cached_prompt_tokens": cached_total,
+            "prompt_cache_hit_fraction": cache_fraction,
             "output_tokens": token_sum(output_tokens),
+            "total_prompt_eval_duration_seconds": duration_sum_seconds(
+                prompt_eval_durations_ns
+            ),
+            "total_load_duration_seconds": duration_sum_seconds(
+                load_durations_ns
+            ),
+            "total_eval_duration_seconds": duration_sum_seconds(
+                eval_durations_ns
+            ),
             "mode_switches": mode_switches,
             "explicit_rule_agreement_fraction": (
                 float(np.mean(rule_consistent[comparable_rules, car_idx]))
@@ -548,6 +640,22 @@ def _add_sim_args(parser):
     group.add_argument("--vehicle-model", choices=["kinematic", "kinetic", "kinetics", "dbm"], default=None)
     group.add_argument("--total-time", type=float, default=None, metavar="SECONDS")
     group.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Explicit environment/model seed recorded in the trace.",
+    )
+    group.add_argument(
+        "--mpc-min-state-speed",
+        type=float,
+        default=None,
+        metavar="MPS",
+        help=(
+            "Override the predicted future-state speed lower bound; values "
+            "other than the frozen protocol default are substrate deviations."
+        ),
+    )
+    group.add_argument(
         "--mpc-velocity-track-weight",
         type=float,
         default=None,
@@ -626,6 +734,12 @@ def _add_sim_args(parser):
         help="Select one independent LLM observation ablation.",
     )
     group.add_argument(
+        "--llm-prompt-module",
+        choices=LLM_PROMPT_MODULES,
+        default="base",
+        help="System-prompt ablation module; base is the unchanged default.",
+    )
+    group.add_argument(
         "--llm-include-raceline-speed",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -641,7 +755,41 @@ def _add_sim_args(parser):
         "--llm-include-decision-feedback",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Toggle the direct-parameter decision_feedback input module.",
+        help=(
+            "Toggle one-step direct-parameter memory: previous observation, "
+            "executed parameters, and interval collision/off-track flags."
+        ),
+    )
+    group.add_argument(
+        "--potential-regret",
+        action="store_true",
+        help=(
+            "Enable exploratory one-second potential-oracle paired rollouts "
+            "at successful direct-parameter LLM decisions."
+        ),
+    )
+    group.add_argument(
+        "--potential-regret-weight",
+        type=Path,
+        default=None,
+        help="Learned potential checkpoint used only by the regret diagnostic.",
+    )
+    group.add_argument(
+        "--potential-regret-sobol-points",
+        type=int,
+        default=8,
+        metavar="N",
+    )
+    group.add_argument(
+        "--potential-regret-max-iterations",
+        type=int,
+        default=40,
+        metavar="N",
+    )
+    group.add_argument(
+        "--potential-regret-optimizer-seed",
+        type=int,
+        default=0,
     )
     group.add_argument(
         "--ibr-implementation",
@@ -694,8 +842,6 @@ def _add_output_args(parser):
     group.add_argument("--no-animation", action="store_true")
     group.add_argument("--show-plot", action="store_true")
     group.add_argument("--show-ref-debug", action="store_true")
-    group.add_argument("--stride", type=int, default=2)
-    group.add_argument("--interval", type=int, default=30)
     group.add_argument("--dpi", type=int, default=100)
 
 
@@ -730,6 +876,17 @@ def _apply_cli_overrides(args):
     if args.mpc_horizon is not None and args.mpc_horizon < 2:
         raise ValueError("--mpc-horizon must be at least 2")
     if (
+        args.mpc_min_state_speed is not None
+        and not 0.0 <= args.mpc_min_state_speed <= params.MAX_STATE_SPEED
+    ):
+        raise ValueError(
+            "--mpc-min-state-speed must be within [0, MAX_STATE_SPEED]"
+        )
+    if args.potential_regret_sobol_points < 1:
+        raise ValueError("--potential-regret-sobol-points must be at least 1")
+    if args.potential_regret_max_iterations < 1:
+        raise ValueError("--potential-regret-max-iterations must be at least 1")
+    if (
         args.mpc_track_slack_weight is not None
         and args.mpc_track_slack_weight < 0.0
     ):
@@ -751,10 +908,12 @@ def _sweep_kwargs_from_args(args):
         "track_name": args.track_name,
         "vehicle_model": args.vehicle_model or "kinematic",
         "duration": args.total_time,
+        "random_seed": args.random_seed,
         "raceline": args.raceline_csv,
         "start_gap": args.start_gap,
         "start_speeds": args.initial_speeds,
         "mpc_velocity_weight": args.mpc_velocity_track_weight,
+        "mpc_min_state_speed": args.mpc_min_state_speed,
         "mpc_track_slack": args.mpc_track_slack_weight,
         "mpc_collision_slack": args.mpc_collision_slack_weight,
         "mpc_horizon": args.mpc_horizon,
@@ -769,9 +928,15 @@ def _sweep_kwargs_from_args(args):
         "llm_models": args.llm_models,
         "llm_update_interval": args.llm_update_interval_seconds,
         "llm_observation_variant": args.llm_observation_variant,
+        "llm_prompt_module": args.llm_prompt_module,
         "llm_include_raceline_speed": args.llm_include_raceline_speed,
         "llm_include_current_parameters": args.llm_include_current_parameters,
         "llm_include_decision_feedback": args.llm_include_decision_feedback,
+        "potential_regret_enabled": args.potential_regret,
+        "potential_regret_weight_path": args.potential_regret_weight,
+        "potential_regret_sobol_points": args.potential_regret_sobol_points,
+        "potential_regret_max_iterations": args.potential_regret_max_iterations,
+        "potential_regret_optimizer_seed": args.potential_regret_optimizer_seed,
         "llm_temperature": args.llm_temperature,
         "llm_temperatures": args.llm_temperatures,
         "show_plot": args.show_plot,
@@ -847,8 +1012,8 @@ def main():
     generate_report(
         sweep_paths,
         output=report_path,
-        animation_stride=args.stride,
-        animation_interval=args.interval,
+        animation_stride=1,
+        animation_interval=None,
         animation_dpi=args.dpi,
         include_animation=not args.no_animation,
     )
