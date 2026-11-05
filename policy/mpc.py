@@ -295,7 +295,7 @@ class MPCPolicy(BasePolicy):
         self,
         p_pert_x: float,  # Perturbed point: centerline s (m).
         p_pert_y: float,  # Perturbed point: centerline e (m).
-        ego_body_vx: float,  # Measured forward body speed (m/s), not s_dot.
+        v_pert_x: float,  # Reference centerline progress rate at step k (m/s).
         ego_py_t: float,  # Measured ego centerline e at the current tick (m).
         opponents,
         k: int,
@@ -307,6 +307,8 @@ class MPCPolicy(BasePolicy):
         Blocking:
             p_bl += (opponent_py(k) - p_pert_y)
                     * (1 - exp(-s3 * max(dv, 0))) * exp(-s2 * dx**2)
+            dv = measured opponent s_dot - reference s_dot at step k.
+            Both selected opponents are eligible once behind the future point.
         """
         _, _, s1, s2, s3 = self.params
         p_ot_front = 0.0
@@ -324,13 +326,13 @@ class MPCPolicy(BasePolicy):
             elif opponent["delta"] < 0.0:
                 p_ot_rear += p_ot
 
-            behind_now = opponent["delta"] < 0.0
-            # Official wrapper compares measured body vx; forecast vx is ds/dt.
-            opponent_body_vx = float(opponent["state"].vx)
-            opponent_faster = opponent_body_vx > ego_body_vx
+            # Paper compares the reference rate with the opponent's measured
+            # longitudinal rate, held constant over the planning window.
+            opponent_vx = float(opponent.get("s_dot", opponent.get("vx", 0.0)))
+            opponent_faster = opponent_vx > v_pert_x
             ego_ahead_in_horizon = dx >= 0.0
-            if behind_now and opponent_faster and ego_ahead_in_horizon:
-                speed_factor = 1.0 - math.exp(-s3 * max(opponent_body_vx - ego_body_vx, 0.0))
+            if opponent_faster and ego_ahead_in_horizon:
+                speed_factor = 1.0 - math.exp(-s3 * max(opponent_vx - v_pert_x, 0.0))
                 proximity = math.exp(-s2 * dx * dx)
                 p_bl += (opp_py - p_pert_y) * speed_factor * proximity
 
@@ -356,19 +358,22 @@ class MPCPolicy(BasePolicy):
         
         raceline_sample_s = raceline_s
         projection_s_hint = current_s  # Start from measured centerline progress.
+        frenet = self._raceline_frenet_point(
+            raceline_sample_s, projection_s_hint=projection_s_hint)
         for k in range(horizon + 1):
-            frenet = self._raceline_frenet_point(
-                raceline_sample_s,
-                projection_s_hint=projection_s_hint,
-            )
-            projection_s_hint = frenet["track_s"]  # Next projection searches near the previous projected point.
             raceline_speed_k = max(frenet["raceline_speed_mps"], 0.0)
+            next_raceline_s = raceline_sample_s + zeta * raceline_speed_k * self.mpc.dt
+            next_frenet = self._raceline_frenet_point(
+                next_raceline_s, projection_s_hint=frenet["track_s"])
+            # The path advances along the raceline, then projects to centerline s.
+            # Compare its actual s progression with the opponent's measured s_dot.
+            v_pert_x = (next_frenet["track_s"] - frenet["track_s"]) / self.mpc.dt
             p_pert_x = frenet["track_s"]  # Perturbed point: centerline s, before competitive offsets.
             p_pert_y = frenet["lateral_e"]  # Perturbed point: centerline e, before competitive offsets.
             p_ot_front, p_ot_rear, p_bl = self._competitive_offsets(
                 p_pert_x,
                 p_pert_y,
-                state.vx,
+                v_pert_x,
                 ego_py_t,
                 selected_opponents,
                 k,
@@ -392,10 +397,8 @@ class MPCPolicy(BasePolicy):
             raceline_world[:, k] = [frenet["world_x"], frenet["world_y"]]
             ref[0, k] = p_pert_x
             ref[1, k] = p_ref_y
-            # zeta controls how quickly the reference horizon advances.  Once
-            # velocity tracking is enabled, the same effective progression
-            # speed must be used as the speed target; using the raw raceline
-            # speed here would silently remove zeta from this part of the MPC.
+            # Retain the speed target along the raceline. Blocking instead uses
+            # the centerline progress rate above; velocity tracking defaults to zero.
             ref[2, k] = float(np.clip(
                 zeta * raceline_speed_k,
                 0.0,
@@ -407,7 +410,8 @@ class MPCPolicy(BasePolicy):
             ref[6, k] = frenet["normal_x"]
             ref[7, k] = frenet["normal_y"]
 
-            raceline_sample_s += zeta * raceline_speed_k * self.mpc.dt
+            raceline_sample_s = next_raceline_s
+            frenet = next_frenet
         return ref, ref_world, raceline_world, ref_components
 
     def _record_reference(self, ref_world, raceline_world, ref_components):
