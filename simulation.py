@@ -438,7 +438,7 @@ class Race:
                     )
 
             # ----- D. Record and report the result -----
-            self.recorder.record(step, transition, self.environment)
+            self.recorder.record(step, transition, self.environment, observation)
             self.reporter.report_step(step, self.environment, transition)
 
         # ==================== 2. FINALIZE OUTPUTS ======================

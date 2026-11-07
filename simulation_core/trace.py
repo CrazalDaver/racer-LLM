@@ -520,6 +520,7 @@ def save_simulation_trace(trace, track, params, output_path=None):
         mpc_prediction_states=np.asarray(trace['mpc_prediction_states']),
         car_mpc_solve_seconds=np.asarray(trace.get('car_mpc_solve_seconds',[])),
         car_mpc_constraint_residual=np.asarray(trace.get('car_mpc_constraint_residual',[])),
+        car_observed_state=np.asarray(trace.get('car_observed_state',[])),
         car_next_state=np.asarray(trace.get('car_next_state',[])),
         car_next_px=np.asarray(trace.get('car_next_px',[])),
         car_next_py=np.asarray(trace.get('car_next_py',[])),

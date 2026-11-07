@@ -149,8 +149,13 @@ class TraceRecorder:
         values[:count] = source[:count]
         return values
 
-    def record(self, step, transition, environment):
+    def record(self, step, transition, environment, observation):
         race = self.race
+        # Pre-action measured state; training reconstructs features without MPC curvature.
+        self.trace.setdefault('car_observed_state', []).append([
+            [car.s, car.e, car.psi, car.vx_body, car.vy_body, car.omega]
+            for car in observation.cars
+        ])
         ref_fx, ref_fy = record_simulation_step(
             self.trace,
             step=step,
