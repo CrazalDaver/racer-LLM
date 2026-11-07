@@ -11,8 +11,11 @@ unless the matching --force-* option is provided.
 """
 
 import argparse
+import concurrent.futures
+import copy
 import hashlib
 import json
+import multiprocessing
 import random
 import subprocess
 import uuid
@@ -211,7 +214,13 @@ def initialize_potential(value_models, device):
 # Stage 1: collect rollout data
 # ---------------------------------------------------------------------------
 
-def collect_rollout_data(args):
+def _collect_parallel_chain(task):
+    args, chain, attempt_budget = task
+    collect_rollout_data(args, _chain=chain, _attempt_budget=attempt_budget)
+    return args.data
+
+
+def collect_rollout_data(args, _chain=None, _attempt_budget=None):
     settings = dict(track=args.track, vehicle_model=args.vehicle_model,
                     horizon=args.horizon, duration=args.duration, gamma=args.gamma,
                     return_window=args.return_window,
@@ -234,6 +243,14 @@ def collect_rollout_data(args):
     chains = collection_chains(splits, args.batch_size, args.seed)
     total_races = sum(len(ids) for ids in splits.values())
     max_attempts = args.max_attempts or 3*total_races
+    if _chain is None and getattr(args, "n_workers", 1) > 1:
+        return _collect_parallel_rollouts(args, settings, splits, chains, max_attempts)
+    if _chain is not None:
+        length = _chain["end"] - _chain["start"]
+        chains = [{**_chain, "start": 0, "end": length}]
+        total_races = length
+        splits = {name: np.arange(length) if name == _chain["split"] else np.array([], dtype=int)
+                  for name in splits}
     configure_track(params, args.track)
     track = Track(load_centerline_csv(params.TRACK_CSV, scale=params.TRACK_SCALE))
     gap_diagnostics = dict(track_length_m=track.total_length, accepted_episodes=0,
@@ -256,7 +273,8 @@ def collect_rollout_data(args):
     collection_id = uuid.uuid4().hex[:12]
     chain_index, active_chain = 0, None
     while len(all_features) < total_races:
-        if attempts >= max_attempts:
+        if (attempts >= max_attempts
+                or (_attempt_budget is not None and not _attempt_budget.acquire(False))):
             raise RuntimeError(f"Collection attempt limit reached: {len(all_features)}/{total_races} valid races; see saved failure diagnostics")
         race = len(all_features)
         if race == chains[chain_index]["end"]:
@@ -300,8 +318,9 @@ def collect_rollout_data(args):
         if reason is not None:
             failure_path = args.data.with_name(f"{args.data.stem}.{collection_id}.failure-{attempts:06d}.json")
             failure_path.write_text(json.dumps(dict(
-                attempt=attempts, accepted_before=race, completed_steps=completed, expected_steps=expected_steps,
-                chain=chain,
+                attempt=attempts, accepted_before=race + (_chain["start"] if _chain else 0),
+                completed_steps=completed, expected_steps=expected_steps,
+                chain=_chain or chain,
                 parameters=joint_params.tolist(), ego_position=start_rank,
                 settings=settings, failure=reason, trace=trace,
             ), indent=2, default=lambda value: value.tolist() if isinstance(value, np.ndarray) else str(value)) + "\n")
@@ -341,7 +360,7 @@ def collect_rollout_data(args):
                 returns=np.stack(all_returns[section]), own_returns=np.stack(own_returns[section]),
                 joint_params=np.stack(all_params[section]),
                 deviating_player=np.asarray(all_deviators[section]),
-                metadata=np.asarray(json.dumps(dict(chain=chain, settings=settings))))
+                metadata=np.asarray(json.dumps(dict(chain=_chain or chain, settings=settings))))
             chain_files.append(str(path))
 
     source_paths = [Path(__file__), Path("policy/alpharacer/network.py"), Path("config.py"),
@@ -379,6 +398,62 @@ def collect_rollout_data(args):
         **{f"{name}_ids": ids for name, ids in splits.items()},
         metadata=np.asarray(json.dumps(metadata, sort_keys=True, default=str)),
     )
+    print(f"  saved {args.data}")
+    return args.data
+
+
+def _collect_parallel_rollouts(args, settings, splits, chains, max_attempts):
+    """Run existing serial collection independently for each seeded chain."""
+    workers = min(args.n_workers, len(chains))
+    collection_id = uuid.uuid4().hex[:12]
+    args.data.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[stage 1/4] Collecting {len(chains)} independent chains with {workers} workers", flush=True)
+    context = multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        attempt_budget = manager.BoundedSemaphore(max_attempts)
+        tasks = []
+        for chain in chains:
+            worker_args = copy.copy(args)
+            worker_args.data = args.data.with_name(
+                f"{args.data.stem}.{collection_id}.worker-{chain['id']:03d}.npz")
+            worker_args.max_attempts = max_attempts
+            tasks.append((worker_args, chain, attempt_budget))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+            paths = list(executor.map(_collect_parallel_chain, tasks))
+
+    arrays = {name: [] for name in ("features", "returns", "own_returns", "joint_params",
+                                     "deviating_player", "chain_id")}
+    metadata = None
+    attempts, failures, starts, chain_files = 0, [], [], []
+    gap = None
+    for path in paths:
+        with np.load(path, allow_pickle=False) as data:
+            current = json.loads(str(data["metadata"]))
+            for name in arrays:
+                arrays[name].append(data[name])
+        if metadata is None:
+            metadata = current
+            gap = current["progress_gap_diagnostics"].copy()
+        else:
+            current_gap = current["progress_gap_diagnostics"]
+            for key in gap:
+                if key == "max_progress_spread_m":
+                    gap[key] = max(gap[key], current_gap[key])
+                elif key != "track_length_m":
+                    gap[key] += current_gap[key]
+        attempts += current["attempts"]
+        failures.extend(current["failed_attempts"])
+        starts.extend(current["start_ego_positions"])
+        chain_files.extend(current["chain_files"])
+    metadata.update(collection_settings=settings, chains=chains, chain_files=chain_files,
+                    start_ego_positions=starts, attempts=attempts, collection_id=collection_id,
+                    failed_attempts=failures, split_counts={name: len(ids) for name, ids in splits.items()},
+                    progress_gap_diagnostics=gap, collection_workers=workers)
+    np.savez_compressed(args.data, **{name: np.concatenate(parts) for name, parts in arrays.items()},
+                        **{f"{name}_ids": ids for name, ids in splits.items()},
+                        metadata=np.asarray(json.dumps(metadata, sort_keys=True, default=str)))
+    for path in paths:
+        path.unlink()
     print(f"  saved {args.data}")
     return args.data
 
@@ -693,6 +768,8 @@ Example:
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--return-window", type=int, default=350, help="fixed future window in control steps (official S)")
     parser.add_argument("--max-attempts", type=int, default=None, help="collection safety limit; default 3 times the required valid races")
+    parser.add_argument("--n-workers", type=int, default=1,
+                        help="parallel CPU workers for independent rollout chains (default: 1)")
 
     # Optimization parameters:
     # --value-epochs N / --potential-epochs N
@@ -723,6 +800,8 @@ Example:
         parser.error("--return-window must be positive and shorter than the race")
     if args.max_attempts is not None and args.max_attempts < 1:
         parser.error("--max-attempts must be positive")
+    if args.n_workers < 1:
+        parser.error("--n-workers must be positive")
     if not (0.0 < args.validation_fraction < 1.0 and 0.0 < args.test_fraction < 1.0
             and args.validation_fraction + args.test_fraction < 1.0):
         parser.error("validation/test fractions must be positive and sum to less than 1")

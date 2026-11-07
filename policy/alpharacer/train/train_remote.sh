@@ -12,6 +12,7 @@ Usage: bash policy/alpharacer/train/train_remote.sh [wrapper options] [training 
 
 Wrapper options:
   --output-dir DIR  New, empty run directory (default: outputs/alpharacer/<UTC>-<PID>)
+  --workers N       Rollout worker processes, or auto to use SLURM_CPUS_PER_TASK (default: 1)
   --check-only      Check dependencies, CUDA, assets and IPOPT; do not train
   --dry-run         Print the command; do not install, create files or train
   -h, --help        Show this help
@@ -19,7 +20,7 @@ Wrapper options:
 All other arguments are forwarded to policy.alpharacer.train.training.
 Defaults: DBM, Berlin, 4000 valid training races + 500 validation + 500 test,
 50s races, gamma=1, 350-step returns, 50000 value / 100000 potential epochs.
-Example: bash policy/alpharacer/train/train_remote.sh --track berlin --seed 7
+Example: bash train_alpharacer.sh --workers auto --track berlin --seed 7
 
 Environment:
   PYTHON_BIN    Existing Python interpreter; otherwise use/create .venv/bin/python
@@ -34,12 +35,19 @@ HELP
 RUN_DIR=""
 CHECK_ONLY=0
 DRY_RUN=0
+WORKERS=1
 TRAIN_ARGS=()
 while (($#)); do
     case "$1" in
         --output-dir)
             [[ $# -ge 2 && -n "$2" ]] || { echo "--output-dir requires a directory" >&2; exit 2; }
             RUN_DIR="$2"; shift 2 ;;
+        --workers)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "--workers requires a positive integer or auto" >&2; exit 2; }
+            WORKERS="$2"; shift 2 ;;
+        --workers=*) WORKERS="${1#*=}"; shift ;;
+        --n-workers|--n-workers=*)
+            echo "Use --workers to select the number of rollout workers." >&2; exit 2 ;;
         --check-only) CHECK_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -50,6 +58,12 @@ while (($#)); do
         *) TRAIN_ARGS+=("$1"); shift ;;
     esac
 done
+if [[ "$WORKERS" == auto ]]; then
+    WORKERS="${SLURM_CPUS_PER_TASK:-1}"
+fi
+[[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "--workers requires a positive integer or auto" >&2; exit 2;
+}
 
 RUN_DIR="${RUN_DIR:-outputs/alpharacer/$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 [[ "$RUN_DIR" = /* ]] || RUN_DIR="$REPO_ROOT/$RUN_DIR"
@@ -58,7 +72,7 @@ TRAIN_COMMAND=("$TRAIN_PYTHON" -u -m policy.alpharacer.train.training
     --vehicle-model dbm --track berlin
     --data "$RUN_DIR/rollouts.npz"
     --value-dir "$RUN_DIR/values"
-    --potential-output "$RUN_DIR/potential.pth")
+    --potential-output "$RUN_DIR/potential.pth" --n-workers "$WORKERS")
 if ((${#TRAIN_ARGS[@]})); then
     TRAIN_COMMAND+=("${TRAIN_ARGS[@]}")
 fi
@@ -83,7 +97,7 @@ fi
 mkdir -p -- "$RUN_DIR"
 mkdir -- "$RUN_DIR/.running" || { echo "Run directory is already in use" >&2; exit 2; }
 
-# Limit numerical-library oversubscription during serial CPU rollout collection.
+# Limit numerical-library oversubscription in each CPU rollout worker.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -178,7 +192,7 @@ if device == 'cpu':
     print('CUDA unavailable: rollout and network fitting will use CPU.')
 else:
     print('Network device:', torch.cuda.get_device_name(0))
-print('Rollout collection: serial CPU MPC/DBM.')
+print(f'Rollout collection: {args.n_workers} CPU worker process(es).')
 x = ca.SX.sym('x')
 solver = ca.nlpsol('alpha_preflight', 'ipopt', {'x': x, 'f': x*x},
                   {'ipopt.print_level': 0, 'print_time': 0})
