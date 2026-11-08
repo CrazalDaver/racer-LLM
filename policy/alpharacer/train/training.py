@@ -16,6 +16,7 @@ import copy
 import hashlib
 import json
 import multiprocessing
+import os
 import random
 import subprocess
 import uuid
@@ -55,6 +56,35 @@ def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def atomic_torch_save(value, path):
+    """Keep the preceding checkpoint if a write is interrupted."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def atomic_npz_save(path, **arrays):
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp.npz")
+    np.savez_compressed(temporary, **arrays)
+    os.replace(temporary, path)
+
+
+def load_training_state(path, device="cpu"):
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def random_state():
+    return dict(torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+
+
+def restore_random_state(state):
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
 
 
 def checkpoint_payload(model, *, kind, metadata):
@@ -243,7 +273,7 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
     chains = collection_chains(splits, args.batch_size, args.seed)
     total_races = sum(len(ids) for ids in splits.values())
     max_attempts = args.max_attempts or 3*total_races
-    if _chain is None and getattr(args, "n_workers", 1) > 1:
+    if _chain is None and (getattr(args, "n_workers", 1) > 1 or getattr(args, "resumable", False)):
         return _collect_parallel_rollouts(args, settings, splits, chains, max_attempts)
     if _chain is not None:
         length = _chain["end"] - _chain["start"]
@@ -272,6 +302,24 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
     attempts, failed_attempts = 0, []
     collection_id = uuid.uuid4().hex[:12]
     chain_index, active_chain = 0, None
+    checkpoint = args.data.with_suffix(".collection-state.pth")
+    if _chain is not None and getattr(args, "resumable", False) and checkpoint.exists():
+        state = load_training_state(checkpoint)
+        if state["settings"] != settings or state["chain"] != _chain:
+            raise ValueError("Saved collection checkpoint does not match this chain or settings")
+        (all_features, all_returns, own_returns, all_params, all_deviators, starts,
+         chain_ids, failed_attempts, gap_diagnostics, attempts, chain_files) = state["data"]
+        collection_id, chain_attempts = state["collection_id"], state["chain_attempts"]
+        active_chain = _chain["id"]
+        rng = np.random.default_rng()
+        rng.bit_generator.state = state["rng_state"]
+        accepted_params = state["accepted_params"]
+        config = SimulationConfig(policies=["static_alpharacer"] * 3,
+            static_params_by_car=accepted_params.copy(), track_name=args.track,
+            vehicle_model=args.vehicle_model, mpc_horizon=args.horizon,
+            initial_speed=args.initial_speed, ego_position=starts[-1] if starts else 1,
+            duration=args.duration, save_trace=False, show_plot=False, quiet=True)
+        print(f"  resumed chain {_chain['id']} at {len(all_features)}/{total_races}", flush=True)
     while len(all_features) < total_races:
         if (attempts >= max_attempts
                 or (_attempt_budget is not None and not _attempt_budget.acquire(False))):
@@ -326,6 +374,11 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
             ), indent=2, default=lambda value: value.tolist() if isinstance(value, np.ndarray) else str(value)) + "\n")
             failed_attempts.append(str(failure_path))
             print(f"  rejected attempt {attempts}: {reason}; saved {failure_path}")
+            if _chain is not None and getattr(args, "resumable", False):
+                atomic_torch_save(dict(settings=settings, chain=_chain, collection_id=collection_id,
+                    chain_attempts=chain_attempts, rng_state=rng.bit_generator.state,
+                    accepted_params=accepted_params, data=(all_features, all_returns, own_returns,
+                    all_params, all_deviators, starts, chain_ids, failed_attempts, gap_diagnostics, attempts, chain_files)), checkpoint)
             continue
         features, update_indices = trace_features(trace, track, joint_params, args.horizon)
         rewards = trace_rewards(trace, update_indices)
@@ -356,12 +409,17 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
         if race+1 == chain["end"]:
             path = args.data.with_name(f"{args.data.stem}.{collection_id}.chain-{chain['id']:03d}.npz")
             section = slice(chain["start"], chain["end"])
-            np.savez_compressed(path, features=np.stack(all_features[section]),
+            atomic_npz_save(path, features=np.stack(all_features[section]),
                 returns=np.stack(all_returns[section]), own_returns=np.stack(own_returns[section]),
                 joint_params=np.stack(all_params[section]),
                 deviating_player=np.asarray(all_deviators[section]),
                 metadata=np.asarray(json.dumps(dict(chain=_chain or chain, settings=settings))))
             chain_files.append(str(path))
+        if _chain is not None and getattr(args, "resumable", False):
+            atomic_torch_save(dict(settings=settings, chain=_chain, collection_id=collection_id,
+                chain_attempts=chain_attempts, rng_state=rng.bit_generator.state,
+                accepted_params=accepted_params, data=(all_features, all_returns, own_returns,
+                all_params, all_deviators, starts, chain_ids, failed_attempts, gap_diagnostics, attempts, chain_files)), checkpoint)
 
     source_paths = [Path(__file__), Path("policy/alpharacer/network.py"), Path("config.py"),
                     Path(params.TRACK_CSV), Path(params.RACELINE_CSV)]
@@ -390,7 +448,7 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
         "effective_params": {key: value for key, value in vars(params).items()
                              if not key.startswith("_") and not callable(value)},
     }
-    np.savez_compressed(
+    atomic_npz_save(
         args.data, features=np.stack(all_features), returns=np.stack(all_returns),
         own_returns=np.stack(own_returns),
         joint_params=np.stack(all_params), deviating_player=np.asarray(all_deviators),
@@ -405,18 +463,32 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
 def _collect_parallel_rollouts(args, settings, splits, chains, max_attempts):
     """Run existing serial collection independently for each seeded chain."""
     workers = min(args.n_workers, len(chains))
-    collection_id = uuid.uuid4().hex[:12]
+    collection_id = "resume" if getattr(args, "resumable", False) else uuid.uuid4().hex[:12]
     args.data.parent.mkdir(parents=True, exist_ok=True)
     print(f"[stage 1/4] Collecting {len(chains)} independent chains with {workers} workers", flush=True)
     context = multiprocessing.get_context("spawn")
+    previous_attempts = 0
+    if getattr(args, "resumable", False):
+        for chain in chains:
+            path = args.data.with_name(f"{args.data.stem}.{collection_id}.worker-{chain['id']:03d}.npz")
+            state_path = path.with_suffix(".collection-state.pth")
+            if path.exists():
+                with np.load(path, allow_pickle=False) as data:
+                    previous_attempts += json.loads(str(data["metadata"]))["attempts"]
+            elif state_path.exists():
+                previous_attempts += load_training_state(state_path)["data"][-2]
+    if previous_attempts > max_attempts:
+        raise ValueError("Saved attempts exceed --max-attempts")
     with context.Manager() as manager:
-        attempt_budget = manager.BoundedSemaphore(max_attempts)
+        attempt_budget = manager.BoundedSemaphore(max_attempts - previous_attempts)
         tasks = []
         for chain in chains:
             worker_args = copy.copy(args)
             worker_args.data = args.data.with_name(
                 f"{args.data.stem}.{collection_id}.worker-{chain['id']:03d}.npz")
             worker_args.max_attempts = max_attempts
+            if getattr(args, "resumable", False):
+                worker_args.force_rollouts = False
             tasks.append((worker_args, chain, attempt_budget))
         with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
             paths = list(executor.map(_collect_parallel_chain, tasks))
@@ -449,11 +521,12 @@ def _collect_parallel_rollouts(args, settings, splits, chains, max_attempts):
                     start_ego_positions=starts, attempts=attempts, collection_id=collection_id,
                     failed_attempts=failures, split_counts={name: len(ids) for name, ids in splits.items()},
                     progress_gap_diagnostics=gap, collection_workers=workers)
-    np.savez_compressed(args.data, **{name: np.concatenate(parts) for name, parts in arrays.items()},
+    atomic_npz_save(args.data, **{name: np.concatenate(parts) for name, parts in arrays.items()},
                         **{f"{name}_ids": ids for name, ids in splits.items()},
                         metadata=np.asarray(json.dumps(metadata, sort_keys=True, default=str)))
-    for path in paths:
-        path.unlink()
+    if not getattr(args, "resumable", False):
+        for path in paths:
+            path.unlink()
     print(f"  saved {args.data}")
     return args.data
 
@@ -465,7 +538,7 @@ def _collect_parallel_rollouts(args, settings, splits, chains, max_attempts):
 def train_value_functions(args, utility="relative"):
     directory = args.value_dir if utility == "relative" else args.value_dir / "own_progress"
     output_paths = [directory / f"value_car{player}.pth" for player in range(3)]
-    if all(path.exists() for path in output_paths) and not args.force_values:
+    if all(path.exists() for path in output_paths) and not args.force_values and not getattr(args, "resumable", False):
         for path in output_paths:
             payload = torch.load(path, map_location="cpu")
             if payload.get("metadata", {}).get("normalization") != "official_value_running_batchnorm":
@@ -492,8 +565,22 @@ def train_value_functions(args, utility="relative"):
         model = SimpleNeuralNetwork(ALPHA_INPUT_SIZE, ALPHA_VALUE_HIDDEN_SIZES, 1).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.value_learning_rate)
         best_loss = float("inf")
+        first_epoch = 0
+        state_path = output_path.with_suffix(".training-state.pth")
+        if getattr(args, "resumable", False) and state_path.exists():
+            state = load_training_state(state_path, device)
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            best_loss, first_epoch = state["best_loss"], state["next_epoch"]
+            restore_random_state(state["random_state"])
+            if first_epoch == args.value_epochs:
+                if not output_path.exists():
+                    raise ValueError(f"Completed checkpoint is missing: {output_path}")
+                print(f"  resumed completed value model {output_path}")
+                continue
+            print(f"  resuming car={player} epoch={first_epoch + 1}/{args.value_epochs}")
 
-        for epoch in range(args.value_epochs):
+        for epoch in range(first_epoch, args.value_epochs):
             model.train()
             for x_batch, y_batch in loader:
                 y_batch = y_batch.to(device)
@@ -511,7 +598,7 @@ def train_value_functions(args, utility="relative"):
             if ((utility == "own_progress" and epoch == args.value_epochs-1)
                     or (utility == "relative" and score < best_loss)):
                 best_loss = score
-                torch.save(
+                atomic_torch_save(
                     checkpoint_payload(
                         model,
                         kind="alpha_value",
@@ -522,6 +609,10 @@ def train_value_functions(args, utility="relative"):
                     ),
                     output_path,
                 )
+            if (getattr(args, "resumable", False)
+                    and ((epoch + 1) % 10 == 0 or epoch + 1 == args.value_epochs)):
+                atomic_torch_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
+                    best_loss=best_loss, next_epoch=epoch + 1, random_state=random_state()), state_path)
             if epoch == 0 or (epoch + 1) % 10 == 0:
                 print(f"  car={player} epoch={epoch + 1}/{args.value_epochs} validation_mse={score:.6g}")
         print(f"  saved {output_path} (selected validation MSE={best_loss:.6g})")
@@ -533,7 +624,7 @@ def train_value_functions(args, utility="relative"):
 # ---------------------------------------------------------------------------
 
 def train_potential_function(args, value_paths, initialization_paths):
-    if args.potential_output.exists() and not args.force_potential:
+    if args.potential_output.exists() and not args.force_potential and not getattr(args, "resumable", False):
         metadata = torch.load(args.potential_output, map_location="cpu").get("metadata", {})
         if (metadata.get("normalization") != "official_potential_frozen_first_value_bn"
                 or metadata.get("tail_batches") != "drop_incomplete_previous_state_pairs"):
@@ -595,8 +686,22 @@ def train_potential_function(args, value_paths, initialization_paths):
     loss_fn = nn.MSELoss()
     best_loss = float("inf")
     args.potential_output.parent.mkdir(parents=True, exist_ok=True)
+    first_epoch = 0
+    state_path = args.potential_output.with_suffix(".training-state.pth")
+    if getattr(args, "resumable", False) and state_path.exists():
+        state = load_training_state(state_path, device)
+        potential.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        best_loss, first_epoch = state["best_loss"], state["next_epoch"]
+        restore_random_state(state["random_state"])
+        if first_epoch == args.potential_epochs:
+            if not args.potential_output.exists():
+                raise ValueError(f"Completed checkpoint is missing: {args.potential_output}")
+            print(f"  resumed completed potential model {args.potential_output}")
+            return args.potential_output
+        print(f"  resuming potential epoch={first_epoch + 1}/{args.potential_epochs}")
 
-    for epoch in range(args.potential_epochs):
+    for epoch in range(first_epoch, args.potential_epochs):
         potential.eval()  # Official training freezes BatchNorm while updating fc weights.
         total, count = 0.0, 0
         for x_left, x_right, y_batch, pair_players in loader:
@@ -621,7 +726,7 @@ def train_potential_function(args, value_paths, initialization_paths):
         validation_mse = float(np.mean((val_prediction - val_target) ** 2))
         if validation_mse < best_loss:
             best_loss = validation_mse
-            torch.save(
+            atomic_torch_save(
                 checkpoint_payload(
                     potential,
                     kind="alpha_potential",
@@ -634,6 +739,10 @@ def train_potential_function(args, value_paths, initialization_paths):
                 ),
                 args.potential_output,
             )
+        if (getattr(args, "resumable", False)
+                and ((epoch + 1) % 10 == 0 or epoch + 1 == args.potential_epochs)):
+            atomic_torch_save(dict(model=potential.state_dict(), optimizer=optimizer.state_dict(),
+                best_loss=best_loss, next_epoch=epoch + 1, random_state=random_state()), state_path)
         if epoch == 0 or (epoch + 1) % 10 == 0:
             print(f"  epoch={epoch + 1}/{args.potential_epochs} difference_mse={mean_loss:.6g} validation_mse={validation_mse:.6g}")
     print(f"  saved {args.potential_output} (best validation difference MSE={best_loss:.6g})")
@@ -705,9 +814,9 @@ def run_training_pipeline(args):
     # artifact necessarily rebuilds every model trained from that artifact.
     rebuilding_rollouts = args.force_rollouts or not args.data.exists()
     rebuilding_values = args.force_values or rebuilding_rollouts or not all(path.exists() for path in value_paths + initialization_paths)
-    if rebuilding_rollouts:
+    if rebuilding_rollouts and not getattr(args, "resumable", False):
         args.force_rollouts = True
-    if rebuilding_values:
+    if rebuilding_values and not getattr(args, "resumable", False):
         args.force_values = True
         args.force_potential = True
     collect_rollout_data(args)
@@ -793,7 +902,10 @@ Example:
     parser.add_argument("--force-rollouts", action="store_true")
     parser.add_argument("--force-values", action="store_true")
     parser.add_argument("--force-potential", action="store_true")
+    parser.add_argument("--resumable", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.resumable and (args.force_rollouts or args.force_values or args.force_potential):
+        parser.error("--resumable cannot be combined with --force-* options")
     if not 0.0 <= args.gamma <= 1.0:
         parser.error("--gamma must be in [0,1]")
     if not 0 < args.return_window < duration_to_steps(args.duration, params.SIM_DT):

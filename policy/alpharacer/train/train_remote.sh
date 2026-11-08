@@ -12,6 +12,7 @@ Usage: bash policy/alpharacer/train/train_remote.sh [wrapper options] [training 
 
 Wrapper options:
   --output-dir DIR  New, empty run directory (default: outputs/alpharacer/<UTC>-<PID>)
+  --resume DIR      Continue a previously started run directory
   --workers N       Rollout worker processes, or auto to use SLURM_CPUS_PER_TASK (default: 1)
   --check-only      Check dependencies, CUDA, assets and IPOPT; do not train
   --dry-run         Print the command; do not install, create files or train
@@ -28,11 +29,12 @@ Environment:
                 0: report dependency problems without installing
 
 The process stays in the foreground. Use nohup or a persistent server session.
-Interrupted collection/optimizer state is not resumable; each run is isolated.
+Collection and training state are saved for continuation with --resume.
 HELP
 }
 
 RUN_DIR=""
+RESUME_RUN=0
 CHECK_ONLY=0
 DRY_RUN=0
 WORKERS=1
@@ -40,8 +42,11 @@ TRAIN_ARGS=()
 while (($#)); do
     case "$1" in
         --output-dir)
-            [[ $# -ge 2 && -n "$2" ]] || { echo "--output-dir requires a directory" >&2; exit 2; }
+            [[ $# -ge 2 && -n "$2" && "$RESUME_RUN" == 0 ]] || { echo "--output-dir requires a directory and cannot be combined with --resume" >&2; exit 2; }
             RUN_DIR="$2"; shift 2 ;;
+        --resume)
+            [[ $# -ge 2 && -n "$2" && -z "$RUN_DIR" ]] || { echo "--resume requires a run directory and cannot be combined with --output-dir" >&2; exit 2; }
+            RUN_DIR="$2"; RESUME_RUN=1; shift 2 ;;
         --workers)
             [[ $# -ge 2 && -n "$2" ]] || { echo "--workers requires a positive integer or auto" >&2; exit 2; }
             WORKERS="$2"; shift 2 ;;
@@ -72,7 +77,7 @@ TRAIN_COMMAND=("$TRAIN_PYTHON" -u -m policy.alpharacer.train.training
     --vehicle-model dbm --track berlin
     --data "$RUN_DIR/rollouts.npz"
     --value-dir "$RUN_DIR/values"
-    --potential-output "$RUN_DIR/potential.pth" --n-workers "$WORKERS")
+    --potential-output "$RUN_DIR/potential.pth" --n-workers "$WORKERS" --resumable)
 if ((${#TRAIN_ARGS[@]})); then
     TRAIN_COMMAND+=("${TRAIN_ARGS[@]}")
 fi
@@ -89,13 +94,21 @@ git rev-parse --verify HEAD >/dev/null 2>&1 || {
     echo "This checkout needs its .git history for training provenance; transfer .git or use git clone." >&2
     exit 2
 }
-if [[ -e "$RUN_DIR" ]]; then
+if ((RESUME_RUN)); then
+    [[ -f "$RUN_DIR/run.json" ]] || { echo "No resumable run.json in $RUN_DIR" >&2; exit 2; }
+elif [[ -e "$RUN_DIR" ]]; then
     [[ -d "$RUN_DIR" && -z "$(ls -A -- "$RUN_DIR")" ]] || {
         echo "Run directory must be new or empty: $RUN_DIR" >&2; exit 2;
     }
 fi
 mkdir -p -- "$RUN_DIR"
-mkdir -- "$RUN_DIR/.running" || { echo "Run directory is already in use" >&2; exit 2; }
+if command -v flock >/dev/null; then
+    exec 9>"$RUN_DIR/.lock"
+    flock -n 9 || { echo "Run directory is already in use" >&2; exit 2; }
+else
+    mkdir -- "$RUN_DIR/.running" || { echo "Run directory is already in use" >&2; exit 2; }
+fi
+export ALPHARACER_RESUME_RUN="$RESUME_RUN"
 
 # Limit numerical-library oversubscription in each CPU rollout worker.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -125,7 +138,9 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN_DIR/started_utc.txt"
+if ((!RESUME_RUN)); then
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$RUN_DIR/started_utc.txt"
+fi
 
 run_work() {
 if [[ -z "${PYTHON_BIN:-}" && ! -x "$TRAIN_PYTHON" ]]; then
@@ -160,9 +175,11 @@ then
     "$TRAIN_PYTHON" -m pip install -r "$REPO_ROOT/requirements.txt"
 fi
 
-"$TRAIN_PYTHON" -m pip freeze > "$RUN_DIR/pip-freeze.txt"
-git status --short > "$RUN_DIR/git-status.txt"
-git diff --binary HEAD > "$RUN_DIR/git-working-tree.patch"
+if ((!RESUME_RUN)); then
+    "$TRAIN_PYTHON" -m pip freeze > "$RUN_DIR/pip-freeze.txt"
+    git status --short > "$RUN_DIR/git-status.txt"
+    git diff --binary HEAD > "$RUN_DIR/git-working-tree.patch"
+fi
 "$TRAIN_PYTHON" - "$RUN_DIR" "${TRAIN_COMMAND[@]:4}" <<'PY'
 import datetime
 import hashlib
@@ -205,9 +222,6 @@ sources = sorted({Path(os.fsdecode(name)) for name in tracked.split(b'\0') if na
 sources = [path for path in sources if path.is_file() and
            (path.suffix in {'.py', '.sh', '.csv', '.pth'} or path.name == 'requirements.txt')]
 hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
-with tarfile.open(output/'source-snapshot.tar.gz', 'w:gz') as archive:
-    for path in sources:
-        archive.add(path, arcname=str(path), recursive=False)
 metadata = dict(
     started_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
     git_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -222,7 +236,20 @@ metadata = dict(
     environment={key: os.environ.get(key) for key in ['CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS',
         'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS']},
 )
-(output/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
+if os.environ['ALPHARACER_RESUME_RUN'] == '1':
+    previous = json.loads((output/'run.json').read_text())
+    old_settings, new_settings = previous['settings'].copy(), metadata['settings'].copy()
+    old_settings.pop('n_workers', None)
+    new_settings.pop('n_workers', None)
+    if (old_settings != new_settings or previous['source_asset_sha256'] != hashes
+            or previous['torch'] != metadata['torch'] or previous['device'] != device):
+        raise ValueError('Cannot resume: training settings, source/assets, PyTorch or device changed')
+    print('Resume provenance verified.')
+else:
+    with tarfile.open(output/'source-snapshot.tar.gz', 'w:gz') as archive:
+        for path in sources:
+            archive.add(path, arcname=str(path), recursive=False)
+    (output/'run.json').write_text(json.dumps(metadata, indent=2)+'\n')
 print('Preflight passed. Effective configuration:')
 print(json.dumps(metadata['settings'], indent=2))
 PY
@@ -256,7 +283,7 @@ PY
 
 # A regular pipe also works where /dev/fd process substitution is unavailable.
 set +e
-(trap - EXIT INT TERM; set -e; run_work) 2>&1 | tee "$RUN_DIR/train.log"
+(trap - EXIT INT TERM; set -e; run_work) 2>&1 | tee -a "$RUN_DIR/train.log"
 PIPE_RESULTS=("${PIPESTATUS[@]}")
 set -e
 if ((PIPE_RESULTS[0])); then
