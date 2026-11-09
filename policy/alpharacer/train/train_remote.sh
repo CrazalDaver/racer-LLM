@@ -21,6 +21,8 @@ Wrapper options:
 All other arguments are forwarded to policy.alpharacer.train.training.
 Defaults: DBM, Berlin, 4000 valid training races + 500 validation + 500 test,
 50s races, gamma=1, 350-step returns, 50000 value / 100000 potential epochs.
+Early stopping defaults to 1000 epochs without validation improvement; use
+--early-stopping-patience 0 to train for the full configured epoch counts.
 Example: bash train_alpharacer.sh --workers auto --track berlin --seed 7
 
 Environment:

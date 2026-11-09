@@ -538,11 +538,17 @@ def _collect_parallel_rollouts(args, settings, splits, chains, max_attempts):
 def train_value_functions(args, utility="relative"):
     directory = args.value_dir if utility == "relative" else args.value_dir / "own_progress"
     output_paths = [directory / f"value_car{player}.pth" for player in range(3)]
+    patience = getattr(args, "early_stopping_patience", 0)
+    min_delta = getattr(args, "early_stopping_min_delta", 0.0)
+    early_settings = dict(patience=patience, min_delta=min_delta)
     if all(path.exists() for path in output_paths) and not args.force_values and not getattr(args, "resumable", False):
         for path in output_paths:
             payload = torch.load(path, map_location="cpu")
             if payload.get("metadata", {}).get("normalization") != "official_value_running_batchnorm":
                 raise ValueError("Value checkpoint uses older normalization; use --force-values")
+            recorded = payload.get("metadata", {}).get("early_stopping", dict(patience=0, min_delta=0.0))
+            if recorded != early_settings:
+                raise ValueError("Value checkpoint uses different early-stopping settings; use --force-values")
         print(f"[stage 2/4] Reusing value checkpoints: {args.value_dir}")
         return output_paths
 
@@ -557,6 +563,14 @@ def train_value_functions(args, utility="relative"):
     loss_fn = nn.MSELoss()
 
     for player, output_path in enumerate(output_paths):
+        shared_own_epoch = None
+        if utility == "own_progress" and patience and player > 0:
+            first_metadata = load_training_state(output_paths[0])["metadata"]
+            if first_metadata.get("early_stopping") != early_settings:
+                raise ValueError("Own-value initializer has incompatible early-stopping settings")
+            shared_own_epoch = first_metadata["selected_epoch"]
+        max_epochs = shared_own_epoch or args.value_epochs
+        monitor = bool(patience and (utility == "relative" or player == 0))
         x_train = torch.from_numpy(features[train_ids]).float()
         y_train = torch.from_numpy(targets[train_ids, ..., player, None]).float()
         loader = DataLoader(TensorDataset(x_train, y_train), batch_size=args.value_batch_size, shuffle=False)
@@ -566,21 +580,27 @@ def train_value_functions(args, utility="relative"):
         optimizer = torch.optim.Adam(model.parameters(), lr=args.value_learning_rate)
         best_loss = float("inf")
         first_epoch = 0
+        best_epoch, bad_epochs, patience_best = 0, 0, float("inf")
         state_path = output_path.with_suffix(".training-state.pth")
         if getattr(args, "resumable", False) and state_path.exists():
             state = load_training_state(state_path, device)
+            if (state.get("early_stopping", dict(patience=0, min_delta=0.0)) != early_settings
+                    or (patience and state.get("max_epochs") != max_epochs)):
+                raise ValueError("Value training state predates or differs from early stopping; use a new output directory")
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
             best_loss, first_epoch = state["best_loss"], state["next_epoch"]
+            best_epoch, bad_epochs = state.get("best_epoch", 0), state.get("bad_epochs", 0)
+            patience_best = state.get("patience_best", best_loss)
             restore_random_state(state["random_state"])
-            if first_epoch == args.value_epochs:
+            if state.get("completed", first_epoch == max_epochs):
                 if not output_path.exists():
                     raise ValueError(f"Completed checkpoint is missing: {output_path}")
                 print(f"  resumed completed value model {output_path}")
                 continue
-            print(f"  resuming car={player} epoch={first_epoch + 1}/{args.value_epochs}")
+            print(f"  resuming car={player} epoch={first_epoch + 1}/{max_epochs}")
 
-        for epoch in range(first_epoch, args.value_epochs):
+        for epoch in range(first_epoch, max_epochs):
             model.train()
             for x_batch, y_batch in loader:
                 y_batch = y_batch.to(device)
@@ -594,27 +614,47 @@ def train_value_functions(args, utility="relative"):
             y_val = targets[val_ids, ..., player].reshape(-1, 1)
             mask = (y_val >= -100.) & (y_val < 600.)
             score = float(np.mean(((predict_batches(model, x_val, device, args.batch_size) - y_val)*mask) ** 2))
-            # Official own-progress models initialize Phi from their final weights.
-            if ((utility == "own_progress" and epoch == args.value_epochs-1)
-                    or (utility == "relative" and score < best_loss)):
+            if not np.isfinite(score):
+                raise ValueError(f"Nonfinite validation MSE for car {player}")
+            improved = score < best_loss
+            if monitor:
+                if score < patience_best - min_delta:
+                    patience_best, bad_epochs = score, 0
+                else:
+                    bad_epochs += 1
+            save_best = utility == "relative" or (utility == "own_progress" and monitor)
+            if (save_best and improved) or (not save_best and epoch + 1 == max_epochs):
                 best_loss = score
+                best_epoch = epoch + 1
+                selection = ("validation_mse_car0_shared_epoch" if utility == "own_progress" and monitor
+                             else "shared_epoch_from_car0" if shared_own_epoch is not None
+                             else "final_epoch" if utility == "own_progress" else "validation_mse")
                 atomic_torch_save(
                     checkpoint_payload(
                         model,
                         kind="alpha_value",
                         metadata={**dataset_metadata, "utility": utility, "player": player,
                                   "normalization": "official_value_running_batchnorm",
-                                  "selection": "final_epoch" if utility == "own_progress" else "validation_mse",
+                                  "selection": selection, "selected_epoch": best_epoch,
+                                  "early_stopping": early_settings,
                                   "target_filter": "official_-100_le_return_lt_600", "validation_mse": score},
                     ),
                     output_path,
                 )
+            stopped = monitor and bad_epochs >= patience
+            completed = stopped or epoch + 1 == max_epochs
             if (getattr(args, "resumable", False)
-                    and ((epoch + 1) % 10 == 0 or epoch + 1 == args.value_epochs)):
+                    and ((epoch + 1) % 10 == 0 or completed)):
                 atomic_torch_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
-                    best_loss=best_loss, next_epoch=epoch + 1, random_state=random_state()), state_path)
+                    best_loss=best_loss, best_epoch=best_epoch, bad_epochs=bad_epochs,
+                    patience_best=patience_best, early_stopping=early_settings,
+                    max_epochs=max_epochs, completed=completed,
+                    next_epoch=epoch + 1, random_state=random_state()), state_path)
             if epoch == 0 or (epoch + 1) % 10 == 0:
-                print(f"  car={player} epoch={epoch + 1}/{args.value_epochs} validation_mse={score:.6g}")
+                print(f"  car={player} epoch={epoch + 1}/{max_epochs} validation_mse={score:.6g}")
+            if stopped:
+                print(f"  early stopping car={player}: epoch={epoch + 1}, best_epoch={best_epoch}, validation_mse={best_loss:.6g}")
+                break
         print(f"  saved {output_path} (selected validation MSE={best_loss:.6g})")
     return output_paths
 
@@ -624,11 +664,16 @@ def train_value_functions(args, utility="relative"):
 # ---------------------------------------------------------------------------
 
 def train_potential_function(args, value_paths, initialization_paths):
+    patience = getattr(args, "early_stopping_patience", 0)
+    min_delta = getattr(args, "early_stopping_min_delta", 0.0)
+    early_settings = dict(patience=patience, min_delta=min_delta)
     if args.potential_output.exists() and not args.force_potential and not getattr(args, "resumable", False):
         metadata = torch.load(args.potential_output, map_location="cpu").get("metadata", {})
         if (metadata.get("normalization") != "official_potential_frozen_first_value_bn"
                 or metadata.get("tail_batches") != "drop_incomplete_previous_state_pairs"):
             raise ValueError("Potential checkpoint uses older training rules; use --force-potential")
+        if metadata.get("early_stopping", dict(patience=0, min_delta=0.0)) != early_settings:
+            raise ValueError("Potential checkpoint uses different early-stopping settings; use --force-potential")
         print(f"[stage 3/4] Reusing potential checkpoint: {args.potential_output}")
         return args.potential_output
 
@@ -687,14 +732,19 @@ def train_potential_function(args, value_paths, initialization_paths):
     best_loss = float("inf")
     args.potential_output.parent.mkdir(parents=True, exist_ok=True)
     first_epoch = 0
+    best_epoch, bad_epochs, patience_best = 0, 0, float("inf")
     state_path = args.potential_output.with_suffix(".training-state.pth")
     if getattr(args, "resumable", False) and state_path.exists():
         state = load_training_state(state_path, device)
+        if state.get("early_stopping", dict(patience=0, min_delta=0.0)) != early_settings:
+            raise ValueError("Potential training state predates or differs from early stopping; use a new output directory")
         potential.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         best_loss, first_epoch = state["best_loss"], state["next_epoch"]
+        best_epoch, bad_epochs = state.get("best_epoch", 0), state.get("bad_epochs", 0)
+        patience_best = state.get("patience_best", best_loss)
         restore_random_state(state["random_state"])
-        if first_epoch == args.potential_epochs:
+        if state.get("completed", first_epoch == args.potential_epochs):
             if not args.potential_output.exists():
                 raise ValueError(f"Completed checkpoint is missing: {args.potential_output}")
             print(f"  resumed completed potential model {args.potential_output}")
@@ -724,8 +774,17 @@ def train_potential_function(args, value_paths, initialization_paths):
         val_prediction = (predict_batches(potential, val_right, device, args.batch_size)
                           - predict_batches(potential, val_left, device, args.batch_size))
         validation_mse = float(np.mean((val_prediction - val_target) ** 2))
-        if validation_mse < best_loss:
+        if not np.isfinite(validation_mse):
+            raise ValueError("Nonfinite potential validation MSE")
+        improved = validation_mse < best_loss
+        if patience:
+            if validation_mse < patience_best - min_delta:
+                patience_best, bad_epochs = validation_mse, 0
+            else:
+                bad_epochs += 1
+        if improved:
             best_loss = validation_mse
+            best_epoch = epoch + 1
             atomic_torch_save(
                 checkpoint_payload(
                     potential,
@@ -733,18 +792,26 @@ def train_potential_function(args, value_paths, initialization_paths):
                     metadata={**metadata, "initialization": "sum_own_progress_values",
                               "normalization": "official_potential_frozen_first_value_bn",
                               "tail_batches": "drop_incomplete_previous_state_pairs",
+                              "early_stopping": early_settings, "selected_epoch": best_epoch,
                               "training_pairs_used_per_epoch": training_pairs_used,
                               "training_pairs_dropped_per_epoch": training_pair_count-training_pairs_used,
                               "difference_mse": mean_loss, "validation_difference_mse": validation_mse},
                 ),
                 args.potential_output,
             )
+        stopped = bool(patience and bad_epochs >= patience)
+        completed = stopped or epoch + 1 == args.potential_epochs
         if (getattr(args, "resumable", False)
-                and ((epoch + 1) % 10 == 0 or epoch + 1 == args.potential_epochs)):
+                and ((epoch + 1) % 10 == 0 or completed)):
             atomic_torch_save(dict(model=potential.state_dict(), optimizer=optimizer.state_dict(),
-                best_loss=best_loss, next_epoch=epoch + 1, random_state=random_state()), state_path)
+                best_loss=best_loss, best_epoch=best_epoch, bad_epochs=bad_epochs,
+                patience_best=patience_best, early_stopping=early_settings, completed=completed,
+                next_epoch=epoch + 1, random_state=random_state()), state_path)
         if epoch == 0 or (epoch + 1) % 10 == 0:
             print(f"  epoch={epoch + 1}/{args.potential_epochs} difference_mse={mean_loss:.6g} validation_mse={validation_mse:.6g}")
+        if stopped:
+            print(f"  early stopping potential: epoch={epoch + 1}, best_epoch={best_epoch}, validation_mse={best_loss:.6g}")
+            break
     print(f"  saved {args.potential_output} (best validation difference MSE={best_loss:.6g})")
     return args.potential_output
 
@@ -837,7 +904,8 @@ Parameter summary:
   rollout:     --races, --duration, --track, --vehicle-model, --horizon,
                --initial-speed, --gamma, --return-window, --max-attempts
   training:    --value-epochs, --potential-epochs, the two learning rates,
-               --value-batch-size, --batch-size, --validation-fraction, --test-fraction, --seed
+               --value-batch-size, --batch-size, --validation-fraction, --test-fraction, --seed,
+               --early-stopping-patience, --early-stopping-min-delta
   cache:       --force-rollouts, --force-values, --force-potential
 
 Choices:
@@ -889,6 +957,10 @@ Example:
     parser.add_argument("--potential-epochs", type=int, default=100000)
     parser.add_argument("--value-learning-rate", type=float, default=1e-3)
     parser.add_argument("--potential-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--early-stopping-patience", type=int, default=1000,
+                        help="stop after this many epochs without validation improvement; 0 disables (default: 1000)")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0,
+                        help="minimum validation MSE improvement for early stopping (default: 0)")
     parser.add_argument("--batch-size", type=int, default=241, help="official independent chain length and potential batch size, in races")
     parser.add_argument("--value-batch-size", type=int, default=4096, help="official value batch size, in races")
     parser.add_argument("--validation-fraction", type=float, default=0.10)
@@ -914,6 +986,8 @@ Example:
         parser.error("--max-attempts must be positive")
     if args.n_workers < 1:
         parser.error("--n-workers must be positive")
+    if args.early_stopping_patience < 0 or not np.isfinite(args.early_stopping_min_delta) or args.early_stopping_min_delta < 0:
+        parser.error("early-stopping patience and minimum improvement must be nonnegative")
     if not (0.0 < args.validation_fraction < 1.0 and 0.0 < args.test_fraction < 1.0
             and args.validation_fraction + args.test_fraction < 1.0):
         parser.error("validation/test fractions must be positive and sum to less than 1")
