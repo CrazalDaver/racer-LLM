@@ -437,7 +437,7 @@ class IteratedBestResponsePolicy(MPCPolicy):
     ibr_level = "round_robin"
 
     def __init__(
-        self, *args, strategy_space="control", rounds=3, ibr_horizon=10,
+        self, *args, strategy_space="control", rounds=6, ibr_horizon=20,
         initial_guess_mode="release",
         parameter_search_points=3, parameter_search_passes=1,
         convergence_tolerance=0.0, **kwargs,
