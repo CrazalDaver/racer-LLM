@@ -37,6 +37,7 @@ from policy.alpharacer.network import (
     SimpleNeuralNetwork,
     build_alpha_input,
 )
+from policy.utils import relative_progress_gain
 from simulation import run_simulation
 from simulation_core.config import SimulationConfig
 from track import Track, configure_track, load_centerline_csv
@@ -305,14 +306,11 @@ def trace_rewards(trace, update_indices):
     assert next_progress.shape == progress.shape
     if not np.isfinite(progress).all() or not np.isfinite(next_progress).all():
         raise ValueError("Nonfinite progress in alpha-RACER reward data")
-    relative = np.empty_like(progress)
-    next_relative = np.empty_like(next_progress)
-    for player in range(3):
-        opponents = [idx for idx in range(3) if idx != player]
-        relative[:, player] = progress[:, player] - progress[:, opponents].max(axis=1)
-        next_relative[:, player] = next_progress[:, player] - next_progress[:, opponents].max(axis=1)
     # Sum the physical transitions belonging to each control update, including the final step.
-    step_rewards = next_relative - relative
+    step_rewards = np.column_stack([
+        relative_progress_gain(progress, next_progress, player)
+        for player in range(3)
+    ])
     ends = np.r_[update_indices[1:], len(progress)]
     return np.asarray([
         step_rewards[start:end].sum(axis=0)

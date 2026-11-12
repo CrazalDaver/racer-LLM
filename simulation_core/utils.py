@@ -9,10 +9,10 @@ import numpy as np
 from config import params
 from policy import (
     AlphaRacerPolicy, CenterLinePolicy, IteratedBestResponsePolicy,
-    FixedModePolicy, LLMAlphaRacerPolicy, OracleModePolicy,
+    FixedModePolicy, LLMModePolicy, LLMParameterPolicy, OracleModePolicy,
     ModeAlphaRacerPolicy,
-    ParameterIBRPolicy, RuleBasedPolicy,
     SelfPlayRLPolicy, StaticAlphaRacerPolicy,
+    resolve_llm_output,
 )
 from .config import validate_policy_name
 from vehicle_model import DynamicBicycleModel, KinematicBicycleModel
@@ -55,7 +55,7 @@ def create_vehicle_model(model_type, dt, db_params, max_speed):
 
 def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   static_policy_params=None, alpharacer_params=None,
-                  alpharacer_weight_path=None, ibr_implementation=None,
+                  alpharacer_weight_path=None, ibr_strategy_space=None,
                   llm_policy_params=None, llm_output_mode=None,
                   llm_model_name=None, llm_temperature=None,
                   llm_update_interval_seconds=None,
@@ -92,13 +92,68 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
             decision_dt=params.CONTROL_DT,
             **common,
         )
-    llm_classes = {
-        "llm_alpharacer": LLMAlphaRacerPolicy,
-    }
-    if policy_type in llm_classes:
-        return llm_classes[policy_type](track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_name=params.LLM_MODEL if llm_model_name is None else llm_model_name, base_url=params.LLM_BASE_URL, timeout=params.LLM_TIMEOUT, temperature=params.LLM_TEMPERATURE if llm_temperature is None else llm_temperature, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, output_mode=params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode, prompt_module=llm_prompt_module, observation_variant=llm_observation_variant, include_raceline_speed=params.LLM_INPUT_INCLUDE_RACELINE_SPEED if llm_include_raceline_speed is None else llm_include_raceline_speed, include_current_parameters=params.LLM_INPUT_INCLUDE_CURRENT_PARAMETERS if llm_include_current_parameters is None else llm_include_current_parameters, include_decision_feedback=params.LLM_INPUT_INCLUDE_DECISION_FEEDBACK if llm_include_decision_feedback is None else llm_include_decision_feedback, **common)
-    if policy_type == "rule_based":
-        return RuleBasedPolicy(track, mpc, params=np.asarray(params.LLM_POLICY_PARAMS if llm_policy_params is None else llm_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, history_length=params.LLM_RECENT_MODES_MAX_LENGTH, **common)
+    if policy_type == "llm_alpharacer":
+        output_mode = (
+            params.LLM_OUTPUT_MODE if llm_output_mode is None else llm_output_mode
+        )
+        model_name = params.LLM_MODEL if llm_model_name is None else llm_model_name
+        policy_class = {
+            "mode": LLMModePolicy,
+            "params": LLMParameterPolicy,
+        }[resolve_llm_output(output_mode, model_name)]
+        llm_kwargs = dict(
+            model_name=model_name,
+            base_url=params.LLM_BASE_URL,
+            timeout=params.LLM_TIMEOUT,
+            temperature=(
+                params.LLM_TEMPERATURE
+                if llm_temperature is None
+                else llm_temperature
+            ),
+            update_interval_seconds=(
+                params.LLM_UPDATE_INTERVAL_SECONDS
+                if llm_update_interval_seconds is None
+                else llm_update_interval_seconds
+            ),
+            decision_dt=params.CONTROL_DT,
+            prompt_module=llm_prompt_module,
+            observation_variant=llm_observation_variant,
+        )
+        if policy_class is LLMModePolicy:
+            llm_kwargs["history_length"] = params.LLM_RECENT_MODES_MAX_LENGTH
+        else:
+            llm_kwargs.update(
+                include_raceline_speed=(
+                    params.LLM_INPUT_INCLUDE_RACELINE_SPEED
+                    if llm_include_raceline_speed is None
+                    else llm_include_raceline_speed
+                ),
+                include_current_parameters=(
+                    params.LLM_INPUT_INCLUDE_CURRENT_PARAMETERS
+                    if llm_include_current_parameters is None
+                    else llm_include_current_parameters
+                ),
+                include_decision_feedback=(
+                    params.LLM_INPUT_INCLUDE_DECISION_FEEDBACK
+                    if llm_include_decision_feedback is None
+                    else llm_include_decision_feedback
+                ),
+            )
+        return policy_class(
+            track,
+            mpc,
+            params=np.asarray(
+                params.LLM_POLICY_PARAMS
+                if llm_policy_params is None
+                else llm_policy_params,
+                dtype=float,
+            ).copy(),
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
+            **llm_kwargs,
+            **common,
+        )
     if policy_type == "alpharacer":
         return AlphaRacerPolicy(track, mpc, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, weight_path=params.ALPHARACER_WEIGHT_PATH if alpharacer_weight_path is None else alpharacer_weight_path, search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS, search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS, opt_style=params.POTENTIAL_FUNCTION_OPT_STYLE, gradient_rate=params.POTENTIAL_FUNCTION_GRADIENT_RATE, initial_params=params.ALPHARACER_INITIAL_PARAMS, **common)
     if policy_type == "mode_alpharacer":
@@ -106,7 +161,23 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
     if policy_type == "self_play_rl":
         return SelfPlayRLPolicy(track, mpc, params=np.asarray(params.STATIC_POLICY_PARAMS if alpharacer_params is None else alpharacer_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_path=params.SELF_PLAY_RL_MODEL_PATH if self_play_rl_model_path is None else self_play_rl_model_path, backend=params.SELF_PLAY_RL_BACKEND if self_play_rl_backend is None else self_play_rl_backend, strict_load=params.SELF_PLAY_RL_STRICT_LOAD if self_play_rl_strict_load is None else self_play_rl_strict_load, action_order=params.SELF_PLAY_RL_ACTION_ORDER if self_play_rl_action_order is None else self_play_rl_action_order, throttle_bounds=params.SELF_PLAY_RL_THROTTLE_BOUNDS, steer_bounds=params.SELF_PLAY_RL_STEER_BOUNDS, **common)
     if policy_type == "ibr":
-        return IteratedBestResponsePolicy(track, mpc, iterations=params.IBR_ITERATIONS, implementation=params.IBR_IMPLEMENTATION if ibr_implementation is None else ibr_implementation, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, **common)
-    if policy_type == "parameter_ibr":
-        return ParameterIBRPolicy(track, mpc, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, initial_params=params.ALPHARACER_INITIAL_PARAMS, search_points=params.PARAMETER_IBR_SEARCH_POINTS, search_passes=params.PARAMETER_IBR_SEARCH_PASSES, update_interval_seconds=params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS, convergence_tolerance=params.PARAMETER_IBR_CONVERGENCE_TOLERANCE, **common)
+        return IteratedBestResponsePolicy(
+            track,
+            mpc,
+            params=np.asarray(params.ALPHARACER_INITIAL_PARAMS, dtype=float).copy(),
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            ref_lateral_clip=params.REF_LATERAL_CLIP,
+            strategy_space=(
+                params.IBR_STRATEGY_SPACE
+                if ibr_strategy_space is None
+                else ibr_strategy_space
+            ),
+            rounds=params.IBR_ROUNDS,
+            ibr_horizon=params.IBR_HORIZON,
+            parameter_search_points=params.IBR_PARAMETER_SEARCH_POINTS,
+            parameter_search_passes=params.IBR_PARAMETER_SEARCH_PASSES,
+            convergence_tolerance=params.IBR_CONVERGENCE_TOLERANCE,
+            **common,
+        )
     raise ValueError(f"Unknown policy type: {policy_type}")

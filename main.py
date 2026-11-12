@@ -620,7 +620,7 @@ def _add_case_args(parser):
     group.add_argument("--name", default=None)
     group.add_argument(
         "--suite",
-        choices=["llm-params", "ibr-speed-cap"],
+        choices=["llm-params"],
         default=None,
         help=(
             "llm-params runs a direct five-parameter LLM against "
@@ -786,44 +786,10 @@ def _add_sim_args(parser):
         default=0,
     )
     group.add_argument(
-        "--ibr-implementation",
-        choices=["local_wang", "historical_strict"],
-        default="local_wang",
-        help=(
-            "IBR solver: local_wang uses local dynamics; "
-            "historical_strict is the locally adapted alpha-RACER IBR "
-            "(default: local_wang)."
-        ),
-    )
-    group.add_argument(
-        "--ibr-speed-cap",
-        choices=["global", "raceline"],
-        default=None,
-        help=(
-            "IBR speed bound: global 5 m/s or a physically reachable bound "
-            "that tightens toward 1.04 times local raceline speed."
-        ),
-    )
-    group.add_argument(
-        "--parameter-ibr-rounds",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Complete joint five-parameter best-response rounds per update.",
-    )
-    group.add_argument(
-        "--parameter-ibr-search-points",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Local candidates per parameter in coarse-to-fine search (minimum 3).",
-    )
-    group.add_argument(
-        "--parameter-ibr-update-interval",
-        type=float,
-        default=None,
-        metavar="SECONDS",
-        help="Simulation-time interval between five-parameter IBR updates.",
+        "--ibr-strategy-space",
+        choices=["control", "parameter", "mode"],
+        default="control",
+        help="Variables changed by each best response (default: control).",
     )
     group.add_argument("--rl-model-path", default=None)
     group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
@@ -850,23 +816,7 @@ def parse_args():
 
 def _apply_cli_overrides(args):
     """Validate CLI values that still configure experimental policy internals."""
-    params.IBR_IMPLEMENTATION = args.ibr_implementation
-    if args.ibr_speed_cap is not None:
-        params.IBR_SPEED_CAP_MODE = args.ibr_speed_cap
-    if args.parameter_ibr_rounds is not None:
-        if args.parameter_ibr_rounds < 1:
-            raise ValueError("--parameter-ibr-rounds must be at least 1")
-        params.PARAMETER_IBR_ROUNDS = args.parameter_ibr_rounds
-    if args.parameter_ibr_search_points is not None:
-        if args.parameter_ibr_search_points < 3:
-            raise ValueError("--parameter-ibr-search-points must be at least 3")
-        params.PARAMETER_IBR_SEARCH_POINTS = args.parameter_ibr_search_points
-    if args.parameter_ibr_update_interval is not None:
-        if args.parameter_ibr_update_interval < 0.0:
-            raise ValueError("--parameter-ibr-update-interval must be non-negative")
-        params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = (
-            args.parameter_ibr_update_interval
-        )
+    params.IBR_STRATEGY_SPACE = args.ibr_strategy_space
     if args.mpc_horizon is not None and args.mpc_horizon < 2:
         raise ValueError("--mpc-horizon must be at least 2")
     if (
@@ -914,7 +864,7 @@ def _sweep_kwargs_from_args(args):
         "static_params": args.static_params,
         "alpha_params": args.alpha_params,
         "alpha_weight_path": args.alpharacer_weight,
-        "ibr_implementation": args.ibr_implementation,
+        "ibr_strategy_space": args.ibr_strategy_space,
         "llm_params": args.llm_params,
         "llm_output_mode": args.llm_output_mode,
         "llm_model": args.llm_model,
@@ -949,11 +899,6 @@ def _suite_definition(name, sweep_kwargs):
                 "llm_alpharacer", "alpharacer", "alpharacer"
             ],
             "param_llm_vs_ibr": ["llm_alpharacer", "ibr", "ibr"],
-        }
-    if name == "ibr-speed-cap":
-        params.IBR_SPEED_CAP_MODE = "raceline"
-        return Path("result/ibr_speed_cap_suite"), {
-            "raceline_capped_ibr": ["ibr", "alpharacer", "alpharacer"],
         }
     raise ValueError(f"Unknown experiment suite: {name}")
 

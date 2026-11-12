@@ -6,6 +6,8 @@ import time
 
 import numpy as np
 
+from policy.utils import relative_progress, relative_progress_gain
+
 from config import duration_to_steps, params
 from policy import progress_delta
 from .runtime_snapshot import RuntimeSnapshotter
@@ -124,17 +126,6 @@ class OracleRolloutEvaluator:
     def _restore_runtime(snapshot: bytes):
         return RuntimeSnapshotter.restore(snapshot)
 
-    @staticmethod
-    def _relative_to_best_opponent(progress, ego_idx):
-        opponents = [
-            float(value)
-            for idx, value in enumerate(progress)
-            if idx != ego_idx
-        ]
-        if not opponents:
-            return 0.0
-        return float(progress[ego_idx]) - max(opponents)
-
     def _simulate_candidate(
         self,
         snapshot: bytes,
@@ -162,9 +153,7 @@ class OracleRolloutEvaluator:
                 freezer()
 
         start_progress = np.asarray(environment.progress_s, dtype=float).copy()
-        start_relative = self._relative_to_best_opponent(
-            start_progress, ego_idx
-        )
+        start_relative = float(relative_progress(start_progress, ego_idx))
         collision_count = 0
         collision_steps = 0
         previous_collision = False
@@ -207,15 +196,15 @@ class OracleRolloutEvaluator:
             if idx != ego_idx
         ]
         best_opponent_progress_gain = max(opponent_gains, default=0.0)
-        final_relative = self._relative_to_best_opponent(
-            final_progress, ego_idx
+        final_relative = float(relative_progress(final_progress, ego_idx))
+        relative_gain = float(
+            relative_progress_gain(start_progress, final_progress, ego_idx)
         )
-        relative_progress_gain = final_relative - start_relative
         collision_seconds = collision_steps * params.SIM_DT
         offtrack_seconds = offtrack_steps * params.SIM_DT
         progress_term = self.progress_weight * ego_progress_gain
         relative_term = (
-            self.relative_progress_weight * relative_progress_gain
+            self.relative_progress_weight * relative_gain
         )
         collision_term = self.collision_penalty * collision_count
         offtrack_term = (
@@ -234,7 +223,7 @@ class OracleRolloutEvaluator:
             "score": float(score),
             "ego_progress_gain": ego_progress_gain,
             "best_opponent_progress_gain": best_opponent_progress_gain,
-            "relative_progress_gain": float(relative_progress_gain),
+            "relative_progress_gain": relative_gain,
             "final_relative_progress": float(final_relative),
             "finish_position": int(finish_position),
             "collision_count": int(collision_count),
@@ -297,7 +286,7 @@ class OracleRolloutEvaluator:
             "current_race_metrics": {
                 "position": int(position),
                 "relative_progress_to_best_opponent": float(
-                    self._relative_to_best_opponent(current_progress, ego_idx)
+                    relative_progress(current_progress, ego_idx)
                 ),
             },
         }

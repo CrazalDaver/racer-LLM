@@ -269,7 +269,7 @@ class Race:
                             config.alpha_weight_path,
                         )
                     ),
-                    ibr_implementation=config.ibr_implementation,
+                    ibr_strategy_space=config.ibr_strategy_space,
                     llm_policy_params=config.llm_params,
                     llm_output_mode=config.llm_output_mode,
                     llm_model_name=self.resolved_llm_model_names[car_idx],
@@ -318,7 +318,7 @@ class Race:
                 )
             )
 
-        self.ibr_implementation = config.ibr_implementation
+        self.ibr_strategy_space = config.ibr_strategy_space
         self.llm_update_interval_seconds = config.llm_update_interval
         self.total_time = config.duration
         self.save_trace = config.save_trace
@@ -533,20 +533,13 @@ if __name__ == "__main__":
         nargs="+",
         default=["llm_alpharacer", "ibr", "ibr"],
         help=(
-            "One policy per car, e.g. --policies ibr ibr ibr or "
-            "--policies parameter_ibr parameter_ibr parameter_ibr."
+            "One policy per car, e.g. --policies ibr ibr ibr."
         ),
     )
     parser.add_argument(
-        "--ibr-implementation",
-        choices=["local_wang", "historical_strict"],
-        default="local_wang",
-        help="IBR solver implementation (default: local_wang).",
-    )
-    parser.add_argument("--parameter-ibr-rounds", type=int, default=None, metavar="N")
-    parser.add_argument("--parameter-ibr-search-points", type=int, default=None, metavar="N")
-    parser.add_argument(
-        "--parameter-ibr-update-interval", type=float, default=None, metavar="SECONDS"
+        "--ibr-strategy-space",
+        choices=["control", "parameter", "mode"],
+        default="control",
     )
     parser.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument(
@@ -649,28 +642,12 @@ if __name__ == "__main__":
     ):
         parser.error("--mpc-collision-slack-weight must be non-negative")
 
-    if cli_args.parameter_ibr_rounds is not None:
-        if cli_args.parameter_ibr_rounds < 1:
-            parser.error("--parameter-ibr-rounds must be at least 1")
-        params.PARAMETER_IBR_ROUNDS = cli_args.parameter_ibr_rounds
-    if cli_args.parameter_ibr_search_points is not None:
-        if cli_args.parameter_ibr_search_points < 3:
-            parser.error("--parameter-ibr-search-points must be at least 3")
-        params.PARAMETER_IBR_SEARCH_POINTS = cli_args.parameter_ibr_search_points
-    if cli_args.parameter_ibr_update_interval is not None:
-        if cli_args.parameter_ibr_update_interval < 0.0:
-            parser.error("--parameter-ibr-update-interval must be non-negative")
-        params.PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = cli_args.parameter_ibr_update_interval
-
     # Use canonical policy names only, e.g. "alpharacer", "static_alpharacer",
-    # "ibr", "parameter_ibr", or "llm_alpharacer".  Aliases are intentionally
+    # "ibr", or "llm_alpharacer". Aliases are intentionally
     # rejected so saved artifacts always identify one unambiguous method.
     # Tracks: "berlin" (scale 2), "modena" (scale 2), or "rounded_rectangle" (scale 1).
 
-    # Wang-style trajectory IBR:
-    # .venv/bin/python simulation.py --policies ibr ibr ibr --no-plot
-    # Five-parameter IBR using the same low-level MPC as alpha-RACER/LLM:
-    # .venv/bin/python simulation.py --policies parameter_ibr parameter_ibr parameter_ibr --no-plot
+    # .venv/bin/python simulation.py --policies ibr ibr ibr --ibr-strategy-space control --no-plot
 
     config = SimulationConfig(
         policies=cli_args.policies,
@@ -684,7 +661,7 @@ if __name__ == "__main__":
         mpc_velocity_weight=cli_args.mpc_velocity_track_weight,
         mpc_track_slack=cli_args.mpc_track_slack_weight,
         mpc_collision_slack=cli_args.mpc_collision_slack_weight,
-        ibr_implementation=cli_args.ibr_implementation,
+        ibr_strategy_space=cli_args.ibr_strategy_space,
         llm_observation_variant=cli_args.llm_observation_variant,
         llm_prompt_module=cli_args.llm_prompt_module,
         llm_include_raceline_speed=cli_args.llm_include_raceline_speed,

@@ -39,7 +39,7 @@ class TraceRecorder:
             resolved_policy_names=race.resolved_policy_names,
             policies=race.policies,
             ego_idx=race.ego_idx,
-            ibr_implementation=race.ibr_implementation,
+            ibr_strategy_space=race.ibr_strategy_space,
             resolved_llm_model_names=race.resolved_llm_model_names,
             resolved_llm_temperatures=race.resolved_llm_temperatures,
             num_cars=race.num_cars,

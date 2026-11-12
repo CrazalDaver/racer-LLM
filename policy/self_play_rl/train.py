@@ -39,6 +39,7 @@ from vehicle_model import (
     KinematicBicycleModel,
     oriented_rectangle_overlap_cost,
 )
+from policy.utils import relative_progress
 
 
 OBSERVATION_SIZE = 15
@@ -271,8 +272,7 @@ class SelfPlayRacingEnv(gym.Env):
         return self.opponent_policy.predict(self._observation_for(car_idx))
 
     def _relative_lead(self, car_idx):
-        opponents = [self.progress_s[idx] for idx in range(self.cfg.num_cars) if idx != car_idx]
-        return float(self.progress_s[car_idx] - max(opponents))
+        return float(relative_progress(self.progress_s, car_idx))
 
     def _apply_racing_incidents(self):
         offroad = np.abs(self.lateral_e) > self.cfg.track_half_width

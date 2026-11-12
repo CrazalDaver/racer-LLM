@@ -40,3 +40,12 @@ invent vehicles, gaps, road geometry, or risks absent from the observation.
 
 Return only the JSON required by the response schema. Give a short basis label
 for the decisive consideration and a factual reason under 20 words.
+
+Previous-decision memory:
+- previous_basis and previous_target_id describe the last executed decision;
+  previous_condition_still_active reports whether its target still meets the
+  existing overtake or block condition. Null means no applicable known target.
+- If the condition is true and no more important situation has emerged, you
+  may keep the previous mode. If it is false, do not continue overtake or block
+  solely because of the previous mode or basis.
+- Current road and traffic observations always take priority over memory.

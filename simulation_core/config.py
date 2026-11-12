@@ -9,8 +9,8 @@ from typing import Literal, Sequence
 
 PolicyName = Literal[
     "centerline", "static_alpharacer", "fixed_push", "oracle_mode",
-    "alpharacer", "mode_alpharacer", "ibr", "parameter_ibr",
-    "llm_alpharacer", "rule_based", "self_play_rl",
+    "alpharacer", "mode_alpharacer", "ibr",
+    "llm_alpharacer", "self_play_rl",
 ]
 CANONICAL_POLICY_NAMES = frozenset(PolicyName.__args__)
 LLM_OBSERVATION_VARIANTS = (
@@ -69,7 +69,7 @@ class SimulationConfig:
     alpha_weight_paths: Sequence[str | None] | None = None
 
     # IBR
-    ibr_implementation: str | None = None
+    ibr_strategy_space: str | None = None
 
     # LLM policies
     llm_params: Sequence[float] | None = None

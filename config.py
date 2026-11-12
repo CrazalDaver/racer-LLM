@@ -364,7 +364,7 @@ class SimParams:
     # are adapted internally because they were trained in transformed coords.
     ALPHARACER_INITIAL_PARAMS = np.array([2.0, 0.95**2, 0.3, 0.2, 0.0])
     POTENTIAL_FUNCTION_WEIGHT_PATH = (
-        "policy/alpharacer/train/weights/upstream/potential_myopic_mpc.pth"
+        "policy/alpharacer/train/weights/potential.pth"
     )
     POTENTIAL_FUNCTION_OPT_STYLE = "grad"
     # Step size in normalized paper-parameter coordinates xi in [0,1]^15.
@@ -389,64 +389,25 @@ class SimParams:
     SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
     SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
 
-    # ==================== TRAJECTORY IBR =======================
+    # ==================== ITERATED BEST RESPONSE ===============
 
-    # IBR_IMPLEMENTATION choices:
-    #   local_wang      Wang-style IBR using this project's dynamics,
-    #                   constraints, action definition, and MPC timing.
-    #   historical_strict restores the local strict solver used from commit
-    #                   5ab4f74 onward: upstream objective plus local vehicle
-    #                   parameters, hard track bounds, and own-action recovery.
-    IBR_IMPLEMENTATION = "local_wang"
-    # local_wang uses complete ego/opponent rounds and finishes with a final
-    # ego solve.
-    IBR_HORIZON = 10
-    IBR_ITERATIONS = 2
+    # One round-robin IBR supports direct controls, continuous five-parameter
+    # policies, or the shared discrete mode presets. Paper settings are 20
+    # steps of 0.1 s and six complete three-player rounds.
+    IBR_STRATEGY_SPACE = "control"  # "control", "parameter", or "mode"
+    IBR_HORIZON = 20
+    IBR_ROUNDS = 6
+    # Control BR follows the release's progress, lateral, heading and effort
+    # weights. The five-parameter and mode BRs use relative progress directly.
     IBR_PROGRESS_WEIGHT = 10.0
-    # IBR objective audit (2026-08): progress is the Wang-style racing
-    # objective. Across six scenarios, the released alpha-RACER IBR's 10*e^4
-    # lateral form eliminated recorded off-road time without materially
-    # reducing progress. Heading and speed tracking were not needed.
     IBR_LATERAL_WEIGHT = 10.0
-    IBR_LATERAL_EXPONENT = 4
-    IBR_HEADING_WEIGHT = 0.0
-    # Compatibility default for trace readers. Local trajectory IBR uses the
-    # effective shared MPC velocity weight so CLI overrides remain aligned.
-    IBR_SPEED_WEIGHT = VELOCITY_TRACK_WEIGHT
-    IBR_CONTROL_WEIGHT = 0.0
-    # ``neutral`` penalizes deviation from straight, speed-holding commands;
-    # ``zero`` reproduces the released alpha-RACER IBR's ||u||^2 form.
-    IBR_CONTROL_REFERENCE = "neutral"  # inactive while IBR_CONTROL_WEIGHT == 0
-    IBR_CONTROL_RATE_WEIGHT = 0.10
-    # Main baseline uses the shared global 5 m/s state bound. ``raceline`` is
-    # an ablation targeting the historical 1.04 * local-raceline-speed cap;
-    # its next-step bound is relaxed only as much as physical braking requires.
-    IBR_SPEED_CAP_MODE = "global"  # "global" or "raceline"
-    IBR_RACELINE_SPEED_CAP_FACTOR = 1.04
-    # Wang et al. use hard constraints. In this discrete three-car simulator,
-    # full-run ablations showed that hard track constraints enter a recovery
-    # infeasibility loop and hard pairwise collision constraints fail during a
-    # closing pack. Keep both feasibility slacks explicit and measurable.
-    IBR_ALLOW_TRACK_SLACK = True
-    IBR_ALLOW_COLLISION_SLACK = True
-    IBR_CONVERGENCE_TOLERANCE = 1.0e-3
-    # Historical local port kept three alternating solves and the upstream
-    # friction proxy while taking vehicle geometry/actuation from local MPC.
-    IBR_HISTORICAL_ITERATIONS = 3
-    IBR_HISTORICAL_FRICTION_COEFFICIENT = 1.6
-
-    # ==================== PARAMETER IBR ========================
-
-    # Five-parameter IBR diagnostic. Each best response searches canonical
-    # coordinates (q, zeta, s1, s2, s3), while candidate actions and
-    # trajectories are always produced by the shared alpha-RACER/LLM MPC.
-    # This is intentionally slower than the learned potential policy and is
-    # primarily an offline/reference baseline rather than a real-time method.
-    PARAMETER_IBR_ROUNDS = 2
-    PARAMETER_IBR_SEARCH_POINTS = 5
-    PARAMETER_IBR_SEARCH_PASSES = 2
-    PARAMETER_IBR_UPDATE_INTERVAL_SECONDS = 1.0
-    PARAMETER_IBR_CONVERGENCE_TOLERANCE = 1.0e-3
+    IBR_HEADING_WEIGHT = 0.3
+    IBR_SPEED_WEIGHT = 0.0
+    IBR_CONTROL_WEIGHT = 1.0
+    IBR_CONTROL_RATE_WEIGHT = 0.0
+    IBR_CONVERGENCE_TOLERANCE = 0.0  # Run all six paper rounds by default.
+    IBR_PARAMETER_SEARCH_POINTS = 3
+    IBR_PARAMETER_SEARCH_PASSES = 1
 
 
 params = SimParams()

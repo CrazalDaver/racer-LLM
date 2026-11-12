@@ -1,822 +1,773 @@
-"""Local trajectory-space IBR baseline and its simulation adapter.
+"""One round-robin IBR policy with three interchangeable strategy spaces.
 
-The local implementation follows the *alternating best-response* idea in
-Wang et al. (RSS 2019): for a two-car interaction it alternately optimizes
-the ego trajectory and a predicted neighbor trajectory, then executes the
-first ego command in receding-horizon fashion.  It uses this repository's
-Frenet kinematic model and safety conventions, rather than the paper's
-piecewise-polynomial SE-IBR formulation.  It is consequently an idea-level
-``local_wang`` baseline, not a reproduction of the sensitivity-enhanced
-objective or the original numerical implementation.
-
-There are deliberately two layers in this file:
-
-* :class:`LocalWangStyleSolver` owns only the two-car CasADi optimization.
-* :class:`TrajectoryIBRPolicy` translates simulator state into solver input,
-  stores the resulting control, and adapts plans for common trace fields.
-The simulator supplies an immutable race observation to ``get_action``; the
-policy performs its own local two-car solve directly from that snapshot.
+The outer game is the same for every strategy space: starting from one frozen
+three-car observation, update one modeled player at a time for six complete
+rounds. Only a player's best-response variables change: ``control`` optimizes
+throttle/steering directly; ``parameter`` searches theta=(q,zeta,s1,s2,s3);
+and ``mode`` chooses an existing parameter preset. The latter two call the
+shared reference builder and MPC. This basic IBR does not implement SE-IBR.
 """
 
-import math
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import time
 
 import casadi as cs
 import numpy as np
 
 from config import GRAVITY, params as sim_params
-from state import CarAction, CarState
-from track import RaceLine
-from vehicle_model import (
-    kinematic_frenet_step,
-    minimum_reachable_speed,
-    neutral_throttle,
-)
+from state import CarAction
+from vehicle_model import kinematic_frenet_step
 
-from ..base import BasePolicy
-from ..utils import track_curvature_at, track_heading_error
-from .historical_ibr import _HistoricalStrictIBRSolver
+from ..alpharacer.network import ALPHA_PARAMETER_BOUNDS
+from ..mpc import MPCPolicy
+from ..utils import relative_progress_gain
 
 
-IBR_IMPLEMENTATIONS = ("local_wang", "historical_strict")
+IBR_STRATEGY_SPACES = ("control", "parameter", "mode")
 
 
-@dataclass(frozen=True)
-class TrajectoryIBRSettings:
-    """Resolved, immutable inputs of one local trajectory-IBR solver.
+@dataclass
+class BestResponseResult:
+    """Output of one modeled player's single best-response optimization."""
 
-    This object is intentionally narrower than the mutable global
-    ``config.params``.  Some fields must use the *effective* per-run MPC
-    values (for example a CLI velocity/slack override), while objective terms
-    remain experiment-level IBR choices.  Constructing this snapshot once
-    makes that boundary inspectable and avoids solver code silently reading
-    global configuration later.
+    player_idx: int
+    state_plan: np.ndarray
+    control_plan: np.ndarray
+    action: np.ndarray
+    utility: float
+    params: np.ndarray | None = None
+    mode: str | None = None
+    diagnostics: dict = field(default_factory=dict)
+
+
+@dataclass
+class RoundRobinResult:
+    """Output of all requested IBR rounds from one frozen race observation."""
+
+    plans: list[np.ndarray]
+    controls: list[np.ndarray]
+    player_results: list[BestResponseResult]
+    round_diagnostics: list[dict]
+
+
+class RoundRobinIBR:
+    """Run complete sequential best-response rounds for all modeled players.
+
+    Input is an initial state/control plan for every player plus a callback that
+    solves exactly one player's BR against the latest joint plans. Output is
+    the final joint plans and the last BR result for each player. The ego is
+    updated last in every round, so its executed action responds to the other
+    players' newest plans rather than to a vehicle-number ordering accident.
     """
 
-    horizon: int
-    dt: float
-    vehicle_params: object
-    mu: float
-    gravity: float
-    lateral_half_width: float
-    collision_longitudinal: float
-    collision_lateral: float
-    collision_exponent: int
-    track_slack_weight: float
-    collision_slack_weight: float
-    allow_track_slack: bool
-    allow_collision_slack: bool
-    progress_weight: float
-    lateral_weight: float
-    lateral_exponent: int
-    heading_weight: float
-    speed_weight: float
-    control_weight: float
-    control_reference: str
-    control_rate_weight: float
-    convergence_tolerance: float
-    max_steer_delta: float
-    max_speed: float
-    speed_cap_mode: str
-    raceline_speed_cap_factor: float
-    enforce_track_boundary: bool
-    enforce_collision_avoidance: bool
-    enforce_friction_speed_limit: bool
-    iterations: int
+    def __init__(self, rounds: int, convergence_tolerance: float = 0.0):
+        self.rounds = int(rounds)
+        if self.rounds < 1:
+            raise ValueError("IBR rounds must be at least one")
+        self.convergence_tolerance = max(float(convergence_tolerance), 0.0)
+        self.current_round = None
+        self.current_player = None
 
-    @classmethod
-    def from_runtime(
-        cls,
-        *,
-        mpc,
-        sim_params,
-        horizon,
-        iterations,
-        lateral_half_width,
-        collision_longitudinal,
-        collision_lateral,
-    ):
-        """Resolve one solver snapshot from shared MPC and IBR configuration.
+    def solve(self, initial_plans, initial_controls, ego_idx, solve_best_response):
+        plans = [np.asarray(plan, dtype=float).copy() for plan in initial_plans]
+        controls = [np.asarray(plan, dtype=float).copy() for plan in initial_controls]
+        player_count = len(plans)
+        if player_count < 2 or len(controls) != player_count:
+            raise ValueError("round-robin IBR requires matching plans for at least two players")
+        ego_idx = int(ego_idx)
+        if not 0 <= ego_idx < player_count:
+            raise IndexError("ego_idx is outside the modeled players")
 
-        The MPC instance is authoritative for constraints and weights that
-        can be overridden per experiment.  ``sim_params`` supplies IBR-only
-        objective choices that currently have no per-run CLI override.
-        """
-        return cls(
-            horizon=int(horizon),
-            dt=float(mpc.dt),
-            vehicle_params=mpc.p,
-            mu=float(mpc.friction_coefficient),
-            gravity=float(GRAVITY),
-            lateral_half_width=float(lateral_half_width),
-            collision_longitudinal=float(collision_longitudinal),
-            collision_lateral=float(collision_lateral),
-            collision_exponent=int(mpc.collision_superellipse_exponent),
-            track_slack_weight=float(mpc.track_slack_weight),
-            collision_slack_weight=float(mpc.collision_slack_weight),
-            allow_track_slack=bool(sim_params.IBR_ALLOW_TRACK_SLACK),
-            allow_collision_slack=bool(sim_params.IBR_ALLOW_COLLISION_SLACK),
-            progress_weight=float(sim_params.IBR_PROGRESS_WEIGHT),
-            lateral_weight=float(sim_params.IBR_LATERAL_WEIGHT),
-            lateral_exponent=int(sim_params.IBR_LATERAL_EXPONENT),
-            heading_weight=float(sim_params.IBR_HEADING_WEIGHT),
-            speed_weight=float(mpc.velocity_track_weight),
-            control_weight=float(sim_params.IBR_CONTROL_WEIGHT),
-            control_reference=str(sim_params.IBR_CONTROL_REFERENCE),
-            control_rate_weight=float(sim_params.IBR_CONTROL_RATE_WEIGHT),
-            convergence_tolerance=float(sim_params.IBR_CONVERGENCE_TOLERANCE),
-            max_steer_delta=float(mpc.max_steer_delta),
-            max_speed=float(mpc.max_speed),
-            speed_cap_mode=str(sim_params.IBR_SPEED_CAP_MODE),
-            raceline_speed_cap_factor=float(sim_params.IBR_RACELINE_SPEED_CAP_FACTOR),
-            enforce_track_boundary=bool(mpc.enforce_track_boundary),
-            enforce_collision_avoidance=bool(mpc.enforce_collision_avoidance),
-            enforce_friction_speed_limit=bool(mpc.enforce_friction_speed_limit),
-            iterations=int(iterations),
-        )
+        order = [idx for idx in range(player_count) if idx != ego_idx] + [ego_idx]
+        latest = [None] * player_count
+        history = []
+        for round_idx in range(self.rounds):
+            before = [plan.copy() for plan in plans]
+            solve_seconds = 0.0
+            utilities = {}
+            for player_idx in order:
+                self.current_round = round_idx + 1
+                self.current_player = player_idx
+                started = time.perf_counter()
+                result = solve_best_response(player_idx, plans, controls)
+                solve_seconds += time.perf_counter() - started
+                if result.player_idx != player_idx:
+                    raise ValueError("best-response result belongs to the wrong player")
+                plans[player_idx] = np.asarray(result.state_plan, dtype=float).copy()
+                controls[player_idx] = np.asarray(result.control_plan, dtype=float).copy()
+                latest[player_idx] = result
+                utilities[player_idx] = float(result.utility)
+            max_change = max(
+                float(np.max(np.abs(plans[idx][:2] - before[idx][:2])))
+                for idx in range(player_count)
+            )
+            history.append({
+                "round": round_idx + 1,
+                "update_order": tuple(order),
+                "max_plan_change": max_change,
+                "solve_seconds": solve_seconds,
+                "utilities": utilities,
+            })
+            if self.convergence_tolerance > 0.0 and max_change <= self.convergence_tolerance:
+                break
+
+        if any(result is None for result in latest):
+            raise RuntimeError("round-robin IBR did not update every player")
+        return RoundRobinResult(plans, controls, latest, history)
 
 
-class LocalWangStyleSolver:
-    """Two-car, finite-horizon alternating best-response optimization.
+class ControlBestResponseSolver:
+    """Solve one player's direct control-space BR against fixed opponent plans.
 
-    Each solve keeps the other car's candidate Frenet ``[s, e]`` plan fixed,
-    optimizes one car's dynamically feasible state/control trajectory, then
-    alternates players for a bounded number of rounds.  A final ego solve
-    reacts to the latest neighbor response.  This is the local approximation
-    of the IBR loop; it does *not* contain Wang et al.'s sensitivity-enhanced
-    multiplier term.
-
-    The solver is independent of simulator objects after construction.  It
-    receives only :class:`TrajectoryIBRSettings`, numerical states, track
-    curvature samples, reference-speed samples, and the other trajectory.
-    That separation is intentional: policy-level state projection, cache
-    management, and multi-car scheduling do not belong in the NLP.
+    Inputs are the focal player's measured Frenet state, previous executed
+    command, warm-start plan, and all opponents' fixed ``[s,e]`` plans. Output
+    is a dynamically feasible state/control plan. Opponent progress is constant
+    during this BR, so maximizing paper relative progress is exactly maximizing
+    the focal player's terminal progress.
     """
 
-    def __init__(self, settings: TrajectoryIBRSettings):
-        self.settings = settings
-        self.p = settings.vehicle_params
-        self.horizon = settings.horizon
-        self.dt = settings.dt
-        self.iterations = settings.iterations
-        self.mu = settings.mu
-        self.gravity = settings.gravity
-        self.lateral_half_width = settings.lateral_half_width
-        self.collision_longitudinal = settings.collision_longitudinal
-        self.collision_lateral = settings.collision_lateral
-        self.collision_exponent = settings.collision_exponent
-        self.track_slack_weight = settings.track_slack_weight
-        self.collision_slack_weight = settings.collision_slack_weight
-        self.allow_track_slack = settings.allow_track_slack
-        self.allow_collision_slack = settings.allow_collision_slack
-        self.progress_weight = settings.progress_weight
-        self.lateral_weight = settings.lateral_weight
-        self.lateral_exponent = settings.lateral_exponent
-        if self.lateral_exponent not in {2, 4}:
-            raise ValueError("IBR lateral_exponent must be 2 or 4")
-        self.heading_weight = settings.heading_weight
-        self.speed_weight = settings.speed_weight
-        self.control_weight = settings.control_weight
-        self.control_reference = settings.control_reference
-        if self.control_reference not in {"neutral", "zero"}:
-            raise ValueError("IBR control_reference must be 'neutral' or 'zero'")
-        self.control_rate_weight = settings.control_rate_weight
-        self.convergence_tolerance = max(settings.convergence_tolerance, 0.0)
-        self.max_steer_delta = max(settings.max_steer_delta, 0.0)
-        self.max_speed = settings.max_speed
-        self.speed_cap_mode = settings.speed_cap_mode
-        self.raceline_speed_cap_factor = settings.raceline_speed_cap_factor
-        if self.speed_cap_mode not in {"global", "raceline"}:
-            raise ValueError("IBR speed_cap_mode must be 'global' or 'raceline'")
-        self.enforce_track_boundary = settings.enforce_track_boundary
-        self.enforce_collision_avoidance = settings.enforce_collision_avoidance
-        self.enforce_friction_speed_limit = settings.enforce_friction_speed_limit
-        self._build_solver()
+    _instance_counter = 0
 
-    def _vehicle_dynamics(self, xk, uk, curvature):
-        return kinematic_frenet_step(
-            xk,
-            uk,
-            curvature,
-            self.dt,
-            self.p,
-            curvature_mode="geometric",
-            symbolic=True,
-        )
+    def __init__(self, mpc, *, horizon, max_opponents):
+        self.mpc = mpc
+        self.p = mpc.p
+        self.dt = float(mpc.dt)
+        self.horizon = int(horizon)
+        self.max_opponents = int(max_opponents)
+        self.track_half_width = float(mpc.track_constraint_half_width)
+        self.longitudinal_separation = float(mpc.min_longitudinal_separation)
+        self.lateral_separation = float(mpc.min_lateral_separation)
+        self.collision_exponent = int(mpc.collision_superellipse_exponent)
+        self.max_speed = float(mpc.max_speed)
+        self.max_steer_delta = float(mpc.max_steer_delta)
+        self.mu = float(mpc.friction_coefficient)
+        self.track_slack_weight = float(mpc.track_slack_weight)
+        self.collision_slack_weight = float(mpc.collision_slack_weight)
+        self.enforce_track = bool(mpc.enforce_track_boundary)
+        self.enforce_collision = bool(mpc.enforce_collision_avoidance)
+        self.enforce_friction = bool(mpc.enforce_friction_speed_limit)
+        self.last_diagnostics = {}
+        self._build_problem()
 
-    def _build_solver(self):
-        """Build the reusable CasADi NLP once for a fixed settings snapshot.
-
-        Curvature, speed profile, initial state, previous command, and the
-        fixed neighbor plan remain numerical NLP parameters.  The variables
-        are the focal car's Frenet state/control sequence plus non-negative
-        track and collision slack.  Reusing this compiled graph is why these
-        quantities are not reconstructed in every policy tick.
-        """
-        n = self.horizon
+    def _build_problem(self):
+        """Build the reusable NLP; measured state and joint plans remain inputs."""
+        n, m = self.horizon, self.max_opponents
         x = cs.MX.sym("x", 4, n + 1)
         u = cs.MX.sym("u", 2, n)
         x0 = cs.MX.sym("x0", 4)
-        curvature = cs.MX.sym("curvature", n)
-        # Horizon-wise raceline speed profile, matching the shared MPC input.
-        target_speed = cs.MX.sym("target_speed", n)
-        neutral_control = cs.MX.sym("neutral_control", 2)
-        opp_s = cs.MX.sym("opp_s", n + 1)
-        opp_e = cs.MX.sym("opp_e", n + 1)
         u_prev = cs.MX.sym("u_prev", 2)
+        curvature = cs.MX.sym("curvature", n)
+        opponent_s = cs.MX.sym("opponent_s", m * (n + 1))
+        opponent_e = cs.MX.sym("opponent_e", m * (n + 1))
         track_slack = cs.MX.sym("track_slack", n)
-        collision_slack = cs.MX.sym("collision_slack", n)
+        collision_slack = cs.MX.sym("collision_slack", m, n)
 
-        cost = 0
-        g = [x[:, 0] - x0]  # constraint
-        identity = np.eye(2)
-
+        constraints = [x[:, 0] - x0]
         for k in range(n):
-            g.append(x[:, k + 1] - self._vehicle_dynamics(x[:, k], u[:, k], curvature[k]))  # kinematic constraints
-            cost += self.lateral_weight * x[1, k] ** self.lateral_exponent
-            cost += self.heading_weight * x[2, k] ** 2
-            cost += self.speed_weight * (x[3, k] - target_speed[k]) ** 2
-            # Absolute effort is measured relative to the command that holds
-            # the reference speed and drives straight. This avoids treating
-            # drag compensation as strategically meaningful acceleration.
-            effort = (
-                u[:, k] - neutral_control
-                if self.control_reference == "neutral"
-                else u[:, k]
+            next_state = kinematic_frenet_step(
+                x[:, k], u[:, k], curvature[k], self.dt, self.p,
+                curvature_mode="geometric", symbolic=True,
             )
-            cost += self.control_weight * cs.mtimes([effort.T, identity, effort])
-            du = u[:, k] - (u_prev if k == 0 else u[:, k - 1])
-            cost += self.control_rate_weight * cs.mtimes([du.T, identity, du])
+            constraints.append(x[:, k + 1] - next_state)
 
-        cost += -self.progress_weight * (x[0, n] - x[0, 0])
-        cost += self.track_slack_weight * cs.dot(track_slack, track_slack)
-        cost += self.collision_slack_weight * cs.dot(collision_slack, collision_slack)
-
+        friction_start = sum(item.numel() for item in constraints)
         for k in range(n):
-            # Keep the same released-alpha-RACER friction proxy used by the
-            # local MPCController: normalized steer appears inside tan().
-            g.append((x[3, k] ** 2) * cs.tan(u[1, k]))
+            constraints.append(x[3, k] ** 2 * cs.tan(u[1, k]))
+        speed_start = sum(item.numel() for item in constraints)
         for k in range(n):
-            g.append(x[3, k + 1])
+            constraints.append(x[3, k + 1])
+        track_start = sum(item.numel() for item in constraints)
         for k in range(1, n + 1):
-            g.append(x[1, k] - self.lateral_half_width - track_slack[k - 1])
-            g.append(-x[1, k] - self.lateral_half_width - track_slack[k - 1])
-        for k in range(n):
-            ds = (x[0, k + 1] - opp_s[k + 1]) / self.collision_longitudinal
-            de = (x[1, k + 1] - opp_e[k + 1]) / self.collision_lateral
-            g.append(
-                1.0 - ds ** self.collision_exponent
-                - de ** self.collision_exponent - collision_slack[k]
-            )
+            constraints.extend((
+                x[1, k] - self.track_half_width - track_slack[k - 1],
+                -x[1, k] - self.track_half_width - track_slack[k - 1],
+            ))
+        collision_start = sum(item.numel() for item in constraints)
+        for opponent_idx in range(m):
+            base = opponent_idx * (n + 1)
+            for k in range(1, n + 1):
+                ds = (x[0, k] - opponent_s[base + k]) / self.longitudinal_separation
+                de = (x[1, k] - opponent_e[base + k]) / self.lateral_separation
+                constraints.append(
+                    1.0 - ds ** self.collision_exponent
+                    - de ** self.collision_exponent
+                    - collision_slack[opponent_idx, k - 1]
+                )
+        steer_rate_start = sum(item.numel() for item in constraints)
         for k in range(n):
             previous_steer = u_prev[1] if k == 0 else u[1, k - 1]
-            g.append(u[1, k] - previous_steer)
+            constraints.append(u[1, k] - previous_steer)
 
-        opt_variables = cs.vertcat(
+        # Opponents are fixed during one BR, so relative progress differs from
+        # own progress only by a constant. Release terms favor staying near the
+        # road center and avoiding large heading errors and control commands.
+        objective = -float(sim_params.IBR_PROGRESS_WEIGHT) * (x[0, n] - x[0, 0])
+        for k in range(n):
+            objective += float(sim_params.IBR_LATERAL_WEIGHT) * x[1, k] ** 4
+            objective += float(sim_params.IBR_HEADING_WEIGHT) * x[2, k] ** 2
+            objective += float(sim_params.IBR_SPEED_WEIGHT) * x[3, k] ** 2
+            objective += float(sim_params.IBR_CONTROL_WEIGHT) * cs.sumsqr(u[:, k])
+            du = u[:, k] - (u_prev if k == 0 else u[:, k - 1])
+            objective += float(sim_params.IBR_CONTROL_RATE_WEIGHT) * cs.sumsqr(du)
+        # Match the local MPC's cost for track and collision violations.
+        objective += self.track_slack_weight * cs.sumsqr(track_slack)
+        objective += self.collision_slack_weight * cs.sumsqr(
+            cs.reshape(collision_slack, -1, 1)
+        )
+
+        variables = cs.vertcat(
             cs.reshape(x, -1, 1), cs.reshape(u, -1, 1),
-            track_slack, collision_slack,
+            track_slack, cs.reshape(collision_slack, -1, 1),
         )
-        constraints = cs.vertcat(*g)
-        params = cs.vertcat(
-            x0, curvature, target_speed, neutral_control, opp_s, opp_e,
-            u_prev,
+        parameters = cs.vertcat(x0, u_prev, curvature, opponent_s, opponent_e)
+        all_constraints = cs.vertcat(*constraints)
+        instance_id = ControlBestResponseSolver._instance_counter
+        ControlBestResponseSolver._instance_counter += 1
+        self.solver = cs.nlpsol(
+            f"ibr_control_br_{instance_id}", "ipopt",
+            {"f": objective, "x": variables, "g": all_constraints, "p": parameters},
+            {"ipopt.print_level": 0, "print_time": 0, "ipopt.max_iter": 500},
         )
-        problem = {"f": cost, "x": opt_variables, "g": constraints, "p": params}
-        opts = {"ipopt.print_level": 0, "print_time": 0, "ipopt.max_iter": 500}
-        self.solver = cs.nlpsol("local_wang_ibr_solver", "ipopt", problem, opts)
+        self.constraint_fn = cs.Function(
+            f"ibr_control_constraints_{instance_id}",
+            [variables, parameters], [all_constraints],
+        )
         self.n_x = 4 * (n + 1)
         self.n_u = 2 * n
         self.n_track_slack = n
-        self.n_collision_slack = n
-        self.n_constraints = constraints.size1()
+        self.n_collision_slack = m * n
+        self.constraint_count = int(all_constraints.numel())
+        self.constraint_offsets = {
+            "friction": friction_start,
+            "speed": speed_start,
+            "track": track_start,
+            "collision": collision_start,
+            "steer_rate": steer_rate_start,
+        }
 
-    def _neutral_throttle(self, speed):
-        """Throttle that approximately maintains speed in MPC dynamics."""
-        return neutral_throttle(speed, self.p)
-
-    def _solve_best_response(
-        self, x0, opponent_plan, curvature, target_speed,
-        initial_plan=None, previous_control=None,
+    def solve_best_response(
+        self, *, player_idx, x0, previous_control, warm_state_plan,
+        warm_control_plan, opponent_plans, curvature,
     ):
-        """Optimize one car while treating ``opponent_plan`` as fixed.
-
-        This is one best-response subproblem, not a joint solve.  Its output
-        becomes the other player's fixed trajectory in the next alternating
-        step.  Warm-start plans are aids to IPOPT convergence only; all
-        dynamic, track, collision, actuation, and slack constraints are
-        imposed again by the NLP.
-        """
-        n = self.horizon
-        target_speed = np.asarray(target_speed, dtype=float).reshape(-1)
-        if target_speed.size == 1:
-            target_speed = np.full(n, float(target_speed[0]))
-        if target_speed.size != n:
-            raise ValueError(
-                f"target_speed must contain {n} samples, got {target_speed.size}"
-            )
-        if initial_plan is None:
-            x_init = np.tile(np.asarray(x0, dtype=float), (n + 1, 1)).T
-        else:
-            x_init = np.asarray(initial_plan, dtype=float).copy()
-            x_init[:, 0] = np.asarray(x0, dtype=float)
-        u_init = np.zeros((2, n))
-        u_init[0, :] = np.clip(self._neutral_throttle(x_init[3, 0]), -1.0, 1.0)
-        u_init[1, :] = np.clip(-self.p.Sb / max(self.p.Sa, 1e-6), -1.0, 1.0)
-        initial_track_slack = np.maximum(
-            np.abs(x_init[1, 1:]) - self.lateral_half_width, 0.0
-        ) + 1.0e-4
-        ds_init = (x_init[0, 1:] - opponent_plan[0, 1:]) / self.collision_longitudinal
-        de_init = (x_init[1, 1:] - opponent_plan[1, 1:]) / self.collision_lateral
-        initial_collision_slack = np.maximum(
-            1.0 - ds_init ** self.collision_exponent
-            - de_init ** self.collision_exponent, 0.0
-        ) + 1.0e-4
-        initial_guess = np.concatenate([
-            x_init.T.reshape(-1), u_init.T.reshape(-1),
-            initial_track_slack, initial_collision_slack,
-        ])
-        if previous_control is None:
-            previous_control = np.asarray([
-                self._neutral_throttle(x0[3]),
-                -self.p.Sb / max(self.p.Sa, 1e-6),
-            ])
+        """Return one direct-control BR plan; raise on failed/nonfinite solve."""
+        n, m = self.horizon, self.max_opponents
+        self.last_diagnostics = {
+            "success": False, "status": "not_solved", "solve_seconds": 0.0,
+            "iterations": 0, "residual": None, "cost": None,
+        }
+        x0 = np.asarray(x0, dtype=float)
         previous_control = np.asarray(previous_control, dtype=float)
-        neutral_control = np.asarray(
-            [self._neutral_throttle(target_speed[0]), -self.p.Sb / max(self.p.Sa, 1e-6)],
-            dtype=float,
-        )
-        p_val = np.concatenate(
-            [
-                np.asarray(x0, dtype=float),
-                np.asarray(curvature, dtype=float),
-                target_speed,
-                neutral_control,
-                np.asarray(opponent_plan[0], dtype=float),
-                np.asarray(opponent_plan[1], dtype=float),
-                previous_control,
-            ]
-        )
-
-        lbg = np.zeros(self.n_constraints)
-        ubg = np.zeros(self.n_constraints)
-        friction_start = 4 * (n + 1)
-        speed_start = friction_start + n
-        boundary_start = speed_start + n
-        collision_start = boundary_start + 2 * n
-        steer_rate_start = collision_start + n
-        if self.enforce_friction_speed_limit:
-            wheelbase = self.p.LF + self.p.LR
-            lbg[friction_start:speed_start] = -self.mu * self.gravity * wheelbase
-            ubg[friction_start:speed_start] = self.mu * self.gravity * wheelbase
-        else:
-            lbg[friction_start:speed_start] = -np.inf
-            ubg[friction_start:speed_start] = np.inf
-        speed_cap = self.max_speed
-        if self.speed_cap_mode == "raceline":
-            # A raw v <= factor*v_ref bound can be infeasible when the measured
-            # car reaches a slower segment faster than it can brake in one
-            # discrete step.  Keep the desired cap, but never demand a next
-            # state below what full braking can physically reach.  Recomputing
-            # this bound each MPC update makes the cap tighten progressively.
-            speed_cap = min(
-                self.max_speed,
-                max(
-                    self.raceline_speed_cap_factor * float(target_speed[0]),
-                    minimum_reachable_speed(x0[3], self.dt, self.p),
-                ),
-            )
-        ubg[speed_start:boundary_start] = speed_cap
-        lbg[boundary_start:] = -np.inf
-        ubg[boundary_start:] = 0.0
-        if not self.enforce_track_boundary:
-            ubg[boundary_start:collision_start] = np.inf
-        if not self.enforce_collision_avoidance:
-            ubg[collision_start:steer_rate_start] = np.inf
-        lbg[steer_rate_start:] = -self.max_steer_delta
-        ubg[steer_rate_start:] = self.max_steer_delta
-
-        lbx = np.full(initial_guess.size, -np.inf)
-        ubx = np.full(initial_guess.size, np.inf)
-        u_start = self.n_x
+        state_guess = np.asarray(warm_state_plan, dtype=float).copy()
+        control_guess = np.asarray(warm_control_plan, dtype=float).copy()
+        opponent_plans = np.asarray(opponent_plans, dtype=float)
+        curvature = np.asarray(curvature, dtype=float)
+        if state_guess.shape != (4, n + 1) or control_guess.shape != (2, n):
+            raise ValueError("control BR warm plans have the wrong shape")
+        if opponent_plans.shape != (m, 2, n + 1):
+            raise ValueError("control BR requires one [s,e] plan per opponent")
+        control_guess[0] = np.clip(control_guess[0], 0.0, 1.0)
+        control_guess[1] = np.clip(control_guess[1], -1.0, 1.0)
+        # Keep the cached controls, but rebuild states for this BR's fixed
+        # curvature schedule. This is the same rollout-style warm start used by
+        # the main MPC and makes the dynamics equalities coherent at the seed.
+        state_guess[:, 0] = x0
         for k in range(n):
-            lbx[u_start + 2 * k:u_start + 2 * k + 2] = [-1.0, -1.0]
-            ubx[u_start + 2 * k:u_start + 2 * k + 2] = [1.0, 1.0]
-        slack_start = self.n_x + self.n_u
-        lbx[slack_start:] = 0.0
-        track_slack_end = slack_start + self.n_track_slack
-        if not self.allow_track_slack:
-            ubx[slack_start:track_slack_end] = 0.0
-            initial_guess[slack_start:track_slack_end] = 0.0
-        if not self.allow_collision_slack:
-            ubx[track_slack_end:] = 0.0
-            initial_guess[track_slack_end:] = 0.0
-
-        solution = self.solver(
-            x0=initial_guess, lbx=lbx, ubx=ubx,
-            lbg=lbg, ubg=ubg, p=p_val,
+            state_guess[:, k + 1] = kinematic_frenet_step(
+                state_guess[:, k], control_guess[:, k], curvature[k],
+                self.dt, self.p, curvature_mode="geometric",
+            )
+        if not np.isfinite(state_guess).all():
+            raise RuntimeError("IBR control warm-start rollout is nonfinite")
+        track_slack_guess = np.maximum(
+            np.abs(state_guess[1, 1:]) - self.track_half_width, 0.0
         )
-        stats = self.solver.stats()
-        if not stats.get("success", False):
-            raise RuntimeError(stats.get("return_status", "unknown"))
-        opt = solution["x"].full().flatten()
-        state_plan = opt[: self.n_x].reshape(n + 1, 4).T
-        control_plan = opt[self.n_x : self.n_x + self.n_u].reshape(n, 2).T
-        collision_slack_start = self.n_x + self.n_u + self.n_track_slack
-        track_slack_plan = opt[
-            self.n_x + self.n_u : self.n_x + self.n_u + self.n_track_slack
-        ]
-        collision_slack_plan = opt[
-            collision_slack_start : collision_slack_start + self.n_collision_slack
-        ]
-        ds = (state_plan[0, 1:] - opponent_plan[0, 1:]) / self.collision_longitudinal
-        de = (state_plan[1, 1:] - opponent_plan[1, 1:]) / self.collision_lateral
-        raw_collision_constraint = (
-            1.0 - ds ** self.collision_exponent - de ** self.collision_exponent
-        )
-        diagnostics = {
-            "track_slack": track_slack_plan,
-            "collision_slack": collision_slack_plan,
-            "max_collision_constraint": float(np.max(raw_collision_constraint)),
-            "min_predicted_longitudinal_distance": float(
-                np.min(np.abs(state_plan[0, 1:] - opponent_plan[0, 1:]))
-            ),
-            "min_predicted_lateral_distance": float(
-                np.min(np.abs(state_plan[1, 1:] - opponent_plan[1, 1:]))
-            ),
-        }
-        return state_plan, control_plan, diagnostics
-
-    def iterate_best_responses(
-        self, neighbor_x0, own_x0, neighbor_curvature, own_curvature,
-        neighbor_speed, own_speed, neighbor_previous_control=None,
-        own_previous_control=None,
-    ):
-        """Run bounded alternating best responses and return the final ego plan.
-
-        Both initial plans are constant-speed rollouts used solely as first
-        guesses.  A round is ego best response followed by neighbor best
-        response.  The extra ego solve after the loop mirrors the paper's
-        execution convention: the command reacts to the latest neighbor plan.
-        Early termination tests only plan change; it is not proof of a Nash
-        equilibrium, especially because this local solver omits SE-IBR.
-        """
-        n = self.horizon
-        def rollout(x0):
-            plan = np.repeat(np.asarray(x0, dtype=float).reshape(4, 1), n + 1, axis=1)
-            for k in range(n):
-                plan[0, k + 1] = plan[0, k] + max(plan[3, k], 0.0) * self.dt
-            return plan
-
-        own_state_plan = rollout(own_x0)
-        neighbor_state_plan = rollout(neighbor_x0)
-        own_control_plan = np.zeros((2, n))
-        neighbor_control_plan = np.zeros((2, n))
-        own_diagnostics = {}
-        neighbor_diagnostics = {}
-
-        # Algorithm 1: complete ego/opponent rounds, followed by a final ego
-        # solve so the executed command always reflects the latest opponent BR.
-        for _ in range(self.iterations):
-            previous_own = own_state_plan.copy()
-            own_state_plan, own_control_plan, own_diagnostics = self._solve_best_response(
-                own_x0, neighbor_state_plan[:2], own_curvature, own_speed,
-                initial_plan=own_state_plan,
-                previous_control=own_previous_control,
+        collision_slack_guess = np.zeros((m, n))
+        for opponent_idx in range(m):
+            ds = (
+                state_guess[0, 1:] - opponent_plans[opponent_idx, 0, 1:]
+            ) / self.longitudinal_separation
+            de = (
+                state_guess[1, 1:] - opponent_plans[opponent_idx, 1, 1:]
+            ) / self.lateral_separation
+            collision_slack_guess[opponent_idx] = np.maximum(
+                1.0 - ds ** self.collision_exponent
+                - de ** self.collision_exponent,
+                0.0,
             )
-            neighbor_state_plan, neighbor_control_plan, neighbor_diagnostics = self._solve_best_response(
-                neighbor_x0, own_state_plan[:2], neighbor_curvature, neighbor_speed,
-                initial_plan=neighbor_state_plan,
-                previous_control=neighbor_previous_control,
-            )
-            if np.max(np.abs(own_state_plan[:2] - previous_own[:2])) <= self.convergence_tolerance:
-                break
+        initial = np.concatenate((
+            state_guess.T.reshape(-1), control_guess.T.reshape(-1),
+            track_slack_guess, collision_slack_guess.T.reshape(-1),
+        ))
+        parameters = np.concatenate((
+            x0, previous_control, curvature,
+            opponent_plans[:, 0, :].reshape(-1),
+            opponent_plans[:, 1, :].reshape(-1),
+        ))
 
-        own_state_plan, own_control_plan, own_diagnostics = self._solve_best_response(
-            own_x0, neighbor_state_plan[:2], own_curvature, own_speed,
-            initial_plan=own_state_plan,
-            previous_control=own_previous_control,
-        )
-        own_plan = own_state_plan[:2]
-        own_u = own_control_plan[:, 0]
-        neighbor_u = neighbor_control_plan[:, 0]
-
-        return {
-            "action": own_u,
-            "state_plan": own_state_plan,
-            "control_plan": own_control_plan,
-            "frenet_plan": own_plan,
-            "neighbor_state_plan": neighbor_state_plan,
-            "neighbor_control_plan": neighbor_control_plan,
-            "neighbor_action": neighbor_u,
-            "diagnostics": own_diagnostics,
-            "neighbor_diagnostics": neighbor_diagnostics,
-        }
-
-class TrajectoryIBRPolicy(BasePolicy):
-    """Simulator-facing adapter for a direct trajectory-space IBR planner.
-
-    This policy directly executes the first control from a local two-car IBR
-    plan; unlike :class:`MPCPolicy`, it does not give a reference to the
-    shared MPC optimizer for control tracking.  The supplied ``mpc`` object
-    still defines the effective physical limits and cost scales, and is used
-    as the common diagnostics/trace interface expected by the simulator.
-
-    ``get_action`` receives one immutable :class:`RaceObservation`, chooses
-    the closest longitudinal opponent, and performs the complete local solve.
-    The observation contains previous-tick controls for all cars, so calling
-    policies in sequence cannot expose newly updated internal state.
-
-    ``local_wang`` is a local alternating-IBR adaptation, not an SE-IBR
-    reproduction.  ``historical_strict`` retains the repository's former
-    solver solely for historical comparisons and should not be used as the
-    primary Wang-style baseline.
-    """
-
-    ibr_level = "trajectory"
-
-    def __init__(
-        self,
-        track,
-        mpc,
-        raceline: RaceLine,
-        max_speed=5.0,
-        car_idx=None,
-        policy_name=None,
-        iterations=2,
-        ibr_horizon=None,
-        lateral_half_width=None,
-        collision_longitudinal=None,
-        collision_lateral=None,
-        implementation="local_wang",
-    ):
-        super().__init__(track, mpc, car_idx=car_idx, policy_name=policy_name)
-        if raceline is None:
-            raise ValueError("IteratedBestResponsePolicy requires a raceline")
-        self.raceline = raceline
-        self.max_speed = float(max_speed)
-        self.last_raceline_s = None
-        self.last_raceline_idx = None
-        self.implementation = str(implementation).strip().lower()
-        if self.implementation not in IBR_IMPLEMENTATIONS:
-            raise ValueError(
-                f"Unknown IBR implementation {implementation!r}; "
-                f"choose one of {IBR_IMPLEMENTATIONS}"
-            )
-        solver_horizon = self.mpc.horizon if ibr_horizon is None else int(ibr_horizon)
-        if lateral_half_width is None:
-            lateral_half_width = getattr(self.mpc, "track_constraint_half_width", self.mpc.track_half_width)
-        self.iterations = int(iterations)
-        if collision_longitudinal is None:
-            collision_longitudinal = self.mpc.min_longitudinal_separation
-        if collision_lateral is None:
-            collision_lateral = self.mpc.min_lateral_separation
-        if self.implementation == "historical_strict":
-            self.ibr_solver = _HistoricalStrictIBRSolver(
-                vehicle_params=self.mpc.p,
-                horizon=solver_horizon,
-                dt=self.mpc.dt,
-                iterations=sim_params.IBR_HISTORICAL_ITERATIONS,
-                mu=sim_params.IBR_HISTORICAL_FRICTION_COEFFICIENT,
-                gravity=GRAVITY,
-                use_upstream_collision_expression=True,
-                lateral_half_width=float(lateral_half_width),
-            )
-            self.iterations = self.ibr_solver.iterations
-            self.ibr_settings = None
+        lower_g = np.zeros(self.constraint_count)
+        upper_g = np.zeros(self.constraint_count)
+        offsets = self.constraint_offsets
+        friction_limit = self.mu * GRAVITY * (self.p.LF + self.p.LR)
+        if self.enforce_friction:
+            lower_g[offsets["friction"]:offsets["speed"]] = -friction_limit
+            upper_g[offsets["friction"]:offsets["speed"]] = friction_limit
         else:
-            self.ibr_settings = TrajectoryIBRSettings.from_runtime(
-                mpc=self.mpc,
-                sim_params=sim_params,
-                horizon=solver_horizon,
-                iterations=self.iterations,
-                lateral_half_width=lateral_half_width,
-                collision_longitudinal=collision_longitudinal,
-                collision_lateral=collision_lateral,
-            )
-            self.ibr_solver = LocalWangStyleSolver(self.ibr_settings)
-        self._last_ibr_action = None
-        self._ibr_cached_ref_traj = None
-        self._ibr_cached_ref_world_horizon = None
-        self._ibr_cached_raceline_world_horizon = None
-        self._ibr_failure_active = False
-        self._ibr_failure_count = 0
-        self._ibr_failure_start_time = None
-        self._ibr_last_failure = None
-        self.last_ibr_diagnostics = {}
+            lower_g[offsets["friction"]:offsets["speed"]] = -np.inf
+            upper_g[offsets["friction"]:offsets["speed"]] = np.inf
+        upper_g[offsets["speed"]:offsets["track"]] = self.max_speed
+        lower_g[offsets["track"]:] = -np.inf
+        upper_g[offsets["track"]:] = 0.0
+        if not self.enforce_track:
+            upper_g[offsets["track"]:offsets["collision"]] = np.inf
+        if not self.enforce_collision:
+            upper_g[offsets["collision"]:offsets["steer_rate"]] = np.inf
+        lower_g[offsets["steer_rate"]:] = -self.max_steer_delta
+        upper_g[offsets["steer_rate"]:] = self.max_steer_delta
 
-    def _report_ibr_failure(self, exc, sim_time=None):
-        self._ibr_failure_count += 1
-        self._ibr_last_failure = str(exc)
-        self.mpc.last_solver_success = False
-        self.mpc.last_solver_status = str(exc)
-        self.mpc.last_recovery_active = True
-        self.mpc.last_recovery_reason = "ibr_hold_last_control"
-        if not self._ibr_failure_active:
-            self._ibr_failure_active = True
-            self._ibr_failure_start_time = sim_time
-            self._log(
-                f"[IBR warning][{self.warning_label}] solve failed "
-                f"({self._format_ibr_time(sim_time)}); using last control. status={exc}"
-            )
+        lower_x = np.full(initial.size, -np.inf)
+        upper_x = np.full(initial.size, np.inf)
+        for k in range(n):
+            start = self.n_x + 2 * k
+            lower_x[start:start + 2] = [0.0, -1.0]
+            upper_x[start:start + 2] = [1.0, 1.0]
+        lower_x[self.n_x + self.n_u:] = 0.0
 
-    def _report_ibr_recovery(self, sim_time=None):
-        if not self._ibr_failure_active:
-            return
-        self._log(
-            f"[IBR warning][{self.warning_label}] solve recovered "
-            f"({self._format_ibr_interval(sim_time)}, failed_count={self._ibr_failure_count})"
-        )
-        self._ibr_failure_active = False
-        self._ibr_failure_count = 0
-        self._ibr_failure_start_time = None
-        self._ibr_last_failure = None
-
-    def _format_ibr_time(self, sim_time):
-        return "t=?" if sim_time is None else f"t={sim_time:.2f}s"
-
-    def _format_ibr_interval(self, sim_time):
-        if self._ibr_failure_start_time is None or sim_time is None:
-            return self._format_ibr_time(sim_time)
-        return f"t={self._ibr_failure_start_time:.2f}-{sim_time:.2f}s"
-
-    def flush_solver_warnings(self, sim_time=None):
-        if self._ibr_failure_active:
-            self._log(
-                f"[IBR warning][{self.warning_label}] solve still failing "
-                f"({self._format_ibr_interval(sim_time)}, failed_count={self._ibr_failure_count}); "
-                f"using last control. status={self._ibr_last_failure}"
-            )
-
-    def _curvature_lookahead(self, current_s, state):
-        """Sample centerline curvature along a frozen-speed nominal horizon.
-
-        The Frenet dynamics need a curvature value at every prediction step.
-        We use ``s_k = s_0 + k dt v_0`` as an inexpensive external parameter
-        schedule, rather than making curvature a symbolic function of the
-        optimized progress.  This is a local approximation: it can disagree
-        with the eventual plan when the car accelerates or brakes sharply,
-        particularly around a hairpin.  It should be audited against the
-        solved ``s`` plan before changing baseline behavior.
-        """
-        curvature = np.zeros(self.ibr_solver.horizon)
-        speed = max(float(state.vx), 0.0)
-        for k in range(self.ibr_solver.horizon):
-            s = current_s + k * self.ibr_solver.dt * speed
-            curvature[k] = track_curvature_at(self.track, s, ds=0.5)
-        return curvature
-
-    def _reference_speed_profile(self, state, current_s):
-        """Sample raceline target speeds for the local solver horizon.
-
-        This is a speed-tracking preference/cap input, not a trajectory given
-        to the solver.  The profile advances using its own sampled raceline
-        speed; it may therefore differ from both frozen-speed curvature
-        lookahead and the optimized progress sequence.
-        """
-        n = self.ibr_solver.horizon
-        if self.raceline is None:
-            return np.full(n, max(float(state.vx), 0.5), dtype=float)
+        started = time.perf_counter()
+        self.last_diagnostics = {
+            "success": False, "status": "solver_exception", "solve_seconds": 0.0,
+            "iterations": 0, "residual": None, "cost": None,
+        }
         try:
-            idx = self.raceline.nearest_index(state.x, state.y)
-            self.last_raceline_idx = idx
-            self.last_raceline_s = float(self.raceline.s[idx])
-            profile = np.empty(n, dtype=float)
-            raceline_s = self.last_raceline_s
-            for k in range(n):
-                sample = self.raceline.interpolate(raceline_s)
-                profile[k] = min(float(sample["vx_mps"]), self.max_speed)
-                raceline_s += max(profile[k], 0.0) * self.ibr_solver.dt
-            return profile
-        except Exception:
-            return np.full(n, max(float(state.vx), 0.5), dtype=float)
-
-    def _frenet_x0(self, state, current_s, current_e):
-        """Project a simulator state into the solver's ``[s,e,psi_err,v]`` state."""
-        return np.array(
-            [
-                float(current_s),
-                float(current_e),
-                float(track_heading_error(self.track, state.psi, current_s, reference_minus_heading=False)),
-                max(float(state.vx), 0.0),
-            ],
-            dtype=float,
-        )
-
-    def _make_ref_from_plan(self, plan, speed_profile):
-        """Adapt a direct IBR plan to the shared trace/visualization format.
-
-        The returned reference is diagnostic only: the direct IBR action has
-        already been computed by :class:`LocalWangStyleSolver`; it is not fed
-        into ``self.mpc.solve``.  Keeping this adapter lets plots and saved
-        traces use the same fields for all policy families.
-        """
-        horizon = self.mpc.horizon
-        speed_profile = np.asarray(speed_profile, dtype=float).reshape(-1)
-        ref = np.zeros((8, horizon + 1))
-        ref_world = np.zeros((2, horizon + 1))
-        plan_len = plan.shape[1]
-        for k in range(horizon + 1):
-            src = min(k, plan_len - 1)
-            s = float(plan[0, src])
-            e = float(plan[1, src])
-            x, y, psi = self.track.interpolate(s)
-            ref[0, k] = s % self.track.total_length
-            ref[1, k] = e
-            ref[2, k] = speed_profile[min(k, speed_profile.size - 1)]
-            ref[3, k] = psi
-            ref[4, k] = x
-            ref[5, k] = y
-            ref[6, k] = -math.sin(psi)
-            ref[7, k] = math.cos(psi)
-            ref_world[:, k] = self.track.frenet_to_world(s, e)
-        return ref, ref_world
-
-    def prepare_interaction_plan(
-        self, own_state, own_s, own_e, neighbor_state, neighbor_s,
-        neighbor_e, sim_time=None, neighbor_previous_control=None,
-    ):
-        """Prepare and cache this policy's first action against one neighbor.
-
-        Both current simulator states are converted to Frenet coordinates.
-        The local solver internally produces a predicted plan for each car,
-        but only this policy's first command is cached and later executed.
-        The neighbor is not commanded by this call; it will prepare its own
-        action in the batch coordinator if it is also a trajectory-IBR policy.
-        """
-        own_x0 = self._frenet_x0(own_state, own_s, own_e)
-        neighbor_x0 = self._frenet_x0(neighbor_state, neighbor_s, neighbor_e)
-        own_speed = self._reference_speed_profile(own_state, own_s)
-        neighbor_speed = self._reference_speed_profile(neighbor_state, neighbor_s)
-        # The historical implementation has only a scalar speed cap and no
-        # velocity-tracking term; keep its replay interface unchanged.
-        if self.implementation == "historical_strict":
-            own_speed = float(own_speed[0])
-            neighbor_speed = float(neighbor_speed[0])
-        result = self.ibr_solver.iterate_best_responses(
-            neighbor_x0=neighbor_x0,
-            own_x0=own_x0,
-            neighbor_curvature=self._curvature_lookahead(neighbor_s, neighbor_state),
-            own_curvature=self._curvature_lookahead(own_s, own_state),
-            neighbor_speed=neighbor_speed,
-            own_speed=own_speed,
-            neighbor_previous_control=neighbor_previous_control,
-            own_previous_control=self.last_u,
-        )
-        self._cache_interaction_result(result, own_speed, sim_time)
-        self._report_ibr_recovery(sim_time=sim_time)
-
-    def _cache_interaction_result(self, result, ref_speed, sim_time):
-        """Store a successful direct-control plan in policy and trace state."""
-        action = np.asarray(result["action"], dtype=float)
-        action = np.clip(action, -1.0, 1.0)
-        self._last_ibr_action = CarAction(throttle=float(action[0]), steer=float(action[1]))
-        self.last_u = np.array([self._last_ibr_action.throttle, self._last_ibr_action.steer])
-        self.mpc.last_solver_success = True
-        self.mpc.last_solver_status = "Solve_Succeeded"
-        self.mpc.last_recovery_active = False
-        self.mpc.last_recovery_reason = ""
-        self.mpc.last_control_plan = result["control_plan"]
-        self.last_ibr_diagnostics = dict(result.get("diagnostics", {}))
-
-        if result["state_plan"] is not None:
-            plan = result["state_plan"][:2, :]
-            ref_traj, ref_world = self._make_ref_from_plan(plan, ref_speed)
-            self.last_ref_traj = ref_traj
-            self.last_ref_world_horizon = ref_world
-            self.last_raceline_world_horizon = np.full_like(ref_world, np.nan)
-            self._ibr_cached_ref_traj = ref_traj
-            self._ibr_cached_ref_world_horizon = ref_world
-            self._ibr_cached_raceline_world_horizon = self.last_raceline_world_horizon
-            # The shared MPC trace convention is now Frenet
-            # [s,e,heading_error,v], matching trajectory IBR directly.
-            self.mpc.last_state_plan = np.asarray(
-                result["state_plan"], dtype=float
-            ).copy()
-
-    def get_action(self, observation) -> CarAction:
-        """Solve the local two-car game from ``observation`` and return its first control."""
-        if self.car_idx is None:
-            raise ValueError("TrajectoryIBRPolicy requires car_idx when used with RaceObservation")
-        ego = observation.car(self.car_idx)
-        neighbor = observation.nearest_opponent(self.car_idx, self.track.total_length)
-        if neighbor is None:
-            return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
-        try:
-            self.prepare_interaction_plan(
-                own_state=ego.state,
-                own_s=ego.s,
-                own_e=ego.e,
-                neighbor_state=neighbor.state,
-                neighbor_s=neighbor.s,
-                neighbor_e=neighbor.e,
-                sim_time=observation.sim_time,
-                neighbor_previous_control=neighbor.previous_action,
+            solution = self.solver(
+                x0=initial, lbx=lower_x, ubx=upper_x,
+                lbg=lower_g, ubg=upper_g, p=parameters,
             )
         except Exception as exc:
-            self._report_ibr_failure(exc, sim_time=observation.sim_time)
-            return CarAction(throttle=float(self.last_u[0]), steer=float(self.last_u[1]))
-        return self._last_ibr_action
+            self.last_diagnostics.update(
+                solve_seconds=time.perf_counter() - started, error=str(exc),
+            )
+            raise RuntimeError(f"IBR control solver error: {exc}") from exc
+        solve_seconds = time.perf_counter() - started
+        stats = self.solver.stats()
+        self.last_diagnostics.update(
+            status=str(stats.get("return_status", "unknown")),
+            solve_seconds=solve_seconds,
+            iterations=int(stats.get("iter_count", 0)),
+        )
+        if not stats.get("success", False):
+            # Record the returned iterate only as a diagnostic, not as a command.
+            try:
+                values = solution["x"].full().reshape(-1)
+                if np.isfinite(values).all():
+                    constraint_values = np.asarray(
+                        self.constraint_fn(values, parameters)
+                    ).reshape(-1)
+                    if np.isfinite(constraint_values).all():
+                        self.last_diagnostics["residual"] = float(max(
+                            np.max(np.maximum(lower_g - constraint_values, 0.0)),
+                            np.max(np.maximum(constraint_values - upper_g, 0.0)),
+                            np.max(np.maximum(lower_x - values, 0.0)),
+                            np.max(np.maximum(values - upper_x, 0.0)),
+                        ))
+            except Exception as exc:
+                self.last_diagnostics["residual_error"] = str(exc)
+            raise RuntimeError(self.last_diagnostics["status"])
+        values = solution["x"].full().reshape(-1)
+        if not np.isfinite(values).all():
+            self.last_diagnostics["status"] = "nonfinite_solution"
+            raise RuntimeError("IBR control solve returned nonfinite values")
+        constraint_values = np.asarray(
+            self.constraint_fn(values, parameters)
+        ).reshape(-1)
+        if not np.isfinite(constraint_values).all():
+            self.last_diagnostics["status"] = "nonfinite_constraints"
+            raise RuntimeError("IBR control solve returned nonfinite constraints")
+        residual = float(max(
+            np.max(np.maximum(lower_g - constraint_values, 0.0)),
+            np.max(np.maximum(constraint_values - upper_g, 0.0)),
+            np.max(np.maximum(lower_x - values, 0.0)),
+            np.max(np.maximum(values - upper_x, 0.0)),
+        ))
+        state_plan = values[:self.n_x].reshape(n + 1, 4).T
+        control_plan = values[self.n_x:self.n_x + self.n_u].reshape(n, 2).T
+        track_start_x = self.n_x + self.n_u
+        collision_start_x = track_start_x + self.n_track_slack
+        track_slack_plan = values[track_start_x:collision_start_x]
+        collision_slack_plan = values[
+            collision_start_x:collision_start_x + self.n_collision_slack
+        ].reshape(n, m).T
+        collision_values = constraint_values[
+            offsets["collision"]:offsets["steer_rate"]
+        ]
+        diagnostics = {
+            "success": True,
+            "status": str(stats.get("return_status", "Solve_Succeeded")),
+            "solve_seconds": solve_seconds,
+            "iterations": int(stats.get("iter_count", 0)),
+            "residual": residual,
+            "cost": float(solution["f"]),
+            "max_collision_constraint": (
+                float(np.max(collision_values)) if collision_values.size else np.nan
+            ),
+            "track_slack": track_slack_plan.copy(),
+            "collision_slack": collision_slack_plan.copy(),
+            "max_track_slack": float(np.max(track_slack_plan)),
+            "max_collision_slack": float(np.max(collision_slack_plan)),
+        }
+        self.last_diagnostics = diagnostics
+        return state_plan, control_plan, diagnostics
 
 
-# Backward-compatible public name used by existing scripts and imports.
-IteratedBestResponsePolicy = TrajectoryIBRPolicy
+class IteratedBestResponsePolicy(MPCPolicy):
+    """Run one private three-car IBR game and execute this car's first action."""
+
+    ibr_level = "round_robin"
+
+    def __init__(
+        self, *args, strategy_space="control", rounds=6, ibr_horizon=20,
+        parameter_search_points=3, parameter_search_passes=1,
+        convergence_tolerance=0.0, **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.strategy_space = str(strategy_space).strip().lower()
+        if self.strategy_space not in IBR_STRATEGY_SPACES:
+            raise ValueError(
+                f"Unknown IBR strategy space {strategy_space!r}; "
+                f"choose one of {IBR_STRATEGY_SPACES}"
+            )
+        if self.mpc.horizon != int(ibr_horizon):
+            raise ValueError("IBR requires the shared MPC horizon to match IBR_HORIZON")
+        self.round_robin = RoundRobinIBR(rounds, convergence_tolerance)
+        self.parameter_search_points = max(3, int(parameter_search_points))
+        self.parameter_search_passes = max(1, int(parameter_search_passes))
+        self.mode_presets = {
+            name: np.asarray(values, dtype=float).copy()
+            for name, values in sim_params.LLM_MODE_PRESETS.items()
+        }
+        self.control_solver = (
+            ControlBestResponseSolver(self.mpc, horizon=self.mpc.horizon, max_opponents=2)
+            if self.strategy_space == "control" else None
+        )
+        self.current_mode = f"ibr_{self.strategy_space}"
+        self.last_ibr_rounds = []
+        self.last_ibr_diagnostics = {}
+        self.last_joint_state_plans = None
+        self.last_joint_control_plans = None
+
+    def _initial_joint_plans(self, observation):
+        """Roll out shifted prior controls from each player's measured state.
+
+        The first control-space tick has no prior plan, so it repeats each
+        player's last executed action. Parameter and mode keep that initializer.
+        """
+        n = self.mpc.horizon
+        state_plans, control_plans = [], []
+        prior = self.last_joint_control_plans if self.strategy_space == "control" else None
+        if prior is not None:
+            assert prior.shape == (len(observation.cars), 2, n)
+            if not np.isfinite(prior).all():
+                raise RuntimeError("IBR warm-start controls contain nonfinite values")
+        for player_idx, car in enumerate(observation.cars):
+            state_plan = np.repeat(car.kinematic_state[:, None], n + 1, axis=1)
+            previous = np.asarray(car.previous_action, dtype=float).copy()
+            previous[0] = np.clip(previous[0], 0.0, 1.0)
+            previous[1] = np.clip(previous[1], -1.0, 1.0)
+            if prior is None:
+                control_plan = np.repeat(previous[:, None], n, axis=1)
+            else:
+                control_plan = np.column_stack((prior[player_idx, :, 1:], prior[player_idx, :, -1]))
+            for k in range(n):
+                curvature = float(self.mpc.curvature_fn(float(state_plan[0, k] % self.track.total_length)))
+                state_plan[:, k + 1] = kinematic_frenet_step(
+                    state_plan[:, k], control_plan[:, k], curvature,
+                    self.mpc.dt, self.mpc.p, curvature_mode="geometric",
+                )
+            state_plans.append(state_plan)
+            control_plans.append(control_plan)
+        return state_plans, control_plans
+
+    def _curvature_schedule(self, state_plan):
+        return np.asarray([
+            float(self.mpc.curvature_fn(float(s % self.track.total_length)))
+            for s in state_plan[0, :-1]
+        ])
+
+    def _paper_utility(self, observation, plans, player_idx):
+        start = np.asarray([car.s for car in observation.cars], dtype=float)
+        final = np.asarray([plan[0, -1] for plan in plans], dtype=float)
+        return float(relative_progress_gain(start, final, player_idx))
+
+    def _control_best_response(self, observation, player_idx, plans, controls):
+        opponent_indices = [idx for idx in range(len(plans)) if idx != player_idx]
+        state_plan, control_plan, diagnostics = self.control_solver.solve_best_response(
+            player_idx=player_idx,
+            x0=observation.car(player_idx).kinematic_state,
+            previous_control=observation.car(player_idx).previous_action,
+            warm_state_plan=plans[player_idx],
+            warm_control_plan=controls[player_idx],
+            opponent_plans=np.stack([plans[idx][:2] for idx in opponent_indices]),
+            curvature=self._curvature_schedule(plans[player_idx]),
+        )
+        candidate_plans = list(plans)
+        candidate_plans[player_idx] = state_plan
+        return BestResponseResult(
+            player_idx, state_plan, control_plan, control_plan[:, 0].copy(),
+            self._paper_utility(observation, candidate_plans, player_idx),
+            diagnostics=diagnostics,
+        )
+
+    def _opponent_records(self, observation, player_idx, plans):
+        records = []
+        for idx, car in enumerate(observation.cars):
+            if idx == player_idx:
+                continue
+            records.append({
+                "car_idx": idx, "px": car.s, "py": car.e,
+                "s_dot": car.s_dot, "vx": car.s_dot, "vy": car.vy_body,
+                "omega": car.omega, "psi": car.psi, "state": car.state,
+                "px_plan": plans[idx][0].copy(), "py_plan": plans[idx][1].copy(),
+            })
+        return records
+
+    def _evaluate_high_level_candidate(
+        self, observation, player_idx, plans, controls, candidate_params,
+    ):
+        """Map one theta candidate through the existing reference builder and MPC."""
+        car = observation.car(player_idx)
+        opponents = self._opponent_records(observation, player_idx, plans)
+        saved_params = self.params
+        saved_control_plan = self.mpc.last_control_plan
+        saved_state_plan = self.mpc.last_state_plan
+        try:
+            self.params = np.asarray(candidate_params, dtype=float).copy()
+            self.mpc.last_control_plan = controls[player_idx].copy()
+            self.mpc.last_state_plan = plans[player_idx].copy()
+            reference = self.get_reference_trajectory(
+                car.state, car.s, opponents=opponents, current_e=car.e
+            )
+            _, action = self.mpc.solve(
+                car.state.to_array(), reference, car.previous_action,
+                q_weight=float(self.params[0]), opponents=opponents,
+                current_s=car.s, frenet_state=car.kinematic_state,
+            )
+            state_plan = np.asarray(self.mpc.last_state_plan, dtype=float).copy()
+            control_plan = np.asarray(self.mpc.last_control_plan, dtype=float).copy()
+            diagnostics = dict(self.mpc.last_diagnostics)
+            diagnostics["track_slack"] = np.asarray(
+                self.mpc.last_track_slack_plan, dtype=float
+            ).copy()
+            diagnostics["collision_slack"] = np.asarray(
+                self.mpc.last_collision_slack_plan, dtype=float
+            ).copy()
+        finally:
+            self.params = saved_params
+            self.mpc.last_control_plan = saved_control_plan
+            self.mpc.last_state_plan = saved_state_plan
+        candidate_plans = list(plans)
+        candidate_plans[player_idx] = np.asarray(state_plan, dtype=float)
+        utility = self._paper_utility(observation, candidate_plans, player_idx)
+        return np.asarray(state_plan), control_plan, np.asarray(action), utility, diagnostics
+
+    def _parameter_candidates(self, center, search_pass, dimension):
+        bounds = np.asarray(ALPHA_PARAMETER_BOUNDS, dtype=float)
+        radius = (bounds[dimension, 1] - bounds[dimension, 0]) * 0.5 ** (search_pass + 1)
+        values = center[dimension] + np.linspace(-radius, radius, self.parameter_search_points)
+        return np.unique(np.clip(
+            np.r_[values, bounds[dimension, 0], center[dimension], bounds[dimension, 1]],
+            bounds[dimension, 0], bounds[dimension, 1],
+        ))
+
+    def _high_level_best_response(self, observation, player_idx, plans, controls, modeled):
+        """Solve one continuous-parameter or discrete-mode best response."""
+        candidate_count = 0
+        failed_count = 0
+        last_error = None
+        last_failure = None
+        best = None
+
+        def consider(params, mode=None):
+            nonlocal best, candidate_count, failed_count, last_error, last_failure
+            candidate_count += 1
+            prior_diagnostics = self.mpc.last_diagnostics
+            try:
+                result = self._evaluate_high_level_candidate(
+                    observation, player_idx, plans, controls, params
+                )
+            except Exception as exc:
+                failed_count += 1
+                last_error = str(exc)
+                diagnostics = self.mpc.last_diagnostics
+                last_failure = (
+                    dict(diagnostics)
+                    if diagnostics is not prior_diagnostics and not diagnostics.get("success")
+                    else {}
+                )
+                return
+            state_plan, control_plan, action, utility, diagnostics = result
+            if best is None or utility > best.utility:
+                best = BestResponseResult(
+                    player_idx, state_plan, control_plan, action, utility,
+                    params=np.asarray(params, dtype=float).copy(), mode=mode,
+                    diagnostics=diagnostics,
+                )
+
+        if self.strategy_space == "mode":
+            for mode, params in self.mode_presets.items():
+                consider(params, mode=mode)
+        else:
+            center = np.asarray(modeled[player_idx]["params"], dtype=float).copy()
+            consider(center)
+            for search_pass in range(self.parameter_search_passes):
+                for dimension in range(5):
+                    previous_best = best
+                    for value in self._parameter_candidates(center, search_pass, dimension):
+                        candidate = center.copy()
+                        candidate[dimension] = value
+                        consider(candidate)
+                    if best is not None and best is not previous_best:
+                        center = best.params.copy()
+
+        if best is None:
+            self._candidate_failure = {
+                **(last_failure or {}), "success": False,
+                "status": (last_failure or {}).get("status", "all_candidates_failed"),
+                "candidate_count": candidate_count,
+                "failed_candidate_count": failed_count,
+                "last_candidate_error": last_error,
+            }
+            raise RuntimeError("all IBR high-level candidates failed")
+        best.diagnostics = {
+            **best.diagnostics,
+            "candidate_count": candidate_count,
+            "failed_candidate_count": failed_count,
+        }
+        modeled[player_idx] = {"params": best.params.copy(), "mode": best.mode}
+        return best
+
+    def _modeled_high_level_state(self, observation):
+        bounds = np.asarray(ALPHA_PARAMETER_BOUNDS, dtype=float)
+        modeled = []
+        for car in observation.cars:
+            params = car.policy_params
+            if params is None or np.shape(params) != (5,):
+                params = sim_params.ALPHARACER_INITIAL_PARAMS
+            params = np.clip(np.asarray(params, dtype=float), bounds[:, 0], bounds[:, 1])
+            mode = min(
+                self.mode_presets,
+                key=lambda name: float(np.linalg.norm(self.mode_presets[name] - params)),
+            )
+            modeled.append({"params": params.copy(), "mode": mode})
+        return modeled
+
+    def get_action(self, observation) -> CarAction:
+        """Run all IBR rounds from the frozen scene and return this car's action."""
+        if self.car_idx is None:
+            raise ValueError("IBRPolicy requires car_idx")
+        if len(observation.cars) != 3:
+            raise ValueError("IBRPolicy currently requires exactly three cars")
+        initial_plans, initial_controls = self._initial_joint_plans(observation)
+        modeled = self._modeled_high_level_state(observation)
+
+        def solve_player(player_idx, plans, controls):
+            if self.strategy_space == "control":
+                return self._control_best_response(observation, player_idx, plans, controls)
+            return self._high_level_best_response(
+                observation, player_idx, plans, controls, modeled
+            )
+
+        self._candidate_failure = None
+        self.round_robin.current_round = None
+        self.round_robin.current_player = None
+        try:
+            result = self.round_robin.solve(
+                initial_plans, initial_controls, self.car_idx, solve_player
+            )
+        except RuntimeError as exc:
+            diagnostics = (
+                self.control_solver.last_diagnostics
+                if self.strategy_space == "control" else self._candidate_failure or {}
+            )
+            status = str(diagnostics.get("status", type(exc).__name__))
+            self.mpc.last_solver_success = False
+            self.mpc.last_solver_status = status
+            self.mpc.last_diagnostics = {
+                **diagnostics, "success": False, "status": status, "error": str(exc),
+                "ibr_round": self.round_robin.current_round,
+                "ibr_player_idx": self.round_robin.current_player,
+                "ibr_strategy_space": self.strategy_space,
+            }
+            self.last_ibr_diagnostics = dict(self.mpc.last_diagnostics)
+            self.last_ibr_rounds = []
+            self.last_joint_state_plans = None
+            self.last_joint_control_plans = None
+            self.predicted_frenet_plan = None
+            for name in ("last_state_plan", "last_control_plan",
+                         "last_track_slack_plan", "last_collision_slack_plan"):
+                setattr(self.mpc, name, None)
+            raise
+        own = result.player_results[self.car_idx]
+        if own.params is not None:
+            self.params = own.params.copy()
+        self.current_mode = own.mode or f"ibr_{self.strategy_space}"
+        self.predicted_frenet_plan = own.state_plan[:2].copy()
+        self.last_joint_state_plans = np.stack(result.plans)
+        self.last_joint_control_plans = np.stack(result.controls)
+        self.last_ibr_rounds = result.round_diagnostics
+        self.last_ibr_diagnostics = dict(own.diagnostics)
+        self.last_ibr_diagnostics.update({
+            "strategy_space": self.strategy_space,
+            "rounds_completed": len(result.round_diagnostics),
+            "paper_utility": own.utility,
+            "selected_params": None if own.params is None else own.params.copy(),
+            "selected_mode": own.mode,
+        })
+
+        action = np.asarray(own.action, dtype=float)
+        action[0] = np.clip(action[0], 0.0, 1.0)
+        action[1] = np.clip(action[1], -1.0, 1.0)
+        self.last_requested_action = action.copy()
+        self.last_u = action.copy()
+        self.mpc.last_solver_success = True
+        self.mpc.last_solver_status = str(own.diagnostics.get("status", "Solve_Succeeded"))
+        self.mpc.last_diagnostics = {
+            **{key: value for key, value in own.diagnostics.items()
+               if key not in ("track_slack", "collision_slack")},
+            "success": True,
+            "status": self.mpc.last_solver_status,
+            "slack": float(np.max(own.diagnostics["track_slack"])),
+            "collision_slack": float(np.max(own.diagnostics["collision_slack"])),
+        }
+        self.mpc.last_recovery_active = False
+        self.mpc.last_recovery_reason = ""
+        self.mpc.last_loss = float(own.diagnostics.get("cost", np.nan))
+        self.mpc.last_track_loss = np.nan
+        self.mpc.last_action_loss = np.nan
+        self.mpc.last_velocity_loss = np.nan
+        self.mpc.last_heading_loss = np.nan
+        track_slack = np.asarray(
+            own.diagnostics.get("track_slack", np.zeros(self.mpc.horizon)),
+            dtype=float,
+        ).copy()
+        collision_slack = np.asarray(
+            own.diagnostics.get(
+                "collision_slack",
+                np.zeros((self.mpc.max_constrained_opponents, self.mpc.horizon)),
+            ),
+            dtype=float,
+        ).copy()
+        self.mpc.last_track_slack_loss = float(
+            self.mpc.track_slack_weight * np.sum(track_slack ** 2)
+        )
+        self.mpc.last_collision_slack_loss = float(
+            self.mpc.collision_slack_weight * np.sum(collision_slack ** 2)
+        )
+        self.mpc.last_violation_loss = (
+            self.mpc.last_track_slack_loss + self.mpc.last_collision_slack_loss
+        )
+        self.mpc.last_state_plan = own.state_plan.copy()
+        self.mpc.last_control_plan = own.control_plan.copy()
+        self.mpc.last_track_slack_plan = track_slack
+        self.mpc.last_collision_slack_plan = collision_slack
+        return CarAction(throttle=float(action[0]), steer=float(action[1]))

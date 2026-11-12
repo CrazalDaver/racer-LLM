@@ -32,10 +32,7 @@ class AlphaRacerPolicy(MPCPolicy):
     def __init__(
         self,
         *args,
-        weight_path=(
-            "policy/alpharacer/train/weights/upstream/"
-            "potential_myopic_mpc.pth"
-        ),
+        weight_path="policy/alpharacer/train/weights/potential.pth",
         search_points=7,
         search_iters=6,
         opt_style="grad",

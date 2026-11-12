@@ -1,15 +1,13 @@
-"""Public IBR policy interface."""
+"""Public interface for the single configurable IBR policy."""
 
-from .mpc_parameter_ibr import (
-    ParameterIBRPolicy,
-)
 from .trajectory_ibr import (
+    IBR_STRATEGY_SPACES,
     IteratedBestResponsePolicy,
-    TrajectoryIBRPolicy,
+    RoundRobinIBR,
 )
 
 __all__ = [
     "IteratedBestResponsePolicy",
-    "ParameterIBRPolicy",
-    "TrajectoryIBRPolicy",
+    "IBR_STRATEGY_SPACES",
+    "RoundRobinIBR",
 ]
