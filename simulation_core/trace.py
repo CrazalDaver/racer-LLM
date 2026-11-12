@@ -423,6 +423,16 @@ def record_simulation_step(
         getattr(policy, "last_ibr_diagnostics", {}).get("candidate_count", 0)
         for policy in policies
     ])
+    trace["car_ibr_accepted_max_iter_count"].append([
+        getattr(policy, "last_ibr_diagnostics", {}).get(
+            "accepted_max_iter_count", 0
+        )
+        for policy in policies
+    ])
+    trace["car_ibr_max_br_residual"].append([
+        getattr(policy, "last_ibr_diagnostics", {}).get("max_br_residual", 0.0)
+        for policy in policies
+    ])
     trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
     trace["car_policy_decision_count"].append(
         [int(getattr(policy, "policy_decision_count", 0)) for policy in policies]
@@ -754,6 +764,12 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_ibr_candidate_count=np.asarray(
             trace.get("car_ibr_candidate_count", []), dtype=int
         ),
+        car_ibr_accepted_max_iter_count=np.asarray(
+            trace.get("car_ibr_accepted_max_iter_count", []), dtype=int
+        ),
+        car_ibr_max_br_residual=np.asarray(
+            trace.get("car_ibr_max_br_residual", []), dtype=float
+        ),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
         car_policy_basis=np.asarray(trace.get("car_policy_basis", []), dtype=str),
@@ -920,6 +936,7 @@ def save_simulation_trace(trace, track, params, output_path=None):
         ),
         mpc_friction_coefficient=np.asarray(params.MPC_FRICTION_COEFFICIENT),
         ibr_horizon=np.asarray(params.IBR_HORIZON),
+        ibr_initial_guess=np.asarray(params.IBR_INITIAL_GUESS),
         ibr_rounds=np.asarray(params.IBR_ROUNDS),
         ibr_strategy_space=np.asarray(
             trace.get("ibr_strategy_space", params.IBR_STRATEGY_SPACE)

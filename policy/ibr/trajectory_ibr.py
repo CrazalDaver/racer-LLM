@@ -1,8 +1,8 @@
 """One round-robin IBR policy with three interchangeable strategy spaces.
 
 The outer game is the same for every strategy space: starting from one frozen
-three-car observation, update one modeled player at a time for six complete
-rounds. Only a player's best-response variables change: ``control`` optimizes
+three-car observation, update one modeled player at a time for the configured
+number of complete rounds. Only a player's best-response variables change: ``control`` optimizes
 throttle/steering directly; ``parameter`` searches theta=(q,zeta,s1,s2,s3);
 and ``mode`` chooses an existing parameter preset. The latter two call the
 shared reference builder and MPC. This basic IBR does not implement SE-IBR.
@@ -87,6 +87,8 @@ class RoundRobinIBR:
             before = [plan.copy() for plan in plans]
             solve_seconds = 0.0
             utilities = {}
+            accepted_max_iter_count = 0
+            max_residual = 0.0
             for player_idx in order:
                 self.current_round = round_idx + 1
                 self.current_player = player_idx
@@ -99,6 +101,12 @@ class RoundRobinIBR:
                 controls[player_idx] = np.asarray(result.control_plan, dtype=float).copy()
                 latest[player_idx] = result
                 utilities[player_idx] = float(result.utility)
+                accepted_max_iter_count += int(
+                    bool(result.diagnostics.get("accepted_max_iter", False))
+                )
+                residual = result.diagnostics.get("residual")
+                if residual is not None and np.isfinite(residual):
+                    max_residual = max(max_residual, float(residual))
             max_change = max(
                 float(np.max(np.abs(plans[idx][:2] - before[idx][:2])))
                 for idx in range(player_count)
@@ -109,6 +117,8 @@ class RoundRobinIBR:
                 "max_plan_change": max_change,
                 "solve_seconds": solve_seconds,
                 "utilities": utilities,
+                "accepted_max_iter_count": accepted_max_iter_count,
+                "max_residual": max_residual,
             })
             if self.convergence_tolerance > 0.0 and max_change <= self.convergence_tolerance:
                 break
@@ -130,12 +140,15 @@ class ControlBestResponseSolver:
 
     _instance_counter = 0
 
-    def __init__(self, mpc, *, horizon, max_opponents):
+    def __init__(self, mpc, *, horizon, max_opponents, initial_guess_mode="release"):
         self.mpc = mpc
         self.p = mpc.p
         self.dt = float(mpc.dt)
         self.horizon = int(horizon)
         self.max_opponents = int(max_opponents)
+        self.initial_guess_mode = str(initial_guess_mode).strip().lower()
+        if self.initial_guess_mode not in {"release", "rollout"}:
+            raise ValueError("IBR initial guess must be 'release' or 'rollout'")
         self.track_half_width = float(mpc.track_constraint_half_width)
         self.longitudinal_separation = float(mpc.min_longitudinal_separation)
         self.lateral_separation = float(mpc.min_lateral_separation)
@@ -267,35 +280,40 @@ class ControlBestResponseSolver:
             raise ValueError("control BR warm plans have the wrong shape")
         if opponent_plans.shape != (m, 2, n + 1):
             raise ValueError("control BR requires one [s,e] plan per opponent")
-        control_guess[0] = np.clip(control_guess[0], 0.0, 1.0)
-        control_guess[1] = np.clip(control_guess[1], -1.0, 1.0)
-        # Keep the cached controls, but rebuild states for this BR's fixed
-        # curvature schedule. This is the same rollout-style warm start used by
-        # the main MPC and makes the dynamics equalities coherent at the seed.
-        state_guess[:, 0] = x0
-        for k in range(n):
-            state_guess[:, k + 1] = kinematic_frenet_step(
-                state_guess[:, k], control_guess[:, k], curvature[k],
-                self.dt, self.p, curvature_mode="geometric",
+        if self.initial_guess_mode == "release":
+            state_guess = np.repeat(x0[:, None], n + 1, axis=1)
+            control_guess = np.zeros((2, n))
+            track_slack_guess = np.zeros(n)
+            collision_slack_guess = np.zeros((m, n))
+        else:
+            control_guess[0] = np.clip(control_guess[0], 0.0, 1.0)
+            control_guess[1] = np.clip(control_guess[1], -1.0, 1.0)
+            # Keep the cached controls, but rebuild states for this BR's fixed
+            # curvature schedule, matching the main MPC warm-start pattern.
+            state_guess[:, 0] = x0
+            for k in range(n):
+                state_guess[:, k + 1] = kinematic_frenet_step(
+                    state_guess[:, k], control_guess[:, k], curvature[k],
+                    self.dt, self.p, curvature_mode="geometric",
+                )
+            if not np.isfinite(state_guess).all():
+                raise RuntimeError("IBR control warm-start rollout is nonfinite")
+            track_slack_guess = np.maximum(
+                np.abs(state_guess[1, 1:]) - self.track_half_width, 0.0
             )
-        if not np.isfinite(state_guess).all():
-            raise RuntimeError("IBR control warm-start rollout is nonfinite")
-        track_slack_guess = np.maximum(
-            np.abs(state_guess[1, 1:]) - self.track_half_width, 0.0
-        )
-        collision_slack_guess = np.zeros((m, n))
-        for opponent_idx in range(m):
-            ds = (
-                state_guess[0, 1:] - opponent_plans[opponent_idx, 0, 1:]
-            ) / self.longitudinal_separation
-            de = (
-                state_guess[1, 1:] - opponent_plans[opponent_idx, 1, 1:]
-            ) / self.lateral_separation
-            collision_slack_guess[opponent_idx] = np.maximum(
-                1.0 - ds ** self.collision_exponent
-                - de ** self.collision_exponent,
-                0.0,
-            )
+            collision_slack_guess = np.zeros((m, n))
+            for opponent_idx in range(m):
+                ds = (
+                    state_guess[0, 1:] - opponent_plans[opponent_idx, 0, 1:]
+                ) / self.longitudinal_separation
+                de = (
+                    state_guess[1, 1:] - opponent_plans[opponent_idx, 1, 1:]
+                ) / self.lateral_separation
+                collision_slack_guess[opponent_idx] = np.maximum(
+                    1.0 - ds ** self.collision_exponent
+                    - de ** self.collision_exponent,
+                    0.0,
+                )
         initial = np.concatenate((
             state_guess.T.reshape(-1), control_guess.T.reshape(-1),
             track_slack_guess, collision_slack_guess.T.reshape(-1),
@@ -356,24 +374,6 @@ class ControlBestResponseSolver:
             solve_seconds=solve_seconds,
             iterations=int(stats.get("iter_count", 0)),
         )
-        if not stats.get("success", False):
-            # Record the returned iterate only as a diagnostic, not as a command.
-            try:
-                values = solution["x"].full().reshape(-1)
-                if np.isfinite(values).all():
-                    constraint_values = np.asarray(
-                        self.constraint_fn(values, parameters)
-                    ).reshape(-1)
-                    if np.isfinite(constraint_values).all():
-                        self.last_diagnostics["residual"] = float(max(
-                            np.max(np.maximum(lower_g - constraint_values, 0.0)),
-                            np.max(np.maximum(constraint_values - upper_g, 0.0)),
-                            np.max(np.maximum(lower_x - values, 0.0)),
-                            np.max(np.maximum(values - upper_x, 0.0)),
-                        ))
-            except Exception as exc:
-                self.last_diagnostics["residual_error"] = str(exc)
-            raise RuntimeError(self.last_diagnostics["status"])
         values = solution["x"].full().reshape(-1)
         if not np.isfinite(values).all():
             self.last_diagnostics["status"] = "nonfinite_solution"
@@ -390,6 +390,14 @@ class ControlBestResponseSolver:
             np.max(np.maximum(lower_x - values, 0.0)),
             np.max(np.maximum(values - upper_x, 0.0)),
         ))
+        solver_success = bool(stats.get("success", False))
+        accepted_max_iter = (
+            not solver_success
+            and self.last_diagnostics["status"] == "Maximum_Iterations_Exceeded"
+        )
+        if not solver_success and not accepted_max_iter:
+            self.last_diagnostics["residual"] = residual
+            raise RuntimeError(self.last_diagnostics["status"])
         state_plan = values[:self.n_x].reshape(n + 1, 4).T
         control_plan = values[self.n_x:self.n_x + self.n_u].reshape(n, 2).T
         track_start_x = self.n_x + self.n_u
@@ -404,6 +412,9 @@ class ControlBestResponseSolver:
         diagnostics = {
             "success": True,
             "status": str(stats.get("return_status", "Solve_Succeeded")),
+            "solver_success": solver_success,
+            "accepted_max_iter": accepted_max_iter,
+            "initial_guess_mode": self.initial_guess_mode,
             "solve_seconds": solve_seconds,
             "iterations": int(stats.get("iter_count", 0)),
             "residual": residual,
@@ -426,7 +437,8 @@ class IteratedBestResponsePolicy(MPCPolicy):
     ibr_level = "round_robin"
 
     def __init__(
-        self, *args, strategy_space="control", rounds=6, ibr_horizon=20,
+        self, *args, strategy_space="control", rounds=3, ibr_horizon=10,
+        initial_guess_mode="release",
         parameter_search_points=3, parameter_search_passes=1,
         convergence_tolerance=0.0, **kwargs,
     ):
@@ -447,7 +459,10 @@ class IteratedBestResponsePolicy(MPCPolicy):
             for name, values in sim_params.LLM_MODE_PRESETS.items()
         }
         self.control_solver = (
-            ControlBestResponseSolver(self.mpc, horizon=self.mpc.horizon, max_opponents=2)
+            ControlBestResponseSolver(
+                self.mpc, horizon=self.mpc.horizon, max_opponents=2,
+                initial_guess_mode=initial_guess_mode,
+            )
             if self.strategy_space == "control" else None
         )
         self.current_mode = f"ibr_{self.strategy_space}"
@@ -722,6 +737,12 @@ class IteratedBestResponsePolicy(MPCPolicy):
             "paper_utility": own.utility,
             "selected_params": None if own.params is None else own.params.copy(),
             "selected_mode": own.mode,
+            "accepted_max_iter_count": sum(
+                item["accepted_max_iter_count"] for item in result.round_diagnostics
+            ),
+            "max_br_residual": max(
+                item["max_residual"] for item in result.round_diagnostics
+            ),
         })
 
         action = np.asarray(own.action, dtype=float)

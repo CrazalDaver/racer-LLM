@@ -173,6 +173,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                 if ibr_strategy_space is None
                 else ibr_strategy_space
             ),
+            initial_guess_mode=params.IBR_INITIAL_GUESS,
             rounds=params.IBR_ROUNDS,
             ibr_horizon=params.IBR_HORIZON,
             parameter_search_points=params.IBR_PARAMETER_SEARCH_POINTS,

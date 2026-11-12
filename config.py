@@ -392,11 +392,12 @@ class SimParams:
     # ==================== ITERATED BEST RESPONSE ===============
 
     # One round-robin IBR supports direct controls, continuous five-parameter
-    # policies, or the shared discrete mode presets. Paper settings are 20
-    # steps of 0.1 s and six complete three-player rounds.
+    # policies, or the shared discrete mode presets. The runnable release uses
+    # ten 0.1 s steps and three alternating solves; keep that tractable scale.
     IBR_STRATEGY_SPACE = "control"  # "control", "parameter", or "mode"
-    IBR_HORIZON = 20
-    IBR_ROUNDS = 6
+    IBR_INITIAL_GUESS = "release"  # "release" or dynamics-consistent "rollout"
+    IBR_HORIZON = 10
+    IBR_ROUNDS = 3
     # Control BR follows the release's progress, lateral, heading and effort
     # weights. The five-parameter and mode BRs use relative progress directly.
     IBR_PROGRESS_WEIGHT = 10.0
@@ -405,7 +406,7 @@ class SimParams:
     IBR_SPEED_WEIGHT = 0.0
     IBR_CONTROL_WEIGHT = 1.0
     IBR_CONTROL_RATE_WEIGHT = 0.0
-    IBR_CONVERGENCE_TOLERANCE = 0.0  # Run all six paper rounds by default.
+    IBR_CONVERGENCE_TOLERANCE = 0.0  # Run all three release solves.
     IBR_PARAMETER_SEARCH_POINTS = 3
     IBR_PARAMETER_SEARCH_PASSES = 1
 
