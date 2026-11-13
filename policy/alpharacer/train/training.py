@@ -440,15 +440,18 @@ def collect_rollout_data(args, _chain=None, _attempt_budget=None):
     if args.data.exists() and not args.force_rollouts:
         with np.load(args.data, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata"]))
+            if (metadata.get("reward_definition") != REWARD_DEFINITION
+                    or metadata.get("format_version") != DATA_FORMAT_VERSION
+                    or metadata.get("collection_settings") != settings):
+                raise ValueError(
+                    "Rollout settings or format changed; use --force-rollouts "
+                    "to rebuild data and models"
+                )
             count = sum(metadata["split_counts"].values())
             if data["features"].ndim != 3 or data["features"].shape[0] != count or data["features"].shape[-1] != ALPHA_INPUT_SIZE:
                 raise ValueError("Rollout features have an unexpected shape")
             if data["returns"].shape != data["own_returns"].shape or data["returns"].shape != (*data["features"].shape[:2], 3):
                 raise ValueError("Rollout targets have an unexpected shape")
-        if (metadata.get("reward_definition") != REWARD_DEFINITION
-                or metadata.get("format_version") != DATA_FORMAT_VERSION
-                or metadata.get("collection_settings") != settings):
-            raise ValueError("Rollout settings or format changed; use --force-rollouts to rebuild data and models")
         print(f"[stage 1/4] Reusing rollout data: {args.data}")
         return args.data
 

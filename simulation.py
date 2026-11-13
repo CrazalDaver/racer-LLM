@@ -286,9 +286,6 @@ class Race:
                     ),
                     oracle_commitment_seconds=self.oracle_commitment_seconds,
                     self_play_rl_model_path=config.rl_model_path,
-                    self_play_rl_backend=config.rl_backend,
-                    self_play_rl_strict_load=config.rl_strict_load,
-                    self_play_rl_action_order=config.rl_action_order,
                 )
             )
             self.vehicle_models.append(

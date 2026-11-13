@@ -65,8 +65,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   llm_include_current_parameters=None,
                   llm_include_decision_feedback=None,
                   oracle_commitment_seconds=None,
-                  self_play_rl_model_path=None, self_play_rl_backend=None,
-                  self_play_rl_strict_load=None, self_play_rl_action_order=None):
+                  self_play_rl_model_path=None):
     """Construct one policy from canonical identity plus relevant overrides."""
     policy_type = validate_policy_name(policy_type)
     common = dict(car_idx=car_idx, policy_name=policy_type)
@@ -159,7 +158,18 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
     if policy_type == "mode_alpharacer":
         return ModeAlphaRacerPolicy(track, mpc, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, weight_path=params.ALPHARACER_WEIGHT_PATH if alpharacer_weight_path is None else alpharacer_weight_path, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, initial_params=params.ALPHARACER_INITIAL_PARAMS, **common)
     if policy_type == "self_play_rl":
-        return SelfPlayRLPolicy(track, mpc, params=np.asarray(params.STATIC_POLICY_PARAMS if alpharacer_params is None else alpharacer_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, model_path=params.SELF_PLAY_RL_MODEL_PATH if self_play_rl_model_path is None else self_play_rl_model_path, backend=params.SELF_PLAY_RL_BACKEND if self_play_rl_backend is None else self_play_rl_backend, strict_load=params.SELF_PLAY_RL_STRICT_LOAD if self_play_rl_strict_load is None else self_play_rl_strict_load, action_order=params.SELF_PLAY_RL_ACTION_ORDER if self_play_rl_action_order is None else self_play_rl_action_order, throttle_bounds=params.SELF_PLAY_RL_THROTTLE_BOUNDS, steer_bounds=params.SELF_PLAY_RL_STEER_BOUNDS, **common)
+        return SelfPlayRLPolicy(
+            track,
+            mpc,
+            raceline=raceline,
+            max_speed=params.MAX_RACELINE_SPEED,
+            model_path=(
+                params.SELF_PLAY_RL_MODEL_PATH
+                if self_play_rl_model_path is None
+                else self_play_rl_model_path
+            ),
+            **common,
+        )
     if policy_type == "ibr":
         return IteratedBestResponsePolicy(
             track,
@@ -174,11 +184,8 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                 else ibr_strategy_space
             ),
             initial_guess_mode=params.IBR_INITIAL_GUESS,
-            rounds=params.IBR_ROUNDS,
+            n_rounds=params.IBR_ROUNDS,
             ibr_horizon=params.IBR_HORIZON,
-            parameter_search_points=params.IBR_PARAMETER_SEARCH_POINTS,
-            parameter_search_passes=params.IBR_PARAMETER_SEARCH_PASSES,
-            convergence_tolerance=params.IBR_CONVERGENCE_TOLERANCE,
             **common,
         )
     raise ValueError(f"Unknown policy type: {policy_type}")

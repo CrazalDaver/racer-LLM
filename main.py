@@ -792,9 +792,6 @@ def _add_sim_args(parser):
         help="Variables changed by each best response (default: control).",
     )
     group.add_argument("--rl-model-path", default=None)
-    group.add_argument("--rl-backend", choices=["auto", "npz", "json", "npy", "sb3", "ppo"], default=None)
-    group.add_argument("--rl-strict-load", action="store_true")
-    group.add_argument("--rl-action-order", choices=["throttle_steer", "steer_throttle"], default=None)
 
 
 def _add_output_args(parser):
@@ -884,9 +881,6 @@ def _sweep_kwargs_from_args(args):
         "llm_temperatures": args.llm_temperatures,
         "show_plot": args.show_plot,
         "rl_model_path": args.rl_model_path,
-        "rl_backend": args.rl_backend,
-        "rl_strict_load": args.rl_strict_load or None,
-        "rl_action_order": args.rl_action_order,
     }
 
 

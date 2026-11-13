@@ -382,20 +382,17 @@ class SimParams:
     # ==================== SELF-PLAY RL =========================
 
     # Created by: python -m policy.self_play_rl.train
-    SELF_PLAY_RL_MODEL_PATH = "policy/self_play_rl/weights/self_play_rl_policy.zip"
-    SELF_PLAY_RL_BACKEND = "sb3"  # Paper-compatible Stable-Baselines3 PPO checkpoint.
-    SELF_PLAY_RL_STRICT_LOAD = True  # Do not silently replace a missing trained PPO with the heuristic fallback.
-    SELF_PLAY_RL_ACTION_ORDER = "throttle_steer"  # use "steer_throttle" for exported policies with reversed outputs
-    SELF_PLAY_RL_THROTTLE_BOUNDS = np.array([0.0, 1.0])
-    SELF_PLAY_RL_STEER_BOUNDS = np.array([-1.0, 1.0])
+    SELF_PLAY_RL_MODEL_PATH = "policy/self_play_rl/weights/self_play_rl_policy.pth"
 
     # ==================== ITERATED BEST RESPONSE ===============
 
-    # One round-robin IBR supports direct controls, continuous five-parameter
-    # policies, or the shared discrete mode presets. Use the paper's two-second
-    # horizon and six complete three-player rounds by default.
+    # One nearest-opponent IBR supports direct controls, continuous five-parameter
+    # policies, or the shared discrete mode presets. Each of the paper's six
+    # rounds updates the selected opponent once and then the ego once.
     IBR_STRATEGY_SPACE = "control"  # "control", "parameter", or "mode"
-    IBR_INITIAL_GUESS = "release"  # "release" or dynamics-consistent "rollout"
+    # A neutral, dynamics-consistent seed avoids repeatedly spending 500 IPOPT
+    # iterations recovering from the release's flat-state/zero-control guess.
+    IBR_INITIAL_GUESS = "neutral"  # alternatives: "release" or cached "rollout"
     IBR_HORIZON = 20
     IBR_ROUNDS = 6
     # Control BR follows the release's progress, lateral, heading and effort
@@ -406,9 +403,10 @@ class SimParams:
     IBR_SPEED_WEIGHT = 0.0
     IBR_CONTROL_WEIGHT = 1.0
     IBR_CONTROL_RATE_WEIGHT = 0.0
-    IBR_CONVERGENCE_TOLERANCE = 0.0  # Run all six paper rounds.
-    IBR_PARAMETER_SEARCH_POINTS = 3
-    IBR_PARAMETER_SEARCH_PASSES = 1
+    # Five-parameter BR estimates all normalized partial derivatives around the
+    # same center, then evaluates one projected joint-ascent step.
+    IBR_PARAMETER_DIFFERENCE_STEP = 0.10
+    IBR_PARAMETER_GRADIENT_STEP = 0.25
 
 
 params = SimParams()

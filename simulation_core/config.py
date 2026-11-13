@@ -107,9 +107,6 @@ class SimulationConfig:
 
     # Self-play RL
     rl_model_path: str | None = None
-    rl_backend: str | None = None
-    rl_strict_load: bool | None = None
-    rl_action_order: str | None = None
 
     # Output
     save_trace: bool = True

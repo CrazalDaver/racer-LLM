@@ -2,7 +2,6 @@ from .alpharacer import AlphaRacerPolicy, ModeAlphaRacerPolicy
 from .ibr import (
     IBR_STRATEGY_SPACES,
     IteratedBestResponsePolicy,
-    RoundRobinIBR,
 )
 from .llm import (
     LLMAlphaRacerPolicy,
@@ -31,7 +30,6 @@ __all__ = [
     "CenterLinePolicy",
     "IteratedBestResponsePolicy",
     "IBR_STRATEGY_SPACES",
-    "RoundRobinIBR",
     "FixedModePolicy",
     "LLMAlphaRacerPolicy",
     "LLMModeAlphaRacerPolicy",

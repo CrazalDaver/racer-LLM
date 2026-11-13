@@ -177,8 +177,9 @@ def create_simulation_trace(
         "track_slack_weight": mpc_track_slack_weight,
         "collision_slack_weight": mpc_collision_slack_weight,
         "ibr_rounds": params.IBR_ROUNDS,
-        "ibr_parameter_search_points": params.IBR_PARAMETER_SEARCH_POINTS,
-        "ibr_parameter_search_passes": params.IBR_PARAMETER_SEARCH_PASSES,
+        "ibr_parameter_optimizer": "finite_difference",
+        "ibr_parameter_difference_step": params.IBR_PARAMETER_DIFFERENCE_STEP,
+        "ibr_parameter_gradient_step": params.IBR_PARAMETER_GRADIENT_STEP,
     })
     return trace
 
@@ -411,12 +412,20 @@ def record_simulation_step(
     trace["car_policy_params"].append(
         [getattr(policy, "params", np.full(5, np.nan)).copy() for policy in policies]
     )
-    trace["car_ibr_paper_utility"].append([
-        getattr(policy, "last_ibr_diagnostics", {}).get("paper_utility", np.nan)
+    trace["car_ibr_utility"].append([
+        getattr(policy, "last_ibr_diagnostics", {}).get("utility", np.nan)
         for policy in policies
     ])
     trace["car_ibr_rounds_completed"].append([
         getattr(policy, "last_ibr_diagnostics", {}).get("rounds_completed", 0)
+        for policy in policies
+    ])
+    trace["car_ibr_br_solve_count"].append([
+        getattr(policy, "last_ibr_diagnostics", {}).get("br_solve_count", 0)
+        for policy in policies
+    ])
+    trace["car_ibr_selected_opponent_idx"].append([
+        getattr(policy, "last_ibr_diagnostics", {}).get("selected_opponent_idx", -1)
         for policy in policies
     ])
     trace["car_ibr_candidate_count"].append([
@@ -755,11 +764,17 @@ def save_simulation_trace(trace, track, params, output_path=None):
             trace.get("car_policy_decision_count", []), dtype=int
         ),
         car_policy_params=np.asarray(trace.get("car_policy_params", []), dtype=float),
-        car_ibr_paper_utility=np.asarray(
-            trace.get("car_ibr_paper_utility", []), dtype=float
+        car_ibr_utility=np.asarray(
+            trace.get("car_ibr_utility", []), dtype=float
         ),
         car_ibr_rounds_completed=np.asarray(
             trace.get("car_ibr_rounds_completed", []), dtype=int
+        ),
+        car_ibr_br_solve_count=np.asarray(
+            trace.get("car_ibr_br_solve_count", []), dtype=int
+        ),
+        car_ibr_selected_opponent_idx=np.asarray(
+            trace.get("car_ibr_selected_opponent_idx", []), dtype=int
         ),
         car_ibr_candidate_count=np.asarray(
             trace.get("car_ibr_candidate_count", []), dtype=int
@@ -949,9 +964,15 @@ def save_simulation_trace(trace, track, params, output_path=None):
         ),
         ibr_control_weight=np.asarray(params.IBR_CONTROL_WEIGHT),
         ibr_control_rate_weight=np.asarray(params.IBR_CONTROL_RATE_WEIGHT),
-        ibr_convergence_tolerance=np.asarray(params.IBR_CONVERGENCE_TOLERANCE),
-        ibr_parameter_search_points=np.asarray(params.IBR_PARAMETER_SEARCH_POINTS),
-        ibr_parameter_search_passes=np.asarray(params.IBR_PARAMETER_SEARCH_PASSES),
+        ibr_parameter_optimizer=np.asarray(
+            trace.get("ibr_parameter_optimizer", "finite_difference")
+        ),
+        ibr_parameter_difference_step=np.asarray(
+            params.IBR_PARAMETER_DIFFERENCE_STEP
+        ),
+        ibr_parameter_gradient_step=np.asarray(
+            params.IBR_PARAMETER_GRADIENT_STEP
+        ),
         llm_update_interval_seconds=np.asarray(
             trace.get("llm_update_interval_seconds", params.LLM_UPDATE_INTERVAL_SECONDS)
         ),

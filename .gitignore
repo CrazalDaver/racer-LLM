@@ -22,3 +22,4 @@ __pycache__/
 /policy/alpharacer/train/data/
 /policy/alpharacer/train/weights/*
 !/policy/alpharacer/train/weights/upstream/
+!/policy/alpharacer/train/weights/potential.pth
