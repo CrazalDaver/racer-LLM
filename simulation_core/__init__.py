@@ -5,6 +5,11 @@ keeps construction, observations, environment mechanics, and recording
 together without crowding the repository root.
 """
 
-from .config import LLM_OBSERVATION_VARIANTS, SimulationConfig
+from .config import DynamicParams, GRAVITY, LLM_OBSERVATION_VARIANTS, SimulationConfig
 
-__all__ = ["LLM_OBSERVATION_VARIANTS", "SimulationConfig"]
+__all__ = [
+    "DynamicParams",
+    "GRAVITY",
+    "LLM_OBSERVATION_VARIANTS",
+    "SimulationConfig",
+]

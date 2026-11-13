@@ -3,7 +3,7 @@ import math
 import casadi as cs
 import numpy as np
 
-from config import GRAVITY
+from simulation_core.config import GRAVITY
 from track.track import frenet_denominator
 
 

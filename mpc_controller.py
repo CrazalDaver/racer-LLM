@@ -11,7 +11,8 @@ and input-change objective of alpha-RACER Eq.(1), the default local problem is:
     p_k = [s_k, e_k]; u_(-1) is the previous executed command.
 """
 
-from config import GRAVITY
+from config import MPCSettings
+from simulation_core.config import GRAVITY
 from vehicle_model import kinematic_frenet_step
 
 import time
@@ -23,7 +24,7 @@ def wrap_angle(angle):
     return np.arctan2(np.sin(angle), np.cos(angle))
 
 
-class MPCController:
+class ReferenceTrajectoryMPC:
     """
     Shared four-state Frenet kinematic MPC tracker.
 
@@ -40,63 +41,39 @@ class MPCController:
 
     _instance_counter = 0
 
-    def __init__(
-        self,
-        dt,
-        horizon,
-        Q,
-        R,
-        max_vel_rate,
-        max_steer_delta,
-        db_params,
-        track_width,
-        track_boundary_slack=0.0,
-        track_constraint_half_width=None,
-        max_state_speed=5.0,
-        min_state_speed=0.0,
-        velocity_track_weight=0.0,
-        heading_track_weight=0.0,
-        track_length=None,
-        min_longitudinal_separation=0.36,
-        min_lateral_separation=0.20,
-        max_constrained_opponents=2,
-        collision_superellipse_exponent=4,
-        enforce_track_boundary=True,
-        enforce_collision_avoidance=True,
-        track_slack_weight=1.0e3,
-        collision_slack_weight=1.0e4,
-        enforce_friction_speed_limit=True,
-        friction_coefficient=1.6,
-        track=None,
-    ):
-        self.dt = dt
-        self.horizon = horizon
-        self.Q = Q[:2, :2] if Q.shape[0] > 2 else Q
-        self.R = R
-        self.max_vel_rate = max_vel_rate
-        self.max_steer_delta = max_steer_delta
-        self.p = db_params
-        self.track_half_width = track_width / 2.0
-        if track_constraint_half_width is None:
-            self.track_constraint_half_width = self.track_half_width + float(track_boundary_slack)
-        else:
-            self.track_constraint_half_width = float(track_constraint_half_width)
+    def __init__(self, settings: MPCSettings, track):
+        self.settings = settings
+        self.dt = settings.dt
+        self.horizon = settings.horizon
+        self.Q = settings.Q[:2, :2] if settings.Q.shape[0] > 2 else settings.Q
+        self.R = settings.R
+        self.max_vel_rate = settings.max_vel_rate
+        self.max_steer_delta = settings.max_steer_delta
+        self.p = settings.dynamics_params
+        self.track_half_width = settings.track_width / 2.0
+        self.track_constraint_half_width = settings.track_constraint_half_width
         self.track_boundary_slack = self.track_constraint_half_width - self.track_half_width
-        self.max_speed = max_state_speed
-        self.min_speed = float(min_state_speed)
-        self.velocity_track_weight = velocity_track_weight
-        self.heading_track_weight = heading_track_weight
-        self.track_length = None if track_length is None else float(track_length)
-        self.min_longitudinal_separation = float(min_longitudinal_separation)
-        self.min_lateral_separation = float(min_lateral_separation)
-        self.max_constrained_opponents = max(0, int(max_constrained_opponents))
-        self.collision_superellipse_exponent = int(collision_superellipse_exponent)
-        self.enforce_track_boundary = bool(enforce_track_boundary)
-        self.enforce_collision_avoidance = bool(enforce_collision_avoidance)
-        self.track_slack_weight = float(track_slack_weight)
-        self.collision_slack_weight = float(collision_slack_weight)
-        self.enforce_friction_speed_limit = bool(enforce_friction_speed_limit)
-        self.friction_coefficient = float(friction_coefficient)
+        self.max_speed = settings.max_state_speed
+        self.min_speed = settings.min_state_speed
+        self.velocity_track_weight = settings.velocity_track_weight
+        self.heading_track_weight = settings.heading_track_weight
+        self.track_length = settings.track_length
+        self.min_longitudinal_separation = settings.min_longitudinal_separation
+        self.min_lateral_separation = settings.min_lateral_separation
+        self.max_constrained_opponents = max(
+            0, settings.max_constrained_opponents
+        )
+        self.collision_superellipse_exponent = (
+            settings.collision_superellipse_exponent
+        )
+        self.enforce_track_boundary = settings.enforce_track_boundary
+        self.enforce_collision_avoidance = settings.enforce_collision_avoidance
+        self.track_slack_weight = settings.track_slack_weight
+        self.collision_slack_weight = settings.collision_slack_weight
+        self.enforce_friction_speed_limit = (
+            settings.enforce_friction_speed_limit
+        )
+        self.friction_coefficient = settings.friction_coefficient
 
         if track is None:
             raise ValueError("Frenet MPC requires the project Track instance")
@@ -151,8 +128,8 @@ class MPCController:
         extended_curvature = np.concatenate((
             curvature[:-1], curvature, curvature[1:],
         ))
-        instance_id = MPCController._instance_counter
-        MPCController._instance_counter += 1
+        instance_id = ReferenceTrajectoryMPC._instance_counter
+        ReferenceTrajectoryMPC._instance_counter += 1
         self._curvature_grid = extended_s
         self._curvature_values = extended_curvature
         self.curvature_fn = cs.interpolant(

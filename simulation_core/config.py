@@ -1,10 +1,93 @@
-"""Simple, flat configuration for one simulation run."""
+"""Low-level vehicle parameters and user inputs for one simulation run."""
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Sequence
+
+
+GRAVITY = 9.81
+
+
+class DynamicParams:
+    """Physical and actuator parameters for one vehicle model."""
+
+    def __init__(self, vehicle_model_type="dbm"):
+        model_type = vehicle_model_type.lower()
+
+        # Geometry and mass
+        self.LF: float = 0.11
+        self.LR: float = 0.23
+        self.MASS: float = 4.65
+        self.Iz: float = 0.1
+
+        # Integration and tire model
+        self.DT: float = 0.05
+        self.K_RFY: float = 20.0
+        self.K_FFY: float = 20.0
+        self.mu: float = 3.0
+        self.Cf: float = 1.0
+        self.Cr: float = 1.0
+        self.Bf: float = 60.0
+        self.Br: float = 60.0
+        self.hcom: float = 0.0
+        self.fr: float = 0.1
+
+        # Throttle and steering actuators
+        self.Ta: float = 5.5
+        self.Tb: float = -1.0
+        self.Sa: float = 0.36
+        self.Sb: float = 0.03
+        self.delay: int = 4
+        self.ros_kinematic = False
+
+        if model_type in {"kinematic", "kinetic", "kinetics"}:
+            self._use_kinematic_baseline()
+        elif model_type == "dbm":
+            self._use_upstream_numerical_dbm()
+        else:
+            raise ValueError(f"Unknown vehicle model: {vehicle_model_type}")
+
+    def _use_upstream_numerical_dbm(self):
+        """Match alpha-RACER's numerical-race DBM instantiation.
+
+        The release overrides the model defaults with Sa=.34, Sb=0, Ta=20,
+        Tb=0, mu=.5, and delay=1. The local simulator then integrates this
+        plant at SIM_DT rather than the release's .1 s numerical step.
+        """
+        self.LF = 0.11
+        self.LR = 0.23
+        self.MASS = 4.65
+        self.Iz = 0.1
+        self.Ta = 20.0
+        self.Tb = 0.0
+        self.Sa = 0.34
+        self.Sb = 0.0
+        self.mu = 0.5
+        self.Cf = 1.0
+        self.Cr = 1.0
+        self.Bf = 60.0
+        self.Br = 60.0
+        self.hcom = 0.0
+        self.fr = 0.1
+        self.delay = 1
+
+    def _use_kinematic_baseline(self):
+        # The released ROS MPC predictor uses Sa=.34. Earlier local revisions
+        # used Sa=.80 as a raceline-tracking workaround.
+        self.LF = 0.11
+        self.LR = 0.23
+        self.Sa = 0.34
+        self.Sb = 0.0
+        self.Ta = 20.0 / 4.65
+        self.Tb = 0.0
+        self.fr = 1.0
+        self.ros_kinematic = True
+
+    def copy(self):
+        return copy.copy(self)
 
 
 PolicyName = Literal[

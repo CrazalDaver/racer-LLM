@@ -1,17 +1,16 @@
-"""Repository-wide defaults and vehicle parameter presets.
+"""Repository-wide experiment, policy, and MPC defaults.
 
 Runtime overrides belong in ``simulation_core.config.SimulationConfig``.
-This module contains shared defaults used when an override is absent.
+Low-level vehicle parameters live with the simulator in ``simulation_core``.
 """
 
-import copy
 from pathlib import Path
 from dataclasses import dataclass
 
 import numpy as np
 
+from simulation_core.config import DynamicParams, GRAVITY
 
-GRAVITY = 9.81
 
 # Canonical high-level policy coordinates used throughout this repository.
 # They match the alpha-RACER paper: theta=(q, zeta, s1, s2, s3).
@@ -43,6 +42,36 @@ class TrackConfig:
         return TRACK_DIR / "csv" / self.csv_name
 
 
+@dataclass(frozen=True)
+class MPCSettings:
+    """Resolved numerical contract shared by both MPC formulations."""
+
+    dt: float
+    horizon: int
+    Q: np.ndarray
+    R: np.ndarray
+    max_vel_rate: float
+    max_steer_delta: float
+    dynamics_params: DynamicParams
+    track_width: float
+    track_constraint_half_width: float
+    max_state_speed: float
+    min_state_speed: float
+    velocity_track_weight: float
+    heading_track_weight: float
+    track_length: float
+    min_longitudinal_separation: float
+    min_lateral_separation: float
+    max_constrained_opponents: int
+    collision_superellipse_exponent: int
+    enforce_track_boundary: bool
+    enforce_collision_avoidance: bool
+    track_slack_weight: float
+    collision_slack_weight: float
+    enforce_friction_speed_limit: bool
+    friction_coefficient: float
+
+
 # Original centerline assets and their original simulator scale/width.
 TRACKS = {
     "berlin": TrackConfig("berlin_2018.csv", 2.0, 0.44),
@@ -50,88 +79,6 @@ TRACKS = {
     "rounded_rectangle": TrackConfig("rounded_rectangle.csv", 1.0, 0.50),
 }
 
-
-
-class DynamicParams:
-    """Physical and actuator parameters for one vehicle model."""
-
-    def __init__(self, vehicle_model_type="dbm"):
-        model_type = vehicle_model_type.lower()
-
-        # Geometry and mass
-        self.LF: float = 0.11
-        self.LR: float = 0.23
-        self.MASS: float = 4.65
-        self.Iz: float = 0.1
-
-        # Integration and tire model
-        self.DT: float = 0.05
-        self.K_RFY: float = 20.0
-        self.K_FFY: float = 20.0
-        self.mu: float = 3.0
-        self.Cf: float = 1.0
-        self.Cr: float = 1.0
-        self.Bf: float = 60.0
-        self.Br: float = 60.0
-        self.hcom: float = 0.0
-        self.fr: float = 0.1
-
-        # Throttle and steering actuators
-        self.Ta: float = 5.5
-        self.Tb: float = -1.0
-        self.Sa: float = 0.36
-        self.Sb: float = 0.03
-        self.delay: int = 4
-        self.ros_kinematic = False
-
-        if model_type in {"kinematic", "kinetic", "kinetics"}:
-            self._use_kinematic_baseline()
-        elif model_type == "dbm":
-            self._use_upstream_numerical_dbm()
-        else:
-            raise ValueError(f"Unknown vehicle model: {vehicle_model_type}")
-
-    def _use_upstream_numerical_dbm(self):
-        """Match alpha-RACER's numerical-race DBM instantiation.
-
-        ``multi_car_comp_blocking.py`` overrides the model class defaults with
-        Sa=0.34, Sb=0, Ta=20, Tb=0, mu=0.5 and delay=1.  Keeping these values
-        explicit prevents a DBM ablation from silently using the unrelated
-        library defaults above.  The local simulator integrates this plant at
-        SIM_DT; the upstream experiment used DT=0.1 s.
-        """
-        self.LF = 0.11
-        self.LR = 0.23
-        self.MASS = 4.65
-        self.Iz = 0.1
-        self.Ta = 20.0
-        self.Tb = 0.0
-        self.Sa = 0.34
-        self.Sb = 0.0
-        self.mu = 0.5
-        self.Cf = 1.0
-        self.Cr = 1.0
-        self.Bf = 60.0
-        self.Br = 60.0
-        self.hcom = 0.0
-        self.fr = 0.1
-        self.delay = 1
-
-    def _use_kinematic_baseline(self):
-        # Match the released alpha-RACER ROS MPC prediction model.  Earlier
-        # local revisions used Sa=0.80 as a raceline-tracking workaround,
-        # which more than doubled the modeled steering authority.
-        self.LF = 0.11
-        self.LR = 0.23
-        self.Sa = 0.34
-        self.Sb = 0.0
-        self.Ta = 20.0 / 4.65
-        self.Tb = 0.0
-        self.fr = 1.0
-        self.ros_kinematic = True
-
-    def copy(self):
-        return copy.copy(self)
 
 
 def make_vehicle_params(vehicle_model_type):
@@ -410,4 +357,83 @@ class SimParams:
 
 
 params = SimParams()
+
+
+def resolve_mpc_settings(config, track, vehicle_params, policy_name):
+    """Resolve defaults and per-run overrides once for one car's MPCs."""
+    base_horizon = (
+        params.MPC_HORIZON
+        if config.mpc_horizon is None
+        else int(config.mpc_horizon)
+    )
+    horizon = (
+        params.IBR_HORIZON
+        if config.mpc_horizon is None and policy_name == "ibr"
+        else base_horizon
+    )
+    min_state_speed = (
+        params.MPC_MIN_STATE_SPEED
+        if config.mpc_min_state_speed is None
+        else float(config.mpc_min_state_speed)
+    )
+    velocity_track_weight = (
+        params.VELOCITY_TRACK_WEIGHT
+        if config.mpc_velocity_weight is None
+        else float(config.mpc_velocity_weight)
+    )
+    track_slack_weight = (
+        params.MPC_TRACK_SLACK_WEIGHT
+        if config.mpc_track_slack is None
+        else float(config.mpc_track_slack)
+    )
+    collision_slack_weight = (
+        params.MPC_COLLISION_SLACK_WEIGHT
+        if config.mpc_collision_slack is None
+        else float(config.mpc_collision_slack)
+    )
+    if not 0.0 <= min_state_speed <= params.MAX_STATE_SPEED:
+        raise ValueError("mpc_min_state_speed must be within [0, MAX_STATE_SPEED]")
+    if velocity_track_weight < 0.0:
+        raise ValueError("velocity_track_weight must be non-negative")
+    if track_slack_weight < 0.0:
+        raise ValueError("track_slack_weight must be non-negative")
+    if collision_slack_weight < 0.0:
+        raise ValueError("collision_slack_weight must be non-negative")
+
+    return MPCSettings(
+        dt=float(params.MPC_DT),
+        horizon=horizon,
+        Q=np.asarray(params.Q, dtype=float).copy(),
+        R=np.asarray(params.R, dtype=float).copy(),
+        max_vel_rate=float(params.MAX_VEL_RATE),
+        max_steer_delta=float(params.MPC_MAX_STEER_RATE * params.MPC_DT),
+        dynamics_params=vehicle_params,
+        track_width=float(params.TRACK_WIDTH),
+        track_constraint_half_width=float(params.MPC_CONSTRAINT_HALF_WIDTH),
+        max_state_speed=float(params.MAX_STATE_SPEED),
+        min_state_speed=min_state_speed,
+        velocity_track_weight=velocity_track_weight,
+        heading_track_weight=float(params.HEADING_TRACK_WEIGHT),
+        track_length=float(track.total_length),
+        min_longitudinal_separation=float(
+            params.MPC_MIN_LONGITUDINAL_SEPARATION
+        ),
+        min_lateral_separation=float(params.MPC_MIN_LATERAL_SEPARATION),
+        max_constrained_opponents=int(params.MPC_MAX_CONSTRAINED_OPPONENTS),
+        collision_superellipse_exponent=int(
+            params.MPC_COLLISION_SUPERELLIPSE_EXPONENT
+        ),
+        enforce_track_boundary=bool(params.MPC_ENFORCE_TRACK_BOUNDARY),
+        enforce_collision_avoidance=bool(
+            params.MPC_ENFORCE_COLLISION_AVOIDANCE
+        ),
+        track_slack_weight=track_slack_weight,
+        collision_slack_weight=collision_slack_weight,
+        enforce_friction_speed_limit=bool(
+            params.MPC_ENFORCE_FRICTION_SPEED_LIMIT
+        ),
+        friction_coefficient=float(params.MPC_FRICTION_COEFFICIENT),
+    )
+
+
 db_params = DynamicParams("dbm")

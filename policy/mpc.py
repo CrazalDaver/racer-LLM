@@ -14,7 +14,7 @@ import math
 
 import numpy as np
 
-from mpc_controller import MPCController
+from mpc_controller import ReferenceTrajectoryMPC
 from state import CarAction, CarState
 from track import RaceLine, Track
 
@@ -45,7 +45,7 @@ class MPCPolicy(BasePolicy):
     def __init__(
         self,
         track: Track,
-        mpc: MPCController,  # MPC instance
+        mpc: ReferenceTrajectoryMPC,
         params=None,  # (q, zeta, s1, s2, s3)
         raceline: RaceLine = None,
         max_speed=5.0,

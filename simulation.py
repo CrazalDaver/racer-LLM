@@ -4,8 +4,13 @@ import random
 
 import numpy as np
 
-from config import duration_to_steps, make_vehicle_params, params
-from mpc_controller import MPCController
+from config import (
+    duration_to_steps,
+    make_vehicle_params,
+    params,
+    resolve_mpc_settings,
+)
+from mpc_controller import ReferenceTrajectoryMPC
 from visualization.plotting import plot_simulation_results
 from policy import progress_delta
 from simulation_core.environment import RaceEnvironment
@@ -159,39 +164,18 @@ class Race:
             else config.vehicle_model
         ).lower()
         vehicle_params = make_vehicle_params(self.vehicle_model_type)
-        self.mpc_horizon = (
-            params.MPC_HORIZON if config.mpc_horizon is None else int(config.mpc_horizon)
+        base_mpc_settings = resolve_mpc_settings(
+            config, self.track, vehicle_params, policy_name=None
         )
-        self.mpc_min_state_speed = (
-            params.MPC_MIN_STATE_SPEED
-            if config.mpc_min_state_speed is None
-            else float(config.mpc_min_state_speed)
-        )
-        if not 0.0 <= self.mpc_min_state_speed <= params.MAX_STATE_SPEED:
-            raise ValueError(
-                "mpc_min_state_speed must be within [0, MAX_STATE_SPEED]"
-            )
+        self.mpc_horizon = base_mpc_settings.horizon
+        self.mpc_min_state_speed = base_mpc_settings.min_state_speed
         self.mpc_velocity_track_weight = (
-            params.VELOCITY_TRACK_WEIGHT
-            if config.mpc_velocity_weight is None
-            else float(config.mpc_velocity_weight)
+            base_mpc_settings.velocity_track_weight
         )
-        if self.mpc_velocity_track_weight < 0.0:
-            raise ValueError("velocity_track_weight must be non-negative")
-        self.mpc_track_slack_weight = (
-            params.MPC_TRACK_SLACK_WEIGHT
-            if config.mpc_track_slack is None
-            else float(config.mpc_track_slack)
-        )
-        if self.mpc_track_slack_weight < 0.0:
-            raise ValueError("track_slack_weight must be non-negative")
+        self.mpc_track_slack_weight = base_mpc_settings.track_slack_weight
         self.mpc_collision_slack_weight = (
-            params.MPC_COLLISION_SLACK_WEIGHT
-            if config.mpc_collision_slack is None
-            else float(config.mpc_collision_slack)
+            base_mpc_settings.collision_slack_weight
         )
-        if self.mpc_collision_slack_weight < 0.0:
-            raise ValueError("collision_slack_weight must be non-negative")
         self.oracle_commitment_seconds = (
             params.ORACLE_COMMITMENT_SECONDS
             if config.oracle_commitment_seconds is None
@@ -210,42 +194,10 @@ class Race:
         self.mpcs, self.policies = [], []
         self.vehicle_models, self.states = [], []
         for car_idx, policy_name in enumerate(self.resolved_policy_names):
-            car_mpc_horizon = (
-                params.IBR_HORIZON
-                if config.mpc_horizon is None and policy_name == "ibr"
-                else self.mpc_horizon
+            mpc_settings = resolve_mpc_settings(
+                config, self.track, vehicle_params, policy_name
             )
-            mpc = MPCController(
-                dt=params.MPC_DT,
-                horizon=car_mpc_horizon,
-                Q=params.Q,
-                R=params.R,
-                max_vel_rate=params.MAX_VEL_RATE,
-                max_steer_delta=params.MPC_MAX_STEER_RATE * params.MPC_DT,
-                db_params=vehicle_params,
-                track_width=params.TRACK_WIDTH,
-                track_constraint_half_width=params.MPC_CONSTRAINT_HALF_WIDTH,
-                max_state_speed=params.MAX_STATE_SPEED,
-                min_state_speed=self.mpc_min_state_speed,
-                velocity_track_weight=self.mpc_velocity_track_weight,
-                heading_track_weight=params.HEADING_TRACK_WEIGHT,
-                track_length=self.track.total_length,
-                min_longitudinal_separation=params.MPC_MIN_LONGITUDINAL_SEPARATION,
-                min_lateral_separation=params.MPC_MIN_LATERAL_SEPARATION,
-                max_constrained_opponents=params.MPC_MAX_CONSTRAINED_OPPONENTS,
-                collision_superellipse_exponent=(
-                    params.MPC_COLLISION_SUPERELLIPSE_EXPONENT
-                ),
-                enforce_track_boundary=params.MPC_ENFORCE_TRACK_BOUNDARY,
-                enforce_collision_avoidance=params.MPC_ENFORCE_COLLISION_AVOIDANCE,
-                track_slack_weight=self.mpc_track_slack_weight,
-                collision_slack_weight=self.mpc_collision_slack_weight,
-                enforce_friction_speed_limit=(
-                    params.MPC_ENFORCE_FRICTION_SPEED_LIMIT
-                ),
-                friction_coefficient=params.MPC_FRICTION_COEFFICIENT,
-                track=self.track,
-            )
+            mpc = ReferenceTrajectoryMPC(mpc_settings, self.track)
             self.mpcs.append(mpc)
             self.policies.append(
                 create_policy(
