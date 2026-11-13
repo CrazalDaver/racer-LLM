@@ -6,6 +6,7 @@ supports direct controls, five continuous parameters, and discrete modes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 
 import casadi as cs
@@ -23,37 +24,92 @@ from ..utils import progress_delta, relative_progress_gain
 IBR_STRATEGY_SPACES = ("control", "parameter", "mode")
 
 
+@dataclass(frozen=True)
+class ControlBestResponseSettings:
+    """Runtime MPC values used by the direct-control BR problem."""
+
+    dynamics_params: object
+    dt: float
+    horizon: int
+    max_opponents: int
+    initial_guess_mode: str
+    track_half_width: float
+    longitudinal_separation: float
+    lateral_separation: float
+    collision_exponent: int
+    max_speed: float
+    max_steer_delta: float
+    friction_coefficient: float
+    track_slack_weight: float
+    collision_slack_weight: float
+    enforce_track: bool
+    enforce_collision: bool
+    enforce_friction: bool
+
+    @classmethod
+    def from_mpc(
+        cls, mpc, *, max_opponents, initial_guess_mode="neutral",
+    ):
+        """Copy the effective per-run values from an MPCController."""
+        return cls(
+            dynamics_params=mpc.p,
+            dt=float(mpc.dt),
+            horizon=int(mpc.horizon),
+            max_opponents=int(max_opponents),
+            initial_guess_mode=str(initial_guess_mode),
+            track_half_width=float(mpc.track_constraint_half_width),
+            longitudinal_separation=float(mpc.min_longitudinal_separation),
+            lateral_separation=float(mpc.min_lateral_separation),
+            collision_exponent=int(mpc.collision_superellipse_exponent),
+            max_speed=float(mpc.max_speed),
+            max_steer_delta=float(mpc.max_steer_delta),
+            friction_coefficient=float(mpc.friction_coefficient),
+            track_slack_weight=float(mpc.track_slack_weight),
+            collision_slack_weight=float(mpc.collision_slack_weight),
+            enforce_track=bool(mpc.enforce_track_boundary),
+            enforce_collision=bool(mpc.enforce_collision_avoidance),
+            enforce_friction=bool(mpc.enforce_friction_speed_limit),
+        )
+
+
 class ControlBestResponseSolver:
-    """
-    Solve one direct-control best response against single opponent
-    by solving an optimization problem with CasADi.
+    """Solve one direct-control best response with CasADi.
+
+    Methods:
+    - ``solve_best_response``: return one direct-control BR plan; raise on
+      failed/nonfinite solve.
+    - ``_make_initial_guess``: return a warm-start guess for the NLP optimizer.
+
+    Attributes:
+    - ``settings``: fixed runtime values copied from the shared MPC controller.
+    - ``solver``: the reusable CasADi NLP solver instance.
     """
 
     _instance_counter = 0
 
-    def __init__(self, mpc, *, horizon, max_opponents, initial_guess_mode="neutral"):
-        self.mpc = mpc
-        self.p = mpc.p
-        self.dt = float(mpc.dt)
-        self.horizon = int(horizon)
-        self.max_opponents = int(max_opponents)
-        self.initial_guess_mode = str(initial_guess_mode).strip().lower()
+    def __init__(self, settings):
+        self.settings = settings
+        self.p = settings.dynamics_params
+        self.dt = settings.dt
+        self.horizon = settings.horizon
+        self.max_opponents = settings.max_opponents
+        self.initial_guess_mode = settings.initial_guess_mode.strip().lower()
         if self.initial_guess_mode not in {"release", "rollout", "neutral"}:
             raise ValueError(
                 "IBR initial guess must be 'release', 'rollout', or 'neutral'"
             )
-        self.track_half_width = float(mpc.track_constraint_half_width)
-        self.longitudinal_separation = float(mpc.min_longitudinal_separation)
-        self.lateral_separation = float(mpc.min_lateral_separation)
-        self.collision_exponent = int(mpc.collision_superellipse_exponent)
-        self.max_speed = float(mpc.max_speed)
-        self.max_steer_delta = float(mpc.max_steer_delta)
-        self.mu = float(mpc.friction_coefficient)
-        self.track_slack_weight = float(mpc.track_slack_weight)
-        self.collision_slack_weight = float(mpc.collision_slack_weight)
-        self.enforce_track = bool(mpc.enforce_track_boundary)
-        self.enforce_collision = bool(mpc.enforce_collision_avoidance)
-        self.enforce_friction = bool(mpc.enforce_friction_speed_limit)
+        self.track_half_width = settings.track_half_width
+        self.longitudinal_separation = settings.longitudinal_separation
+        self.lateral_separation = settings.lateral_separation
+        self.collision_exponent = settings.collision_exponent
+        self.max_speed = settings.max_speed
+        self.max_steer_delta = settings.max_steer_delta
+        self.mu = settings.friction_coefficient
+        self.track_slack_weight = settings.track_slack_weight
+        self.collision_slack_weight = settings.collision_slack_weight
+        self.enforce_track = settings.enforce_track
+        self.enforce_collision = settings.enforce_collision
+        self.enforce_friction = settings.enforce_friction
         self.last_diagnostics = {}
         self._build_problem()
 
@@ -395,8 +451,11 @@ class IteratedBestResponsePolicy(MPCPolicy):
         }
         self.control_solver = (
             ControlBestResponseSolver(
-                self.mpc, horizon=self.mpc.horizon, max_opponents=1,
-                initial_guess_mode=initial_guess_mode,
+                ControlBestResponseSettings.from_mpc(
+                    self.mpc,
+                    max_opponents=1,
+                    initial_guess_mode=initial_guess_mode,
+                )
             )
             if self.strategy_space == "control" else None
         )
