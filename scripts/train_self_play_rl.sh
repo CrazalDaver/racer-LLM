@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Local/server entry point for the native Torch self-play baseline.
 set -Eeuo pipefail
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 usage() {
     cat <<'HELP'
-Usage: bash train_self_play_rl.sh [options]
+Usage: bash scripts/train_self_play_rl.sh [options]
   --work-dir DIR    Stable resume directory (default outputs/self_play_rl/berlin-dbm)
   --output PATH     Runtime checkpoint (default policy/self_play_rl/weights/self_play_rl_policy.pth)
   --track NAME      Registered track (default berlin)
-  --workers N       CPU rollout workers/environments (paper default 8)
-  --device DEVICE   auto | cpu | cuda (training only; rollout remains on CPU)
+  --workers N       CPU rollout workers/environments (default 8; paper uses 8)
+  --device DEVICE   auto | cpu | cuda | cuda:N (one training GPU; rollout stays on CPU)
   --seed N          Training seed
-  --smoke           Run the short three-phase pipeline check
+  --smoke           Run the short shared-policy three-phase pipeline check
   --check-only      Validate imports, track and selected device
   --dry-run         Print the command only
 

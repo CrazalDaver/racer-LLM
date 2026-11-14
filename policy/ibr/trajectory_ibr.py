@@ -1,7 +1,8 @@
-"""Nearest-opponent iterative best response for three-car races.
+"""Nearest-opponent iterative best response for multi-car races.
 
-Each policy models only its closest opponent. The shared alternating scheduler
-supports direct controls, five continuous parameters, and discrete modes.
+Each policy models only its closest opponent, regardless of how many other
+cars are present. The shared alternating scheduler supports direct controls,
+five continuous parameters, and discrete modes.
 """
 
 from __future__ import annotations
@@ -871,15 +872,18 @@ class IteratedBestResponsePolicy(MPCPolicy):
         """Initialize, select the nearest opponent, and run six IBR rounds."""
         if self.car_idx is None:
             raise ValueError("IBRPolicy requires car_idx")
-        if len(observation.cars) != 3:
-            raise ValueError("IBRPolicy currently requires exactly three cars")
-
+        if len(observation.cars) < 2:
+            raise ValueError("IBRPolicy requires at least two cars")
+        # Initialize the IBR process
         plans, controls, strategy_states = self._initialize_ibr(observation)
+        # find the nearest opponent to the ego car for IBR rounds
         opponent_idx = self._nearest_opponent_idx(observation)
 
         self._candidate_failure = None
         self.current_ibr_round = None
         self.current_ibr_player = None
+
+        # solve the IBR rounds and do exceptions handling
         try:
             plans, controls, own, history = self._run_ibr_rounds(
                 observation, plans, controls, strategy_states, opponent_idx,
@@ -888,6 +892,9 @@ class IteratedBestResponsePolicy(MPCPolicy):
         except RuntimeError as exc:
             self._record_ibr_failure(exc)
             raise
+
+        # Accept the final ego BR result and return its first action
+        # only the first action is really executed
         return self._accept_ibr_result(
             plans, controls, own, history, opponent_idx
         )

@@ -7,7 +7,7 @@ cd "$REPO_ROOT"
 
 usage() {
     cat <<'HELP'
-Usage: bash train_alpharacer.sh [options]
+Usage: bash scripts/train_alpharacer.sh [options]
   --work-dir DIR       Fixed experiment directory (default outputs/alpharacer/berlin-dbm)
   --stage STAGE        status | collect | train | own-values | relative-values |
                        potential | evaluate | all (default all)

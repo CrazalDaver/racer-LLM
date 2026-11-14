@@ -11,7 +11,10 @@ from .network import OBSERVATION_SIZE, load_actor_checkpoint
 
 
 class SelfPlayRLPolicy(BasePolicy):
-    """Map the shared 15-value observation directly to throttle and steering."""
+    """
+    Map the shared 15-value observation directly to throttle and steering.
+
+    """
 
     def __init__(
         self,
@@ -48,30 +51,23 @@ class SelfPlayRLPolicy(BasePolicy):
             if model_path in {None, ""}:
                 raise ValueError("Self-play RL requires a native Torch checkpoint")
             self.model_path, self.model, self.model_metadata = load_actor_checkpoint(
-                model_path, car_idx, self.device
+                model_path, self.device
             )
             self.model_kind = "torch"
 
     def _predict(self, observation):
+        """
+        Main inference function for self-play RL policies.
+        Call model.predict() to predict the raw two-value action from the 15-value observation.
+        Return the raw two-value action predicted by the self-play RL model.
+        """
         values = np.asarray(observation, dtype=np.float32)
-        if hasattr(self.model, "predict"):
-            action, _ = self.model.predict(values, deterministic=True)
-            return np.asarray(action, dtype=float)
-        if callable(self.model):
-            return np.asarray(self.model(values), dtype=float)
-        raise TypeError(f"Unsupported self-play model object: {type(self.model)!r}")
+        action, _ = self.model.predict(values, deterministic=True)
+        self.last_raw_action = np.asarray(action, dtype=float).reshape(-1)[:2].copy()
+        return self.last_raw_action
 
-    @staticmethod
-    def _bounded_action(raw_action):
-        raw_action = np.asarray(raw_action, dtype=float).reshape(-1)
-        if raw_action.size < 2 or not np.all(np.isfinite(raw_action[:2])):
-            raise RuntimeError("Self-play actor returned a nonfinite two-value action")
-        return CarAction(
-            throttle=float(np.clip(raw_action[0], 0.0, 1.0)),
-            steer=float(np.clip(raw_action[1], -1.0, 1.0)),
-        )
-
-    def get_action(self, observation) -> CarAction:
+    def _construct_input(self, observation):
+        """Build the shared input and update reference fields for recording."""
         ego = observation.car(self.car_idx)
         if self.raceline is not None:
             self.last_raceline_idx = self.raceline.nearest_index(ego.x, ego.y)
@@ -81,10 +77,27 @@ class SelfPlayRLPolicy(BasePolicy):
         self.last_raceline_world_horizon = None
         model_input = observation.self_play_rl_input(self.car_idx)
         self.last_observation = model_input.copy()
-        self.last_raw_action = self._predict(model_input).reshape(-1)[:2].copy()
-        action = self._bounded_action(self.last_raw_action)
-        self.last_u = np.array([action.throttle, action.steer])
+        return model_input
 
+    @staticmethod
+    def _bounded_action(raw_action):
+        """
+        Clip the raw action to the valid range for throttle and steering.
+        throttle: [0.0, 1.0]
+        steer: [-1.0, 1.0]
+        Return a CarAction object with the bounded throttle and steering values.
+        """
+        raw_action = np.asarray(raw_action, dtype=float).reshape(-1)
+        if raw_action.size < 2 or not np.all(np.isfinite(raw_action[:2])):
+            raise RuntimeError("Self-play actor returned a nonfinite two-value action")
+        return CarAction(
+            throttle=float(np.clip(raw_action[0], 0.0, 1.0)),
+            steer=float(np.clip(raw_action[1], -1.0, 1.0)),
+        )
+
+    def _record_direct_action(self, action):
+        """Save the selected action and the recorder's common MPC fields."""
+        self.last_u = np.array([action.throttle, action.steer])
         # Direct policies do not invoke the MPC solver, but the recorder expects
         # the same diagnostic surface from every policy.
         self.mpc.last_solver_success = True
@@ -103,4 +116,11 @@ class SelfPlayRLPolicy(BasePolicy):
             self.last_u.reshape(2, 1), self.mpc.horizon, axis=1
         )
         self.mpc.last_state_plan = None
+
+    def get_action(self, observation) -> CarAction:
+        """Build the input, predict one action, and record the decision."""
+        model_input = self._construct_input(observation)
+        raw_action = self._predict(model_input)
+        action = self._bounded_action(raw_action)
+        self._record_direct_action(action)
         return action

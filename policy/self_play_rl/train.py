@@ -1,7 +1,7 @@
-"""Pure-Torch round-robin PPO self-play training.
+"""Pure-Torch PPO self-play training with one shared policy.
 
 Alpha-RACER supplies the PPO hyperparameters and three-agent 100K-step
-switching schedule.  The actor/critic architecture and opponent snapshot
+viewpoint-switching schedule.  The actor/critic architecture and opponent snapshot
 schedule follow the referenced Thakkar self-play implementation.
 """
 
@@ -33,14 +33,19 @@ from .network import (
 )
 
 
+TRAINING_CHECKPOINT_FORMAT = "self_play_rl_trainer_v2_shared"
+
+
 @dataclass(frozen=True)
 class PPOSettings:
-    """Fixed PPO contract; unspecified values follow standard SB3 defaults."""
+    """PPO settings from Alpha-RACER Appendix E and SB3 defaults."""
 
+    # Appendix E: learning rate, minibatch size, epochs, and discount.
     learning_rate: float = 5e-4
     batch_size: int = 1024
     epochs: int = 5
     gamma: float = 0.99
+    # SB3 PPO defaults: GAE, clipping, loss weights, and gradient limit.
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_coefficient: float = 0.5
@@ -50,17 +55,21 @@ class PPOSettings:
 
 @dataclass(frozen=True)
 class SelfPlaySettings:
-    """Paper/Thakkar self-play and race settings."""
+    """Self-play schedule and local race collection settings."""
 
+    # Appendix E: three agents, 99 phases, 100K steps per phase.
     num_agents: int = 3
     agent_switches: int = 99
     steps_per_phase: int = 100_000
+    # Local rollout chunk; episode and starting conditions use the old training
+    # skeleton or local choices, not stated paper or Thakkar settings.
     rollout_steps: int = 256
     episode_steps: int = 500
     dt: float = 0.1
     initial_speed: float = 2.0
     start_gap: float = 3.0
     start_jitter: float = 0.15
+    # Thakkar E2E/NonLSTM self-play configuration; extended locally to three cars.
     snapshot_steps: int = 20_000
     opponent_swap_steps: int = 10_000
     opponent_window: int = 10
@@ -79,8 +88,14 @@ def _cpu_policy_state(model):
     }
 
 
-def _copy_actor_state(state):
-    return {name: value.detach().cpu().clone() for name, value in state.items()}
+def _copy_policy_state(state):
+    return {
+        "actor_state_dict": {
+            name: np.asarray(value).copy()
+            for name, value in state["actor_state_dict"].items()
+        },
+        "log_std": np.asarray(state["log_std"]).copy(),
+    }
 
 
 class TrainingRace:
@@ -386,28 +401,20 @@ def _git_metadata():
     }
 
 
-def _deployment_checkpoint(models, metadata):
+def _deployment_checkpoint(model, metadata):
     return {
         "format": CHECKPOINT_FORMAT,
-        "agents": [
-            {"actor_state_dict": actor_state(model)} for model in models
-        ],
+        "actor_state_dict": actor_state(model),
         "metadata": metadata,
     }
 
 
-def _select_opponent_state(models, pools, agent_idx, rng, latest_probability):
-    if not pools[agent_idx] or rng.random() < latest_probability:
-        return _cpu_policy_state(models[agent_idx])
-    pool = list(pools[agent_idx])
+def _select_opponent_state(model, pool, rng, latest_probability):
+    """Choose the current shared policy or one of its historical snapshots."""
+    if not pool or rng.random() < latest_probability:
+        return _cpu_policy_state(model)
     selected = pool[int(rng.integers(0, len(pool)))]
-    return {
-        "actor_state_dict": {
-            name: value.detach().cpu().numpy().copy()
-            for name, value in selected.items()
-        },
-        "log_std": models[agent_idx].log_std.detach().cpu().numpy().copy(),
-    }
+    return _copy_policy_state(selected)
 
 
 def _worker_steps(total_steps, workers, maximum_per_worker):
@@ -417,7 +424,7 @@ def _worker_steps(total_steps, workers, maximum_per_worker):
 
 
 def train(args):
-    """Run or resume the fixed three-agent self-play schedule."""
+    """Train one policy while rotating the car that supplies its rollouts."""
     ppo = PPOSettings()
     self_play = SelfPlaySettings()
     if args.smoke:
@@ -454,21 +461,20 @@ def train(args):
     work_dir = Path(args.work_dir)
     state_path = work_dir / "trainer.pth"
     output_path = Path(args.output)
-    models = [PPOActorCritic().to(device) for _ in range(self_play.num_agents)]
-    initial_state = models[0].state_dict()
-    for model in models[1:]:
-        model.load_state_dict(initial_state)
-    optimizers = [
-        torch.optim.Adam(model.parameters(), lr=ppo.learning_rate)
-        for model in models
-    ]
-    pools = [deque(maxlen=self_play.opponent_window) for _ in models]
-    for agent_idx, model in enumerate(models):
-        pools[agent_idx].append(actor_state(model))
+    model = PPOActorCritic().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=ppo.learning_rate)
+    opponent_pool = deque(
+        [_cpu_policy_state(model)], maxlen=self_play.opponent_window
+    )
     phase = phase_steps = total_steps = 0
 
     if state_path.exists():
         saved = torch.load(state_path, map_location="cpu", weights_only=False)
+        if saved.get("format") != TRAINING_CHECKPOINT_FORMAT:
+            raise ValueError(
+                "Existing self-play checkpoint is not the shared-policy format; "
+                "use a new --work-dir"
+            )
         if (
             saved["ppo_settings"] != asdict(ppo)
             or saved["self_play_settings"] != asdict(self_play)
@@ -477,17 +483,12 @@ def train(args):
         phase = int(saved["phase"])
         phase_steps = int(saved["phase_steps"])
         total_steps = int(saved["total_steps"])
-        for model, state in zip(models, saved["models"]):
-            model.load_state_dict(state)
-        for optimizer, state in zip(optimizers, saved["optimizers"]):
-            optimizer.load_state_dict(state)
-        pools = [
-            deque(
-                (_copy_actor_state(item) for item in pool),
-                maxlen=self_play.opponent_window,
-            )
-            for pool in saved["opponent_pools"]
-        ]
+        model.load_state_dict(saved["model"])
+        optimizer.load_state_dict(saved["optimizer"])
+        opponent_pool = deque(
+            (_copy_policy_state(item) for item in saved["opponent_pool"]),
+            maxlen=self_play.opponent_window,
+        )
         rng.bit_generator.state = saved["rng_state"]
         print(f"Resuming phase={phase} phase_steps={phase_steps} total_steps={total_steps}")
 
@@ -506,8 +507,6 @@ def train(args):
     try:
         while phase < self_play.agent_switches:
             learning_car = phase % self_play.num_agents
-            model = models[learning_car]
-            optimizer = optimizers[learning_car]
             next_swap = (
                 (phase_steps // self_play.opponent_swap_steps) + 1
             ) * self_play.opponent_swap_steps
@@ -521,12 +520,12 @@ def train(args):
                 selected_opponents = []
                 for _ in range(args.workers):
                     states = []
-                    for agent_idx in range(self_play.num_agents):
-                        if agent_idx == learning_car:
+                    for car_idx in range(self_play.num_agents):
+                        if car_idx == learning_car:
                             states.append(_cpu_policy_state(model))
                         else:
                             states.append(_select_opponent_state(
-                                models, pools, agent_idx, rng,
+                                model, opponent_pool, rng,
                                 self_play.latest_opponent_probability,
                             ))
                     selected_opponents.append(states)
@@ -545,7 +544,7 @@ def train(args):
             total_steps += collected
 
             if phase_steps % self_play.snapshot_steps == 0:
-                pools[learning_car].append(actor_state(model))
+                opponent_pool.append(_cpu_policy_state(model))
             if phase_steps % self_play.opponent_swap_steps == 0:
                 selected_opponents = None
             if phase_steps == self_play.steps_per_phase:
@@ -563,15 +562,17 @@ def train(args):
                 "total_steps": total_steps,
                 "track": args.track,
                 "seed": args.seed,
+                "shared_policy": True,
                 "sources": "alpha-RACER Appendix E; Thakkar et al. self-play",
                 "git": git,
             }
-            _atomic_torch_save(_deployment_checkpoint(models, metadata), output_path)
+            _atomic_torch_save(_deployment_checkpoint(model, metadata), output_path)
             _atomic_torch_save({
                 **metadata,
-                "models": [model.state_dict() for model in models],
-                "optimizers": [optimizer.state_dict() for optimizer in optimizers],
-                "opponent_pools": [list(pool) for pool in pools],
+                "format": TRAINING_CHECKPOINT_FORMAT,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "opponent_pool": list(opponent_pool),
                 "rng_state": rng.bit_generator.state,
             }, state_path)
             elapsed = time.monotonic() - started
@@ -591,14 +592,20 @@ def train(args):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Train Torch PPO self-play agents")
+    parser = argparse.ArgumentParser(description="Train one shared Torch PPO policy")
     parser.add_argument("--work-dir", default="outputs/self_play_rl/berlin-dbm")
     parser.add_argument(
         "--output", default="policy/self_play_rl/weights/self_play_rl_policy.pth"
     )
     parser.add_argument("--track", default="berlin")
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="parallel CPU rollout environments (default: 8)",
+    )
+    parser.add_argument(
+        "--device", default="auto",
+        help="single training device: auto, cpu, cuda, cuda:0, ... (default: auto)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
