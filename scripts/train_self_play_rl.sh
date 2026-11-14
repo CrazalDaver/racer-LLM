@@ -12,13 +12,14 @@ Usage: bash scripts/train_self_play_rl.sh [options]
   --track NAME      Registered track (default berlin)
   --workers N       CPU rollout workers/environments (default 8; paper uses 8)
   --device DEVICE   auto | cpu | cuda | cuda:N (one training GPU; rollout stays on CPU)
+  --activation ACT  tanh | relu (default tanh)
   --seed N          Training seed
   --smoke           Run the short shared-policy three-phase pipeline check
   --check-only      Validate imports, track and selected device
   --dry-run         Print the command only
 
-Training resumes automatically from WORK_DIR/trainer.pth. Algorithm and
-self-play hyperparameters are fixed in policy.self_play_rl.train.
+Training resumes automatically from WORK_DIR/trainer.pth. Exact resume uses
+the same --workers value. Algorithm settings are fixed in policy.self_play_rl.train.
 HELP
 }
 
@@ -65,7 +66,7 @@ device = torch.device(
     'cuda' if args.device == 'auto' and torch.cuda.is_available()
     else 'cpu' if args.device == 'auto' else args.device
 )
-PPOActorCritic().to(device).actor(torch.zeros(1, 15, device=device))
+PPOActorCritic(args.activation).to(device).actor(torch.zeros(1, 15, device=device))
 print('Environment check passed. Device:', device, 'Workers:', args.workers)
 PY
     exit 0

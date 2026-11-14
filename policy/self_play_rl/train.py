@@ -9,7 +9,6 @@ import argparse
 from collections import deque
 from dataclasses import asdict, dataclass
 import multiprocessing
-from pathlib import Path
 import random
 import subprocess
 import time
@@ -23,17 +22,13 @@ from simulation_core.environment import RaceEnvironment
 from simulation_core.observation import RaceObservation
 from state import CarAction, CarState
 from track import Track, configure_track, load_centerline_csv
-from vehicle_model import DynamicBicycleModel
+from vehicle_model import DynamicBicycleModel, oriented_rectangle_overlap_cost
 
+from .checkpoint import SelfPlayCheckpoint
 from .network import (
-    CHECKPOINT_FORMAT,
     HIDDEN_SIZES,
     PPOActorCritic,
-    actor_state,
 )
-
-
-TRAINING_CHECKPOINT_FORMAT = "self_play_rl_trainer_v2_shared"
 
 
 @dataclass(frozen=True)
@@ -42,6 +37,7 @@ class PPOSettings:
 
     # Appendix E: learning rate, minibatch size, epochs, and discount.
     learning_rate: float = 5e-4
+    adam_epsilon: float = 1e-5  # SB3 PPO default.
     batch_size: int = 1024
     epochs: int = 5
     gamma: float = 0.99
@@ -61,14 +57,13 @@ class SelfPlaySettings:
     num_agents: int = 3
     agent_switches: int = 99
     steps_per_phase: int = 100_000
-    # Local rollout chunk; episode and starting conditions use the old training
-    # skeleton or local choices, not stated paper or Thakkar settings.
+    # Rollout timing follows old local defaults; starts are a local training choice.
     rollout_steps: int = 256
     episode_steps: int = 500
     dt: float = 0.1
-    initial_speed: float = 2.0
-    start_gap: float = 3.0
-    start_jitter: float = 0.15
+    initial_speed: float = 0.0
+    min_start_gap: float = 2.0
+    max_start_gap: float = 6.0
     # Thakkar E2E/NonLSTM self-play configuration; extended locally to three cars.
     snapshot_steps: int = 20_000
     opponent_swap_steps: int = 10_000
@@ -114,22 +109,34 @@ class TrainingRace:
     def reset(self):
         settings = self.setup["self_play"]
         num_agents = settings["num_agents"]
-        base_s = float(self.rng.uniform(0.0, self.track.total_length))
-        slots = self.rng.permutation(num_agents)
-        states, progress = [], []
-        for car_idx in range(num_agents):
-            start_s = (
-                base_s
-                - float(slots[car_idx]) * settings["start_gap"]
-                + float(self.rng.uniform(-settings["start_jitter"], settings["start_jitter"]))
+        # Resample the scene if a tight bend makes the initial bodies overlap.
+        for _ in range(1000):
+            base_s = float(self.rng.uniform(0.0, self.track.total_length))
+            slots = self.rng.permutation(num_agents)
+            gaps = self.rng.uniform(
+                settings["min_start_gap"], settings["max_start_gap"], num_agents - 1
             )
-            start_e = float(self.rng.uniform(-0.05, 0.05))
-            x, y = self.track.frenet_to_world(start_s, start_e)
-            _, _, psi = self.track.interpolate(start_s)
-            states.append(CarState(
-                x=x, y=y, psi=psi, vx=settings["initial_speed"], vy=0.0, omega=0.0
-            ))
-            progress.append(start_s)
+            offsets = np.r_[0.0, np.cumsum(gaps)]
+            states, progress = [], []
+            for car_idx in range(num_agents):
+                start_s = base_s - float(offsets[slots[car_idx]])
+                start_e = float(self.rng.uniform(-0.05, 0.05))
+                x, y = self.track.frenet_to_world(start_s, start_e)
+                _, _, psi = self.track.interpolate(start_s)
+                states.append(CarState(
+                    x=x, y=y, psi=psi, vx=settings["initial_speed"], vy=0.0, omega=0.0
+                ))
+                progress.append(start_s)
+            if all(
+                oriented_rectangle_overlap_cost(
+                    states[i], states[j], params.VEHICLE_HALF_LENGTH,
+                    params.VEHICLE_HALF_WIDTH,
+                ) <= 0.0
+                for i in range(num_agents) for j in range(i + 1, num_agents)
+            ):
+                break
+        else:
+            raise RuntimeError("Could not sample a non-overlapping self-play start")
         vehicle_params = make_vehicle_params("dbm")
         models = [
             DynamicBicycleModel(dt=settings["dt"], db_params=vehicle_params)
@@ -155,6 +162,39 @@ class TrainingRace:
     def observation(self, car_idx):
         return self.scene().self_play_rl_input(car_idx)
 
+    def snapshot(self):
+        """Return the complete mutable race state at a rollout boundary."""
+        return {
+            "rng_state": self.rng.bit_generator.state,
+            "step_count": self.step_count,
+            "states": np.stack([state.to_array() for state in self.environment.states]),
+            "progress_s": self.environment.progress_s.copy(),
+            "step_index": self.environment.step_index,
+            "car_s": np.asarray(self.environment.car_s, dtype=float),
+            "car_e": np.asarray(self.environment.car_e, dtype=float),
+            "last_controls": np.stack([
+                model.last_control.copy() for model in self.environment.vehicle_models
+            ]),
+        }
+
+    def restore(self, snapshot):
+        """Restore a state produced by :meth:`snapshot` without resetting."""
+        self.rng.bit_generator.state = snapshot["rng_state"]
+        self.step_count = int(snapshot["step_count"])
+        self.environment.states = [
+            CarState.from_array(values) for values in snapshot["states"]
+        ]
+        self.environment.progress_s = np.asarray(
+            snapshot["progress_s"], dtype=float
+        ).copy()
+        self.environment.step_index = int(snapshot["step_index"])
+        self.environment.car_s = np.asarray(snapshot["car_s"], dtype=float).tolist()
+        self.environment.car_e = np.asarray(snapshot["car_e"], dtype=float).tolist()
+        for model, control in zip(
+            self.environment.vehicle_models, snapshot["last_controls"]
+        ):
+            model.last_control = np.asarray(control, dtype=float).copy()
+
     def step(self, actions, learning_car):
         previous = relative_progress(self.environment.car_s, learning_car)
         result = self.environment.step(tuple(actions))
@@ -175,10 +215,10 @@ class TrainingRace:
         return next_observation, float(reward), episode_end, metrics
 
 
-def _load_worker_policies(policy_states):
+def _load_worker_policies(policy_states, activation):
     models = []
     for state in policy_states:
-        model = PPOActorCritic().cpu().eval()
+        model = PPOActorCritic(activation).cpu().eval()
         model.actor.load_state_dict({
             name: torch.from_numpy(value)
             for name, value in state["actor_state_dict"].items()
@@ -198,12 +238,25 @@ def _worker_loop(connection, setup, worker_id):
             command = connection.recv()
             if command["kind"] == "close":
                 return
+            if command["kind"] == "snapshot":
+                connection.send({
+                    "race": race.snapshot(),
+                    "torch_rng_state": torch.get_rng_state().numpy().copy(),
+                })
+                continue
+            if command["kind"] == "restore":
+                race.restore(command["state"]["race"])
+                torch.set_rng_state(torch.from_numpy(
+                    command["state"]["torch_rng_state"]
+                ))
+                connection.send(True)
+                continue
             if command["kind"] != "collect":
                 raise ValueError(f"Unknown worker command: {command['kind']}")
             if command["reset"]:
                 race.reset()
             learning_car = command["learning_car"]
-            models = _load_worker_policies(command["policies"])
+            models = _load_worker_policies(command["policies"], setup["activation"])
             observations, actions, rewards = [], [], []
             next_observations, episode_ends = [], []
             offroad = contact = 0
@@ -254,12 +307,13 @@ def _worker_loop(connection, setup, worker_id):
 
 
 class RolloutWorkers:
-    """Persistent CPU workers; policy updates remain in the GPU main process."""
+    """Persistent CPU workers; policy updates remain in the main process."""
 
     def __init__(self, count, setup):
+        self.count = int(count)
         context = multiprocessing.get_context("spawn")
         self.connections, self.processes = [], []
-        for worker_id in range(count):
+        for worker_id in range(self.count):
             parent, child = context.Pipe()
             process = context.Process(
                 target=_worker_loop, args=(child, setup, worker_id), daemon=True
@@ -269,7 +323,8 @@ class RolloutWorkers:
             self.connections.append(parent)
             self.processes.append(process)
 
-    def collect(self, learning_car, policies, steps, reset):
+    def collect_rollouts(self, learning_car, policies, steps, reset):
+        """Collect one on-policy batch from all persistent CPU workers."""
         for connection, worker_policies, worker_steps in zip(
             self.connections, policies, steps
         ):
@@ -281,6 +336,21 @@ class RolloutWorkers:
                 "reset": reset,
             })
         return [connection.recv() for connection in self.connections]
+
+    def snapshot(self):
+        """Capture every worker's race and sampling RNG state."""
+        for connection in self.connections:
+            connection.send({"kind": "snapshot"})
+        return [connection.recv() for connection in self.connections]
+
+    def restore(self, states):
+        """Restore all workers before collecting the next rollout."""
+        if len(states) != self.count:
+            raise ValueError("Worker checkpoint count does not match active workers")
+        for connection, state in zip(self.connections, states):
+            connection.send({"kind": "restore", "state": state})
+        if not all(connection.recv() for connection in self.connections):
+            raise RuntimeError("A rollout worker did not restore its checkpoint")
 
     def close(self):
         for connection in self.connections:
@@ -302,8 +372,8 @@ class PPOUpdater:
     def __init__(self, settings):
         self.settings = settings
 
-    def update(self, model, optimizer, rollouts, device, rng):
-        """Consume current-policy worker trajectories and return mean losses."""
+    def _prepare_batch(self, model, rollouts, device):
+        """Compute old-policy values, GAE advantages and return targets."""
         all_observations, all_actions, all_advantages, all_returns = [], [], [], []
         all_old_log_probabilities = []
         model.eval()
@@ -340,6 +410,13 @@ class PPOUpdater:
         advantages = torch.cat(all_advantages)
         returns = torch.cat(all_returns)
         advantages = (advantages - advantages.mean()) / advantages.std().clamp_min(1e-8)
+        return observations, actions, old_log_probabilities, advantages, returns
+
+    def update(self, model, optimizer, rollouts, device, rng):
+        """Compute GAE and perform all PPO epochs for one rollout batch."""
+        observations, actions, old_log_probabilities, advantages, returns = (
+            self._prepare_batch(model, rollouts, device)
+        )
         sample_count = len(observations)
         metrics = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "updates": 0}
         model.train()
@@ -382,12 +459,132 @@ class PPOUpdater:
         return metrics
 
 
-def _atomic_torch_save(value, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(value, temporary)
-    temporary.replace(path)
+class SelfPlayTrainer:
+    """Run one complete opponent-selection, rollout and PPO-update iteration."""
+
+    def __init__(self, model, optimizer, workers, updater, settings, device, rng):
+        self.model = model
+        self.optimizer = optimizer
+        self.workers = workers
+        self.updater = updater
+        self.settings = settings
+        self.device = device
+        self.rng = rng
+        self.opponent_pool = deque(
+            [_cpu_policy_state(model)], maxlen=settings.opponent_window
+        )
+        self.phase = 0
+        self.phase_steps = 0
+        self.total_steps = 0
+        self.selected_opponents = None
+        self.reset_workers = True
+
+    @property
+    def complete(self):
+        return self.phase >= self.settings.agent_switches
+
+    def state_dict(self):
+        """Return algorithm scheduling state for the checkpoint manager."""
+        return {
+            "phase": self.phase,
+            "phase_steps": self.phase_steps,
+            "total_steps": self.total_steps,
+            "opponent_pool": [
+                _copy_policy_state(state) for state in self.opponent_pool
+            ],
+            "selected_opponents": (
+                None if self.selected_opponents is None else [
+                    [_copy_policy_state(state) for state in worker_states]
+                    for worker_states in self.selected_opponents
+                ]
+            ),
+            "reset_workers": self.reset_workers,
+        }
+
+    def load_state_dict(self, state):
+        """Restore scheduling and opponent-selection state."""
+        self.phase = int(state["phase"])
+        self.phase_steps = int(state["phase_steps"])
+        self.total_steps = int(state["total_steps"])
+        self.opponent_pool = deque(
+            (_copy_policy_state(item) for item in state["opponent_pool"]),
+            maxlen=self.settings.opponent_window,
+        )
+        selected = state["selected_opponents"]
+        self.selected_opponents = None if selected is None else [
+            [_copy_policy_state(item) for item in worker_states]
+            for worker_states in selected
+        ]
+        self.reset_workers = bool(state["reset_workers"])
+
+    def _choose_opponents(self, learning_car):
+        selections = []
+        for _ in range(self.workers.count):
+            worker_states = []
+            for car_idx in range(self.settings.num_agents):
+                if car_idx == learning_car:
+                    worker_states.append(_cpu_policy_state(self.model))
+                elif (
+                    not self.opponent_pool
+                    or self.rng.random() < self.settings.latest_opponent_probability
+                ):
+                    worker_states.append(_cpu_policy_state(self.model))
+                else:
+                    selected = self.opponent_pool[
+                        int(self.rng.integers(0, len(self.opponent_pool)))
+                    ]
+                    worker_states.append(_copy_policy_state(selected))
+            selections.append(worker_states)
+        return selections
+
+    def run_update(self):
+        """Collect one rollout batch, update PPO, and advance self-play scheduling."""
+        learning_car = self.phase % self.settings.num_agents
+        next_swap = (
+            (self.phase_steps // self.settings.opponent_swap_steps) + 1
+        ) * self.settings.opponent_swap_steps
+        next_snapshot = (
+            (self.phase_steps // self.settings.snapshot_steps) + 1
+        ) * self.settings.snapshot_steps
+        boundary = min(self.settings.steps_per_phase, next_swap, next_snapshot)
+        if self.selected_opponents is None:
+            self.selected_opponents = self._choose_opponents(learning_car)
+        for worker_states in self.selected_opponents:
+            worker_states[learning_car] = _cpu_policy_state(self.model)
+
+        total = min(
+            boundary - self.phase_steps,
+            self.workers.count * self.settings.rollout_steps,
+        )
+        base, remainder = divmod(total, self.workers.count)
+        steps = [
+            base + (worker < remainder) for worker in range(self.workers.count)
+        ]
+        rollouts = self.workers.collect_rollouts(
+            learning_car, self.selected_opponents, steps, self.reset_workers
+        )
+        self.reset_workers = False
+        metrics = self.updater.update(
+            self.model, self.optimizer, rollouts, self.device, self.rng
+        )
+        collected = sum(steps)
+        self.phase_steps += collected
+        self.total_steps += collected
+
+        if self.phase_steps % self.settings.snapshot_steps == 0:
+            self.opponent_pool.append(_cpu_policy_state(self.model))
+        if self.phase_steps % self.settings.opponent_swap_steps == 0:
+            self.selected_opponents = None
+        if self.phase_steps == self.settings.steps_per_phase:
+            self.phase += 1
+            self.phase_steps = 0
+            self.selected_opponents = None
+            self.reset_workers = True
+
+        mean_reward = float(np.mean(np.concatenate([
+            rollout["rewards"] for rollout in rollouts
+        ])))
+        return learning_car, mean_reward, metrics
 
 
 def _git_metadata():
@@ -399,28 +596,6 @@ def _git_metadata():
             ["git", "status", "--porcelain"], text=True
         ),
     }
-
-
-def _deployment_checkpoint(model, metadata):
-    return {
-        "format": CHECKPOINT_FORMAT,
-        "actor_state_dict": actor_state(model),
-        "metadata": metadata,
-    }
-
-
-def _select_opponent_state(model, pool, rng, latest_probability):
-    """Choose the current shared policy or one of its historical snapshots."""
-    if not pool or rng.random() < latest_probability:
-        return _cpu_policy_state(model)
-    selected = pool[int(rng.integers(0, len(pool)))]
-    return _copy_policy_state(selected)
-
-
-def _worker_steps(total_steps, workers, maximum_per_worker):
-    total_steps = min(total_steps, workers * maximum_per_worker)
-    base, remainder = divmod(total_steps, workers)
-    return [base + (worker < remainder) for worker in range(workers)]
 
 
 def train(args):
@@ -458,137 +633,65 @@ def train(args):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
-    work_dir = Path(args.work_dir)
-    state_path = work_dir / "trainer.pth"
-    output_path = Path(args.output)
-    model = PPOActorCritic().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=ppo.learning_rate)
-    opponent_pool = deque(
-        [_cpu_policy_state(model)], maxlen=self_play.opponent_window
+    model = PPOActorCritic(args.activation).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=ppo.learning_rate, eps=ppo.adam_epsilon
     )
-    phase = phase_steps = total_steps = 0
-
-    if state_path.exists():
-        saved = torch.load(state_path, map_location="cpu", weights_only=False)
-        if saved.get("format") != TRAINING_CHECKPOINT_FORMAT:
-            raise ValueError(
-                "Existing self-play checkpoint is not the shared-policy format; "
-                "use a new --work-dir"
-            )
-        if (
-            saved["ppo_settings"] != asdict(ppo)
-            or saved["self_play_settings"] != asdict(self_play)
-        ):
-            raise ValueError("Existing self-play checkpoint uses different settings")
-        phase = int(saved["phase"])
-        phase_steps = int(saved["phase_steps"])
-        total_steps = int(saved["total_steps"])
-        model.load_state_dict(saved["model"])
-        optimizer.load_state_dict(saved["optimizer"])
-        opponent_pool = deque(
-            (_copy_policy_state(item) for item in saved["opponent_pool"]),
-            maxlen=self_play.opponent_window,
-        )
-        rng.bit_generator.state = saved["rng_state"]
-        print(f"Resuming phase={phase} phase_steps={phase_steps} total_steps={total_steps}")
-
     setup = {
         "seed": args.seed,
+        "activation": args.activation,
         "track_csv": params.TRACK_CSV,
         "track_scale": params.TRACK_SCALE,
         "self_play": asdict(self_play),
     }
     workers = RolloutWorkers(args.workers, setup)
-    updater = PPOUpdater(ppo)
-    reset_workers = True
-    selected_opponents = None
+    trainer = SelfPlayTrainer(
+        model, optimizer, workers, PPOUpdater(ppo), self_play, device, rng
+    )
+    checkpoint = SelfPlayCheckpoint(
+        args.work_dir, args.output, asdict(ppo), trainer
+    )
     started = time.monotonic()
     git = _git_metadata()
     try:
-        while phase < self_play.agent_switches:
-            learning_car = phase % self_play.num_agents
-            next_swap = (
-                (phase_steps // self_play.opponent_swap_steps) + 1
-            ) * self_play.opponent_swap_steps
-            next_snapshot = (
-                (phase_steps // self_play.snapshot_steps) + 1
-            ) * self_play.snapshot_steps
-            boundary = min(
-                self_play.steps_per_phase, next_swap, next_snapshot
+        resumed = checkpoint.load()
+        if resumed:
+            print(
+                f"Resuming phase={trainer.phase} phase_steps={trainer.phase_steps} "
+                f"total_steps={trainer.total_steps}"
             )
-            if selected_opponents is None:
-                selected_opponents = []
-                for _ in range(args.workers):
-                    states = []
-                    for car_idx in range(self_play.num_agents):
-                        if car_idx == learning_car:
-                            states.append(_cpu_policy_state(model))
-                        else:
-                            states.append(_select_opponent_state(
-                                model, opponent_pool, rng,
-                                self_play.latest_opponent_probability,
-                            ))
-                    selected_opponents.append(states)
-            for states in selected_opponents:
-                states[learning_car] = _cpu_policy_state(model)
-            steps = _worker_steps(
-                boundary - phase_steps, args.workers, self_play.rollout_steps
-            )
-            rollouts = workers.collect(
-                learning_car, selected_opponents, steps, reset_workers
-            )
-            reset_workers = False
-            collected = sum(steps)
-            metrics = updater.update(model, optimizer, rollouts, device, rng)
-            phase_steps += collected
-            total_steps += collected
 
-            if phase_steps % self_play.snapshot_steps == 0:
-                opponent_pool.append(_cpu_policy_state(model))
-            if phase_steps % self_play.opponent_swap_steps == 0:
-                selected_opponents = None
-            if phase_steps == self_play.steps_per_phase:
-                phase += 1
-                phase_steps = 0
-                selected_opponents = None
-                reset_workers = True
+        while not trainer.complete:
+            learning_car, mean_reward, metrics = trainer.run_update()
 
             metadata = {
                 "ppo_settings": asdict(ppo),
                 "self_play_settings": asdict(self_play),
-                "network": {"hidden_sizes": HIDDEN_SIZES, "activation": "ReLU"},
-                "phase": phase,
-                "phase_steps": phase_steps,
-                "total_steps": total_steps,
+                "network": {"hidden_sizes": HIDDEN_SIZES, "activation": model.activation},
+                "phase": trainer.phase,
+                "phase_steps": trainer.phase_steps,
+                "total_steps": trainer.total_steps,
                 "track": args.track,
                 "seed": args.seed,
+                "workers": args.workers,
+                "device": str(device),
                 "shared_policy": True,
                 "sources": "alpha-RACER Appendix E; Thakkar et al. self-play",
                 "git": git,
             }
-            _atomic_torch_save(_deployment_checkpoint(model, metadata), output_path)
-            _atomic_torch_save({
-                **metadata,
-                "format": TRAINING_CHECKPOINT_FORMAT,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "opponent_pool": list(opponent_pool),
-                "rng_state": rng.bit_generator.state,
-            }, state_path)
+            checkpoint.save(metadata)
             elapsed = time.monotonic() - started
-            mean_reward = float(np.mean(np.concatenate([
-                rollout["rewards"] for rollout in rollouts
-            ])))
             print(
-                f"phase={phase + (phase_steps > 0)}/{self_play.agent_switches} "
-                f"agent={learning_car} phase_steps={phase_steps} total={total_steps} "
+                f"phase={trainer.phase + (trainer.phase_steps > 0)}/"
+                f"{self_play.agent_switches} agent={learning_car} "
+                f"phase_steps={trainer.phase_steps} total={trainer.total_steps} "
                 f"reward={mean_reward:.5g} policy={metrics['policy_loss']:.5g} "
                 f"value={metrics['value_loss']:.5g} elapsed={elapsed:.1f}s",
                 flush=True,
             )
     finally:
         workers.close()
-    print(f"Training complete. Runtime checkpoint: {output_path}")
+    print(f"Training complete. Runtime checkpoint: {args.output}")
 
 
 def parse_args(argv=None):
@@ -607,6 +710,7 @@ def parse_args(argv=None):
         help="single training device: auto, cpu, cuda, cuda:0, ... (default: auto)",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--activation", choices=("tanh", "relu"), default="tanh")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
     if args.workers < 1:
