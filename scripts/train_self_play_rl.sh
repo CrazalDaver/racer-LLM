@@ -13,6 +13,7 @@ Usage: bash scripts/train_self_play_rl.sh [options]
   --workers N       CPU rollout workers/environments (default 8; paper uses 8)
   --device DEVICE   auto | cpu | cuda | cuda:N (one training GPU; rollout stays on CPU)
   --activation ACT  tanh | relu (default tanh)
+  --actor-save-phases N  Save a permanent actor every N completed phases (default 10)
   --seed N          Training seed
   --smoke           Run the short shared-policy three-phase pipeline check
   --check-only      Validate imports, track and selected device

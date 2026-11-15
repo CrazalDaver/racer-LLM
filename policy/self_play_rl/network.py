@@ -12,7 +12,7 @@ OBSERVATION_SIZE = 15
 ACTION_SIZE = 2
 # Thakkar's E2E/NonLSTM configuration supplies these hidden-layer sizes.
 HIDDEN_SIZES = (128, 128, 128)
-CHECKPOINT_FORMAT = "self_play_rl_torch_v2_shared"
+CHECKPOINT_FORMAT = "self_play_rl_torch_v3_bounded_mean"
 
 
 def _mlp(output_size, activation="tanh"):
@@ -27,6 +27,14 @@ def _mlp(output_size, activation="tanh"):
         input_size = hidden_size
     layers.append(nn.Linear(input_size, output_size))
     return nn.Sequential(*layers)
+
+
+def bounded_action_mean(raw_action):
+    """Map actor logits to throttle [0, 1] and steering [-1, 1]."""
+    return torch.stack(
+        (torch.sigmoid(raw_action[..., 0]), torch.tanh(raw_action[..., 1])),
+        dim=-1,
+    )
 
 
 class PPOActorCritic(nn.Module):
@@ -56,7 +64,7 @@ class PPOActorCritic(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(ACTION_SIZE))
 
     def distribution(self, observation):
-        mean = self.actor(observation)
+        mean = bounded_action_mean(self.actor(observation))
         std = self.log_std.exp().expand_as(mean)
         return torch.distributions.Normal(mean, std)
 
@@ -89,7 +97,7 @@ class TorchActorPolicy:
             raise ValueError("Self-play actor requires one finite 15-value observation")
         with torch.no_grad():
             tensor = torch.from_numpy(values).to(self.device).unsqueeze(0)
-            action = self.actor(tensor).squeeze(0).cpu().numpy()
+            action = bounded_action_mean(self.actor(tensor)).squeeze(0).cpu().numpy()
         return action, None
 
 
@@ -110,8 +118,7 @@ def load_actor_checkpoint(weight_path, device="cpu"):
     if not isinstance(state, dict) or not state:
         raise ValueError(f"Self-play checkpoint {path} has no shared actor")
     metadata = checkpoint.get("metadata", {})
-    # Earlier v2 files always used ReLU; their metadata may lack this field.
-    activation = metadata.get("network", {}).get("activation", "relu").lower()
+    activation = metadata.get("network", {}).get("activation", "tanh").lower()
     actor = _mlp(ACTION_SIZE, activation)
     actor.load_state_dict(state)
     return path, TorchActorPolicy(actor, device), metadata

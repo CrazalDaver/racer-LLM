@@ -10,7 +10,7 @@ import torch
 from .network import CHECKPOINT_FORMAT, actor_state
 
 
-TRAINING_CHECKPOINT_FORMAT = "self_play_rl_trainer_v3_complete"
+TRAINING_CHECKPOINT_FORMAT = "self_play_rl_trainer_v4_bounded_mean"
 
 
 class SelfPlayCheckpoint:
@@ -34,7 +34,9 @@ class SelfPlayCheckpoint:
     def _runtime_state(model, metadata):
         metadata = dict(metadata)
         metadata["network"] = {
-            **metadata.get("network", {}), "activation": model.activation,
+            **metadata.get("network", {}),
+            "activation": model.activation,
+            "action_mean": ("sigmoid", "tanh"),
         }
         return {
             "format": CHECKPOINT_FORMAT,
@@ -69,6 +71,15 @@ class SelfPlayCheckpoint:
             self._runtime_state(trainer.model, metadata), self.output_path
         )
 
+    def save_phase_actor(self, metadata, every_phases):
+        """Permanently publish the actor at completed phase boundaries."""
+        phase = self.trainer.phase
+        if phase <= 0 or self.trainer.phase_steps != 0 or phase % every_phases:
+            return None
+        path = self.state_path.parent / "actors" / f"phase_{phase:03d}.pth"
+        self._atomic_save(self._runtime_state(self.trainer.model, metadata), path)
+        return path
+
     def load(self):
         """Restore all mutable training state, or return False for a new run."""
         if not self.state_path.exists():
@@ -86,10 +97,7 @@ class SelfPlayCheckpoint:
             or saved.get("self_play_settings") != self.self_play_settings
         ):
             raise ValueError("Existing self-play checkpoint uses different settings")
-        # Older complete shared-policy checkpoints were always ReLU.
-        saved_activation = saved.get(
-            "activation", saved.get("network", {}).get("activation", "relu")
-        ).lower()
+        saved_activation = saved.get("activation", "tanh").lower()
         if saved_activation != trainer.model.activation:
             raise ValueError(
                 f"Checkpoint activation is {saved_activation}; use "

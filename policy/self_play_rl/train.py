@@ -28,6 +28,7 @@ from .checkpoint import SelfPlayCheckpoint
 from .network import (
     HIDDEN_SIZES,
     PPOActorCritic,
+    bounded_action_mean,
 )
 
 
@@ -277,7 +278,7 @@ def _worker_loop(connection, setup, worker_id):
                             raw_action, _, _ = model.sample(tensor)
                             raw_learning_action = raw_action.squeeze(0).numpy()
                         else:
-                            raw_action = model.actor(tensor)
+                            raw_action = bounded_action_mean(model.actor(tensor))
                         bounded = raw_action.squeeze(0).numpy()
                     joint_actions.append(CarAction(
                         throttle=float(np.clip(bounded[0], 0.0, 1.0)),
@@ -667,7 +668,11 @@ def train(args):
             metadata = {
                 "ppo_settings": asdict(ppo),
                 "self_play_settings": asdict(self_play),
-                "network": {"hidden_sizes": HIDDEN_SIZES, "activation": model.activation},
+                "network": {
+                    "hidden_sizes": HIDDEN_SIZES,
+                    "activation": model.activation,
+                    "action_mean": ("sigmoid", "tanh"),
+                },
                 "phase": trainer.phase,
                 "phase_steps": trainer.phase_steps,
                 "total_steps": trainer.total_steps,
@@ -680,6 +685,9 @@ def train(args):
                 "git": git,
             }
             checkpoint.save(metadata)
+            phase_actor = checkpoint.save_phase_actor(
+                metadata, args.actor_save_phases
+            )
             elapsed = time.monotonic() - started
             print(
                 f"phase={trainer.phase + (trainer.phase_steps > 0)}/"
@@ -689,6 +697,8 @@ def train(args):
                 f"value={metrics['value_loss']:.5g} elapsed={elapsed:.1f}s",
                 flush=True,
             )
+            if phase_actor is not None:
+                print(f"Saved phase actor: {phase_actor}", flush=True)
     finally:
         workers.close()
     print(f"Training complete. Runtime checkpoint: {args.output}")
@@ -711,10 +721,16 @@ def parse_args(argv=None):
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--activation", choices=("tanh", "relu"), default="tanh")
+    parser.add_argument(
+        "--actor-save-phases", type=int, default=10,
+        help="permanently save the runtime actor every N completed phases (default: 10)",
+    )
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if args.actor_save_phases < 1:
+        parser.error("--actor-save-phases must be positive")
     return args
 
 
