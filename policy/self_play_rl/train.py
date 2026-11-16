@@ -25,16 +25,12 @@ from track import Track, configure_track, load_centerline_csv
 from vehicle_model import DynamicBicycleModel, oriented_rectangle_overlap_cost
 
 from .checkpoint import SelfPlayCheckpoint
-from .network import (
-    HIDDEN_SIZES,
-    PPOActorCritic,
-    bounded_action_mean,
-)
+from .network import HIDDEN_SIZES, PPOActorCritic
 
 
 @dataclass(frozen=True)
 class PPOSettings:
-    """PPO settings from Alpha-RACER Appendix E and SB3 defaults."""
+    """PPO settings from Alpha-RACER Appendix E, SB3 defaults and Thakkar."""
 
     # Appendix E: learning rate, minibatch size, epochs, and discount.
     learning_rate: float = 5e-4
@@ -46,8 +42,21 @@ class PPOSettings:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     value_coefficient: float = 0.5
-    entropy_coefficient: float = 0.0
     max_gradient_norm: float = 0.5
+    # Thakkar E2E/NonLSTM beta=0.005; ML-Agents 0.27 decays it linearly to
+    # 1e-5 over the whole run.  Learning rate and clip ratio stay constant.
+    entropy_coefficient: float = 0.005
+    entropy_coefficient_final: float = 1e-5
+    # Local choice: offroad-recovery steps, whose commands the environment
+    # largely overrides, are excluded from the policy loss (value loss keeps them).
+    mask_recovery_policy_loss: bool = True
+
+    def entropy_at(self, step, total_steps):
+        """Linearly decayed entropy coefficient at one global step."""
+        fraction = min(max(step / total_steps, 0.0), 1.0)
+        return self.entropy_coefficient_final + (
+            self.entropy_coefficient - self.entropy_coefficient_final
+        ) * (1.0 - fraction)
 
 
 @dataclass(frozen=True)
@@ -58,8 +67,9 @@ class SelfPlaySettings:
     num_agents: int = 3
     agent_switches: int = 99
     steps_per_phase: int = 100_000
-    # Rollout timing follows old local defaults; starts are a local training choice.
-    rollout_steps: int = 256
+    # Transitions per PPO update, split across workers so the update size does
+    # not depend on --workers (local choice); starts are a local training choice.
+    rollout_samples: int = 2048
     episode_steps: int = 500
     dt: float = 0.1
     initial_speed: float = 0.0
@@ -206,6 +216,8 @@ class TrainingRace:
         metrics = {
             "offroad": int(sum(result.offroad_active)),
             "contact": int(result.contact_happened),
+            # Recovery was applied to this step's learning-car command.
+            "learning_recovery": bool(result.offroad_active[learning_car]),
         }
         if episode_end:
             self.reset()
@@ -257,7 +269,7 @@ def _worker_loop(connection, setup, worker_id):
             learning_car = command["learning_car"]
             models = _load_worker_policies(command["policies"], setup["activation"])
             observations, actions, rewards = [], [], []
-            next_observations, episode_ends = [], []
+            next_observations, episode_ends, recovery = [], [], []
             offroad = contact = 0
             for _ in range(command["steps"]):
                 joint_actions = []
@@ -276,11 +288,11 @@ def _worker_loop(connection, setup, worker_id):
                             raw_action, _, _ = model.sample(tensor)
                             raw_learning_action = raw_action.squeeze(0).numpy()
                         else:
-                            raw_action = bounded_action_mean(model.actor(tensor))
-                        bounded = raw_action.squeeze(0).numpy()
+                            raw_action = model.actor(tensor)  # deterministic mean
+                        raw_action = raw_action.squeeze(0).numpy()
                     joint_actions.append(CarAction(
-                        throttle=float(np.clip(bounded[0], 0.0, 1.0)),
-                        steer=float(np.clip(bounded[1], -1.0, 1.0)),
+                        throttle=float(np.clip(raw_action[0], 0.0, 1.0)),
+                        steer=float(np.clip(raw_action[1], -1.0, 1.0)),
                     ))
                 next_observation, reward, episode_end, metrics = race.step(
                     joint_actions, learning_car
@@ -290,6 +302,7 @@ def _worker_loop(connection, setup, worker_id):
                 rewards.append(reward)
                 next_observations.append(next_observation)
                 episode_ends.append(episode_end)
+                recovery.append(metrics["learning_recovery"])
                 offroad += metrics["offroad"]
                 contact += metrics["contact"]
             connection.send({
@@ -298,6 +311,7 @@ def _worker_loop(connection, setup, worker_id):
                 "rewards": np.asarray(rewards, dtype=np.float32),
                 "next_observations": np.asarray(next_observations, dtype=np.float32),
                 "episode_ends": np.asarray(episode_ends, dtype=bool),
+                "recovery": np.asarray(recovery, dtype=bool),
                 "offroad": offroad,
                 "contact": contact,
             })
@@ -374,7 +388,7 @@ class PPOUpdater:
     def _prepare_batch(self, model, rollouts, device):
         """Compute old-policy values, GAE advantages and return targets."""
         all_observations, all_actions, all_advantages, all_returns = [], [], [], []
-        all_old_log_probabilities = []
+        all_old_log_probabilities, all_policy_masks = [], []
         model.eval()
         for rollout in rollouts:
             observations = torch.from_numpy(rollout["observations"]).to(device)
@@ -402,20 +416,31 @@ class PPOUpdater:
             all_old_log_probabilities.append(old_log_probabilities)
             all_advantages.append(advantages)
             all_returns.append(advantages + values)
+            recovery = torch.from_numpy(rollout["recovery"]).to(device)
+            all_policy_masks.append(
+                ~recovery if self.settings.mask_recovery_policy_loss
+                else torch.ones_like(recovery)
+            )
 
         observations = torch.cat(all_observations)
         actions = torch.cat(all_actions)
         old_log_probabilities = torch.cat(all_old_log_probabilities)
         advantages = torch.cat(all_advantages)
         returns = torch.cat(all_returns)
-        advantages = (advantages - advantages.mean()) / advantages.std().clamp_min(1e-8)
-        return observations, actions, old_log_probabilities, advantages, returns
+        policy_mask = torch.cat(all_policy_masks)
+        # GAE above still runs through recovery steps; only the policy-loss
+        # samples are restricted, so normalize advantages over those samples.
+        if int(policy_mask.sum()) > 1:
+            controlled = advantages[policy_mask]
+            advantages = (advantages - controlled.mean()) / controlled.std().clamp_min(1e-8)
+        return observations, actions, old_log_probabilities, advantages, returns, policy_mask
 
-    def update(self, model, optimizer, rollouts, device, rng):
+    def update(self, model, optimizer, rollouts, device, rng, entropy_coefficient):
         """Compute GAE and perform all PPO epochs for one rollout batch."""
-        observations, actions, old_log_probabilities, advantages, returns = (
-            self._prepare_batch(model, rollouts, device)
-        )
+        (
+            observations, actions, old_log_probabilities, advantages, returns,
+            policy_mask,
+        ) = self._prepare_batch(model, rollouts, device)
         sample_count = len(observations)
         metrics = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "updates": 0}
         model.train()
@@ -435,13 +460,16 @@ class PPOUpdater:
                     1.0 - self.settings.clip_ratio,
                     1.0 + self.settings.clip_ratio,
                 ) * advantages[indices]
-                policy_loss = -torch.minimum(unclipped, clipped).mean()
+                mask = policy_mask[indices].float()
+                policy_loss = -(
+                    torch.minimum(unclipped, clipped) * mask
+                ).sum() / mask.sum().clamp_min(1.0)
                 value_loss = torch.nn.functional.mse_loss(value, returns[indices])
                 entropy_mean = entropy.mean()
                 loss = (
                     policy_loss
                     + self.settings.value_coefficient * value_loss
-                    - self.settings.entropy_coefficient * entropy_mean
+                    - entropy_coefficient * entropy_mean
                 )
                 optimizer.zero_grad()
                 loss.backward()
@@ -455,6 +483,8 @@ class PPOUpdater:
                 metrics["updates"] += 1
         for key in ("policy_loss", "value_loss", "entropy"):
             metrics[key] /= max(metrics["updates"], 1)
+        metrics["entropy_coefficient"] = float(entropy_coefficient)
+        metrics["policy_sample_fraction"] = float(policy_mask.float().mean())
         return metrics
 
 
@@ -551,10 +581,7 @@ class SelfPlayTrainer:
         for worker_states in self.selected_opponents:
             worker_states[learning_car] = _cpu_policy_state(self.model)
 
-        total = min(
-            boundary - self.phase_steps,
-            self.workers.count * self.settings.rollout_steps,
-        )
+        total = min(boundary - self.phase_steps, self.settings.rollout_samples)
         base, remainder = divmod(total, self.workers.count)
         steps = [
             base + (worker < remainder) for worker in range(self.workers.count)
@@ -563,9 +590,22 @@ class SelfPlayTrainer:
             learning_car, self.selected_opponents, steps, self.reset_workers
         )
         self.reset_workers = False
-        metrics = self.updater.update(
-            self.model, self.optimizer, rollouts, self.device, self.rng
+        entropy_coefficient = self.updater.settings.entropy_at(
+            self.total_steps,
+            self.settings.agent_switches * self.settings.steps_per_phase,
         )
+        metrics = self.updater.update(
+            self.model, self.optimizer, rollouts, self.device, self.rng,
+            entropy_coefficient,
+        )
+        # Learning-car safety diagnostics for the log; they do not enter PPO.
+        metrics["recovery_fraction"] = float(np.mean(np.concatenate([
+            rollout["recovery"] for rollout in rollouts
+        ])))
+        metrics["contact_fraction"] = sum(
+            rollout["contact"] for rollout in rollouts
+        ) / max(sum(steps), 1)
+        metrics["action_std"] = self.model.log_std.detach().exp().cpu().numpy().tolist()
         collected = sum(steps)
         self.phase_steps += collected
         self.total_steps += collected
@@ -605,7 +645,7 @@ def train(args):
         self_play = SelfPlaySettings(
             agent_switches=3,
             steps_per_phase=256,
-            rollout_steps=32,
+            rollout_samples=64,
             episode_steps=64,
             snapshot_steps=128,
             opponent_swap_steps=64,
@@ -614,6 +654,7 @@ def train(args):
         self_play.steps_per_phase,
         self_play.snapshot_steps,
         self_play.opponent_swap_steps,
+        self_play.rollout_samples,
     )
     if args.workers > shortest_boundary:
         raise ValueError(
@@ -669,7 +710,7 @@ def train(args):
                 "network": {
                     "hidden_sizes": HIDDEN_SIZES,
                     "activation": model.activation,
-                    "action_mean": ("sigmoid", "tanh"),
+                    "action_mean": ("linear", "linear"),
                 },
                 "phase": trainer.phase,
                 "phase_steps": trainer.phase_steps,
@@ -679,7 +720,7 @@ def train(args):
                 "workers": args.workers,
                 "device": str(device),
                 "shared_policy": True,
-                "sources": "alpha-RACER Appendix E; Thakkar et al. self-play",
+                "sources": "alpha-RACER Appendix E; SB3 PPO; Thakkar et al. self-play",
                 "git": git,
             }
             checkpoint.save(metadata)
@@ -692,7 +733,12 @@ def train(args):
                 f"{self_play.agent_switches} agent={learning_car} "
                 f"phase_steps={trainer.phase_steps} total={trainer.total_steps} "
                 f"reward={mean_reward:.5g} policy={metrics['policy_loss']:.5g} "
-                f"value={metrics['value_loss']:.5g} elapsed={elapsed:.1f}s",
+                f"value={metrics['value_loss']:.5g} "
+                f"ent_coef={metrics['entropy_coefficient']:.3g} "
+                f"std={metrics['action_std'][0]:.3g},{metrics['action_std'][1]:.3g} "
+                f"recovery={metrics['recovery_fraction']:.3f} "
+                f"contact={metrics['contact_fraction']:.3f} "
+                f"elapsed={elapsed:.1f}s",
                 flush=True,
             )
             if phase_actor is not None:

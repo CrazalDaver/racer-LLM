@@ -10,7 +10,7 @@ import torch
 from .network import CHECKPOINT_FORMAT, actor_state
 
 
-TRAINING_CHECKPOINT_FORMAT = "self_play_rl_trainer_v4_bounded_mean"
+TRAINING_CHECKPOINT_FORMAT = "self_play_rl_trainer_v5_linear_mean"
 
 
 class SelfPlayCheckpoint:
@@ -36,7 +36,7 @@ class SelfPlayCheckpoint:
         metadata["network"] = {
             **metadata.get("network", {}),
             "activation": model.activation,
-            "action_mean": ("sigmoid", "tanh"),
+            "action_mean": ("linear", "linear"),
         }
         return {
             "format": CHECKPOINT_FORMAT,
