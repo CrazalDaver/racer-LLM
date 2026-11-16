@@ -7,6 +7,8 @@ __pycache__/
 /AGENTS.md
 /agent/
 /test/agent/
+# Local experiment records (configs, summaries, notes); kept out of GitHub.
+/experiment/
 
 # Generated simulations and training artifacts.
 /result/

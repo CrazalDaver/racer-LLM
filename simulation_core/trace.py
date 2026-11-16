@@ -87,6 +87,15 @@ def create_simulation_trace(
         "car_llm_timeout_seconds": [
             float(getattr(policy, "timeout", np.nan)) for policy in policies
         ],
+        "car_llm_base_urls": [
+            str(getattr(policy, "base_url", "")) for policy in policies
+        ],
+        "car_llm_backends": [
+            str(getattr(policy, "backend", "")) for policy in policies
+        ],
+        "car_llm_seeds": [
+            int(getattr(policy, "seed", -1)) for policy in policies
+        ],
         "car_llm_retry_counts": [
             int(getattr(policy, "retry_count", 0)) for policy in policies
         ],
@@ -674,6 +683,9 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_llm_timeout_seconds=np.asarray(
             trace.get("car_llm_timeout_seconds", []), dtype=float
         ),
+        car_llm_base_urls=np.asarray(trace.get("car_llm_base_urls", []), dtype=str),
+        car_llm_backends=np.asarray(trace.get("car_llm_backends", []), dtype=str),
+        car_llm_seeds=np.asarray(trace.get("car_llm_seeds", []), dtype=np.int64),
         car_llm_retry_counts=np.asarray(
             trace.get("car_llm_retry_counts", []), dtype=int
         ),
@@ -736,6 +748,8 @@ def save_simulation_trace(trace, track, params, output_path=None):
         llm_raw_call_indices=np.asarray(trace.get("llm_raw_call_indices", []), dtype=int),
         llm_raw_prompts=np.asarray(trace.get("llm_raw_prompts", []), dtype=str),
         llm_raw_responses=np.asarray(trace.get("llm_raw_responses", []), dtype=str),
+        llm_raw_reasonings=np.asarray(trace.get("llm_raw_reasonings", []), dtype=str),
+        llm_raw_seeds=np.asarray(trace.get("llm_raw_seeds", []), dtype=np.int64),
         llm_raw_errors=np.asarray(trace.get("llm_raw_errors", []), dtype=str),
         llm_raw_done_reasons=np.asarray(trace.get("llm_raw_done_reasons", []), dtype=str),
         llm_raw_eval_counts=np.asarray(trace.get("llm_raw_eval_counts", []), dtype=int),

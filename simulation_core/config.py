@@ -162,6 +162,9 @@ class SimulationConfig:
     llm_models: Sequence[str | None] | None = None
     llm_temperature: float | None = None
     llm_temperatures: Sequence[float | None] | None = None
+    llm_base_url: str | None = None  # one shared server for all LLM cars
+    llm_backend: str | None = None
+    llm_seed: int | None = None
     llm_update_interval: float | None = None
     llm_observation_variant: str = "baseline"
     llm_prompt_module: str = "base"

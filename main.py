@@ -471,6 +471,14 @@ def _run_position_trial(
     return result
 
 
+def _trial_llm_seed(seed, ego_position, repeat):
+    """Per-race LLM base seed from (seed, ego position, repeat), like alpha starts."""
+    return int(
+        np.random.SeedSequence([int(seed), int(ego_position), int(repeat)])
+        .generate_state(1)[0]
+    )
+
+
 def _alpha_initial_joint_params(seed, ego_position, repeat):
     """Per-race alpharacer start, sampled like the official comparison script.
 
@@ -524,6 +532,12 @@ def _run_sweep_trials(
                     alpha_initial_seed, ego_position, repeat
                 )
                 overrides["alpha_initial_joint_params_by_car"] = initial_joint.tolist()
+            # Repeats differ at temperature > 0 but each race stays reproducible.
+            base_llm_seed = simulation_overrides.get("llm_seed")
+            overrides["llm_seed"] = _trial_llm_seed(
+                params.LLM_SEED if base_llm_seed is None else base_llm_seed,
+                ego_position, repeat,
+            )
             trial_id = len(tasks) + 1
             tasks.append({
                 "trial": trial_id,
@@ -532,6 +546,7 @@ def _run_sweep_trials(
                 "alpha_initial_joint_params": (
                     None if initial_joint is None else initial_joint.tolist()
                 ),
+                "llm_seed": overrides["llm_seed"],
                 "policy_names": list(policy_names),
                 "trace_path": trace_dir / f"trial_{trial_id:03d}.npz",
                 "simulation_overrides": overrides,
@@ -602,6 +617,7 @@ def _run_sweep_trials(
             "ego_position": task["ego_position"],
             "repeat": task["repeat"],
             "alpha_initial_joint_params": task["alpha_initial_joint_params"],
+            "llm_seed": task["llm_seed"],
             "winner": winner_role,
             "winner_index": winner_index,
             "winner_policy": winner_policy,
@@ -697,6 +713,12 @@ def run_position_sweep(
         "alpha_initial_params": alpha_initial_params,
         "alpha_initial_seed": (
             int(alpha_initial_seed) if alpha_initial_params == "random" else None
+        ),
+        # Base seed; every trial record holds its derived per-race llm_seed.
+        "llm_seed_base": int(
+            params.LLM_SEED
+            if simulation_overrides.get("llm_seed") is None
+            else simulation_overrides["llm_seed"]
         ),
         "ego_positions": ego_positions,
         "winner_counts": winner_counts,
@@ -832,6 +854,18 @@ def _add_sim_args(parser):
     group.add_argument("--llm-models", nargs="+", default=None)
     group.add_argument("--llm-temperature", type=float, default=None)
     group.add_argument("--llm-temperatures", nargs="+", type=float, default=None)
+    group.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="OpenAI-compatible server root (default: config LLM_BASE_URL, local Ollama).",
+    )
+    group.add_argument("--llm-backend", choices=["ollama", "vllm"], default=None)
+    group.add_argument(
+        "--llm-seed",
+        type=int,
+        default=None,
+        help="Base LLM sampling seed (default: config LLM_SEED); each race derives its own.",
+    )
     group.add_argument(
         "--llm-update-interval-seconds",
         type=float,
@@ -1000,6 +1034,9 @@ def _sweep_kwargs_from_args(args):
         "potential_regret_optimizer_seed": args.potential_regret_optimizer_seed,
         "llm_temperature": args.llm_temperature,
         "llm_temperatures": args.llm_temperatures,
+        "llm_base_url": args.llm_base_url,
+        "llm_backend": args.llm_backend,
+        "llm_seed": args.llm_seed,
         "show_plot": args.show_plot,
         "rl_model_path": args.rl_model_path,
     }

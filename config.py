@@ -234,7 +234,14 @@ class SimParams:
     # ==================== LLM POLICIES =========================
 
     LLM_MODEL = "qwen2.5:7b"
+    # OpenAI-compatible server root; requests go to {base}/v1/chat/completions.
+    # Local Ollama: http://localhost:11434; vLLM default: http://localhost:8000.
     LLM_BASE_URL = "http://localhost:11434"
+    # Server family; only selects the field that switches model thinking on/off.
+    LLM_BACKEND = "ollama"  # "ollama" or "vllm"
+    # Sampling seed; each request uses a seed derived from (seed, car, call).
+    # A position sweep first derives one seed per (ego position, repeat).
+    LLM_SEED = 0
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.0
     LLM_UPDATE_INTERVAL_SECONDS = 1.0

@@ -31,6 +31,8 @@ class LLMPolicyBase:
         *args,
         model_name="qwen2.5:7b",
         base_url="http://localhost:11434",
+        backend="ollama",
+        seed=0,
         timeout=3.0,
         temperature=0.0,
         thinking=False,
@@ -46,7 +48,12 @@ class LLMPolicyBase:
             raise ValueError("LLM subclass must declare response_format")
 
         self.model_name = str(model_name)
-        self.base_url = str(base_url).rstrip("/")
+        # Server root; a trailing /v1 is accepted and removed.
+        self.base_url = re.sub(r"/v1$", "", str(base_url).rstrip("/"))
+        self.backend = str(backend).strip().lower()
+        if self.backend not in {"ollama", "vllm"}:
+            raise ValueError(f"Unknown LLM backend: {backend!r}")
+        self.seed = int(seed)
         self.timeout = float(timeout)
         self.temperature = float(np.clip(temperature, 0.0, 2.0))
         self.thinking = bool(thinking)
@@ -288,22 +295,52 @@ class LLMPolicyBase:
     def finish_decision_attempt(self, observed):
         """Commit subclass-specific memory after success or handled failure."""
 
+    def _thinking_fields(self):
+        """Return the server-specific field that switches model thinking."""
+        if self.backend == "vllm":
+            # Read by the Qwen3 chat template; other templates ignore it.
+            return {"chat_template_kwargs": {"enable_thinking": self.thinking}}
+        # Ollama ignores chat_template_kwargs; "none" disables thinking and is
+        # accepted by non-thinking models. Thinking uses the model default.
+        return {} if self.thinking else {"reasoning_effort": "none"}
+
+    def _request_seed(self):
+        """Seed of this request from (policy seed, car, call index)."""
+        return int(
+            np.random.SeedSequence(
+                [self.seed, int(self.car_idx or 0), self._llm_call_count]
+            ).generate_state(1)[0]
+        )
+
     def call_llm(self, prompt):
-        """Send one prompt to Ollama and return the parsed JSON response."""
+        """Send one chat request to an OpenAI-compatible server, parse its JSON.
+
+        Ollama (/v1) and vLLM share this request. The response schema is
+        enforced server-side through ``response_format``.
+        """
         request_body = {
             "model": self.model_name,
-            "system": self.system_prompt,
-            "prompt": prompt,
-            "format": self.response_schema(),
-            "think": self.thinking,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.temperature,
+            "seed": self._request_seed(),
+            "max_tokens": self.num_predict,  # includes thinking tokens
             "stream": False,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.num_predict,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"{self.response_format}_decision",
+                    "schema": self.response_schema(),
+                    "strict": True,
+                },
             },
+            **self._thinking_fields(),
         }
+        self._last_llm_seed = request_body["seed"]
         request = urllib.request.Request(
-            f"{self.base_url}/api/generate",
+            f"{self.base_url}/v1/chat/completions",
             data=json.dumps(request_body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -315,21 +352,27 @@ class LLMPolicyBase:
         finally:
             self._last_llm_latency_seconds = time.perf_counter() - started
 
-        def integer(name):
-            """Read one optional Ollama counter using -1 for unavailable data."""
-            value = body.get(name)
+        choice = body["choices"][0]
+        message = choice["message"]
+        usage = body.get("usage") or {}
+
+        def integer(value):
+            """Read one optional token counter using -1 for unavailable data."""
             return -1 if value is None else int(value)
 
-        self._last_raw_llm_response = str(body.get("response", ""))
-        self._last_llm_done_reason = str(body.get("done_reason", ""))
-        self._last_llm_eval_count = integer("eval_count")
-        self._last_llm_prompt_eval_count = integer("prompt_eval_count")
-        self._last_llm_prompt_eval_cached_count = integer(
-            "prompt_eval_cached_count"
+        self._last_raw_llm_response = str(message.get("content") or "")
+        # vLLM names the thinking text reasoning_content, Ollama reasoning.
+        self._last_llm_reasoning = str(
+            message.get("reasoning_content") or message.get("reasoning") or ""
         )
-        self._last_llm_prompt_eval_duration_ns = integer("prompt_eval_duration")
-        self._last_llm_load_duration_ns = integer("load_duration")
-        self._last_llm_eval_duration_ns = integer("eval_duration")
+        self._last_llm_done_reason = str(choice.get("finish_reason") or "")
+        self._last_llm_eval_count = integer(usage.get("completion_tokens"))
+        self._last_llm_prompt_eval_count = integer(usage.get("prompt_tokens"))
+        self._last_llm_prompt_eval_cached_count = integer(
+            (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        )
+        # Server-side load/prompt/eval durations are not part of this API;
+        # those fields stay -1 and latency_seconds is the wall-clock time.
         return self._extract_json(self._last_raw_llm_response)
 
     def _extract_json(self, text):
@@ -359,6 +402,8 @@ class LLMPolicyBase:
     def _reset_response_metadata(self):
         """Clear raw-response fields before recording one request attempt."""
         self._last_raw_llm_response = ""
+        self._last_llm_reasoning = ""
+        self._last_llm_seed = -1
         self._last_llm_done_reason = ""
         self._last_llm_eval_count = -1
         self._last_llm_prompt_eval_count = -1
@@ -375,6 +420,8 @@ class LLMPolicyBase:
                 "call": self._llm_call_count,
                 "prompt": prompt,
                 "response": self._last_raw_llm_response,
+                "reasoning": self._last_llm_reasoning,
+                "seed": self._last_llm_seed,
                 "error": "" if error is None else str(error),
                 "done_reason": self._last_llm_done_reason,
                 "eval_count": self._last_llm_eval_count,

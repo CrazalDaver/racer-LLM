@@ -219,6 +219,8 @@ class TraceRecorder:
             "llm_raw_call_indices": (lambda item: item["call"], -1),
             "llm_raw_prompts": (lambda item: item["prompt"], ""),
             "llm_raw_responses": (lambda item: item["response"], ""),
+            "llm_raw_reasonings": (lambda item: item.get("reasoning", ""), ""),
+            "llm_raw_seeds": (lambda item: item.get("seed", -1), -1),
             "llm_raw_errors": (lambda item: item["error"], ""),
             "llm_raw_done_reasons": (
                 lambda item: item.get("done_reason", ""), ""

@@ -59,6 +59,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   alpharacer_initial_joint_params=None, ibr_strategy_space=None,
                   llm_policy_params=None, llm_output_mode=None,
                   llm_model_name=None, llm_temperature=None,
+                  llm_base_url=None, llm_backend=None, llm_seed=None,
                   llm_update_interval_seconds=None,
                   llm_observation_variant="baseline",
                   llm_prompt_module="base",
@@ -86,7 +87,9 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
         }[resolve_llm_output(output_mode, model_name)]
         llm_kwargs = dict(
             model_name=model_name,
-            base_url=params.LLM_BASE_URL,
+            base_url=params.LLM_BASE_URL if llm_base_url is None else llm_base_url,
+            backend=params.LLM_BACKEND if llm_backend is None else llm_backend,
+            seed=params.LLM_SEED if llm_seed is None else llm_seed,
             timeout=params.LLM_TIMEOUT,
             temperature=(
                 params.LLM_TEMPERATURE
