@@ -825,21 +825,6 @@ def save_simulation_trace(trace, track, params, output_path=None):
             -1 if trace.get("random_seed") is None else trace["random_seed"],
             dtype=int,
         ),
-        oracle_mode_names=np.asarray(
-            trace.get("oracle_mode_names", []), dtype=str
-        ),
-        oracle_mode_presets_json=np.asarray(
-            json.dumps(trace.get("oracle_mode_presets", {}), sort_keys=True)
-        ),
-        oracle_settings_json=np.asarray(
-            json.dumps(trace.get("oracle_settings", {}), sort_keys=True)
-        ),
-        oracle_decisions_json=np.asarray(
-            json.dumps(trace.get("oracle_decisions_by_car", []), sort_keys=True)
-        ),
-        oracle_mode_counts_json=np.asarray(
-            json.dumps(trace.get("oracle_mode_counts_by_car", []), sort_keys=True)
-        ),
         mode_alpharacer_decisions_json=np.asarray(
             json.dumps(
                 trace.get("mode_alpharacer_decisions_by_car", []), sort_keys=True

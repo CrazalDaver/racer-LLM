@@ -13,7 +13,7 @@ from .llm import (
 )
 from .base import BasePolicy
 from .mpc import CenterLinePolicy, MPCPolicy, StaticAlphaRacerPolicy
-from .oracle_mode import FixedModePolicy, OracleModePolicy
+from .fixed_mode import FixedModePolicy
 from .self_play_rl import SelfPlayRLPolicy
 from .utils import (
     angle_delta,
@@ -37,7 +37,6 @@ __all__ = [
     "LLMPolicyBase",
     "MPCPolicy",
     "ModeAlphaRacerPolicy",
-    "OracleModePolicy",
     "SelfPlayRLPolicy",
     "StaticAlphaRacerPolicy",
     "angle_delta",

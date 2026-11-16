@@ -91,7 +91,7 @@ class DynamicParams:
 
 
 PolicyName = Literal[
-    "centerline", "static_alpharacer", "fixed_push", "oracle_mode",
+    "centerline", "static_alpharacer", "fixed_push",
     "alpharacer", "mode_alpharacer", "ibr",
     "llm_alpharacer", "self_play_rl",
 ]
@@ -167,16 +167,6 @@ class SimulationConfig:
     llm_include_raceline_speed: bool | None = None
     llm_include_current_parameters: bool | None = None
     llm_include_decision_feedback: bool | None = None
-
-    # Discrete receding-horizon oracle.  ``None`` uses the documented defaults
-    # in config.params, keeping ordinary simulations unchanged.
-    oracle_horizon_seconds: float | None = None
-    oracle_commitment_seconds: float | None = None
-    oracle_progress_weight: float | None = None
-    oracle_relative_progress_weight: float | None = None
-    oracle_collision_penalty: float | None = None
-    oracle_offtrack_penalty_per_second: float | None = None
-    oracle_tie_tolerance: float | None = None
 
     # Optional learned-potential paired-rollout diagnostic. Disabled by
     # default so existing simulations do not load a network or branch state.

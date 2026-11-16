@@ -14,7 +14,6 @@ from mpc_controller import ReferenceTrajectoryMPC
 from visualization.plotting import plot_simulation_results
 from policy import progress_delta
 from simulation_core.environment import RaceEnvironment
-from simulation_core.oracle import OracleRolloutEvaluator
 from simulation_core.recorder import TraceRecorder
 from state import CarState
 from simulation_core.config import LLM_OBSERVATION_VARIANTS, SimulationConfig
@@ -176,13 +175,6 @@ class Race:
         self.mpc_collision_slack_weight = (
             base_mpc_settings.collision_slack_weight
         )
-        self.oracle_commitment_seconds = (
-            params.ORACLE_COMMITMENT_SECONDS
-            if config.oracle_commitment_seconds is None
-            else float(config.oracle_commitment_seconds)
-        )
-        if self.oracle_commitment_seconds <= 0.0:
-            raise ValueError("oracle_commitment_seconds must be positive")
         self.resolved_mpc_formulation = (
             params.MPC_FORMULATION
             if config.mpc_formulation is None
@@ -236,7 +228,6 @@ class Race:
                     llm_include_decision_feedback=(
                         config.llm_include_decision_feedback
                     ),
-                    oracle_commitment_seconds=self.oracle_commitment_seconds,
                     self_play_rl_model_path=config.rl_model_path,
                 )
             )
@@ -294,14 +285,6 @@ class Race:
             vehicle_models=self.vehicle_models,
             initial_progress=initial_progress,
         )
-        self.oracle_evaluator = (
-            OracleRolloutEvaluator(self)
-            if any(
-                hasattr(policy, "oracle_decision_due")
-                for policy in self.policies
-            )
-            else None
-        )
         self.potential_regret_evaluator = None
         if self.config.potential_regret_enabled:
             from evaluation.potential_regret import PotentialRegretEvaluator
@@ -335,18 +318,6 @@ class Race:
                 regret_previous_theta = np.asarray(
                     self.policies[self.ego_idx].params, dtype=float
                 ).copy()
-
-            # Oracle branches are evaluated from this single pre-action
-            # snapshot.  Applying the winning preset changes policy state only;
-            # the real environment is advanced exactly once below.
-            if self.oracle_evaluator is not None:
-                for policy in self.policies:
-                    due = getattr(policy, "oracle_decision_due", None)
-                    if due is not None and due(step):
-                        decision = self.oracle_evaluator.evaluate(
-                            policy, observation, step
-                        )
-                        policy.apply_oracle_decision(decision)
 
             # ----- B. Ask every policy to act -----
             try:

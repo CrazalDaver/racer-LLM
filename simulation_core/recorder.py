@@ -78,16 +78,6 @@ class TraceRecorder:
         self.trace["mpc_horizon"] = int(race.mpc_horizon)
         self.trace["mpc_formulation"] = race.resolved_mpc_formulation
         self.trace["random_seed"] = race.random_seed
-        self.trace["oracle_settings"] = (
-            {}
-            if race.oracle_evaluator is None
-            else race.oracle_evaluator.settings_dict()
-        )
-        self.trace["oracle_mode_names"] = list(params.LLM_MODE_PRESETS)
-        self.trace["oracle_mode_presets"] = {
-            name: np.asarray(values, dtype=float).tolist()
-            for name, values in params.LLM_MODE_PRESETS.items()
-        }
         self.trace["potential_regret_settings"] = (
             {}
             if race.potential_regret_evaluator is None
@@ -262,21 +252,6 @@ class TraceRecorder:
         self.trace["car_policy_decision_counts"] = [
             int(getattr(policy, "policy_decision_count", 0))
             for policy in self.race.policies
-        ]
-        oracle_histories = [
-            list(getattr(policy, "oracle_decision_history", []))
-            for policy in self.race.policies
-        ]
-        self.trace["oracle_decisions_by_car"] = oracle_histories
-        self.trace["oracle_mode_counts_by_car"] = [
-            {
-                mode: sum(
-                    decision.get("selected_mode") == mode
-                    for decision in history
-                )
-                for mode in params.LLM_MODE_PRESETS
-            }
-            for history in oracle_histories
         ]
         mode_alpharacer_histories = [
             list(getattr(policy, "mode_alpharacer_decision_history", []))
