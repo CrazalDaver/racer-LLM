@@ -39,6 +39,7 @@ class AlphaRacerPolicy(MPCPolicy):
         gradient_rate=1e-4,
         initial_params=None,
         opponent_default_params=None,
+        initial_joint_params=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -73,6 +74,12 @@ class AlphaRacerPolicy(MPCPolicy):
         self._oracle_rollout_frozen = False
         if self.car_idx is not None and 0 <= self.car_idx < 3:
             self.joint_params[self.car_idx] = self.params
+        if initial_joint_params is not None:
+            # Optional per-race start (official comparison script): own row is
+            # the initial theta, other rows the initial estimate of opponents.
+            self.joint_params = np.asarray(initial_joint_params, dtype=float).copy()
+            assert self.joint_params.shape == (3, 5) and self.car_idx in range(3)
+            self.params = self.joint_params[self.car_idx].copy()
         # This is this agent's own estimate of the joint policy parameters.
         # It is deliberately not shared with other AlphaRacerPolicy instances:
         # each agent solves the paper's online potential maximization from its

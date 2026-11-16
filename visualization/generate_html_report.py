@@ -155,7 +155,15 @@ def _sweep_description(summary) -> str:
     policies = ", ".join(html.escape(str(value)) for value in summary["policy_names"])
     trials = len(summary["trials"])
     repeats = summary.get("trials_per_position", "?")
-    return f"{trials} trials &nbsp;·&nbsp; {repeats} per position &nbsp;·&nbsp; policies: {policies}"
+    alpha_start = summary.get("alpha_initial_params")
+    if alpha_start == "random":
+        alpha_start = f"random (seed {summary.get('alpha_initial_seed')})"
+    alpha_text = (
+        f" &nbsp;·&nbsp; alpha initial params: {html.escape(str(alpha_start))}"
+        if alpha_start
+        else ""
+    )
+    return f"{trials} trials &nbsp;·&nbsp; {repeats} per position &nbsp;·&nbsp; policies: {policies}{alpha_text}"
 
 
 def _sweep_table(summary) -> str:
@@ -165,6 +173,10 @@ def _sweep_table(summary) -> str:
         f"<strong>{html.escape(str(role))}</strong>: {int(count)}"
         for role, count in winner_counts.items()
     )
+    if summary.get("failure_count"):  # Shown only when a race failed.
+        count_text += (
+            f" &nbsp;·&nbsp; <strong>failed</strong>: {int(summary['failure_count'])}"
+        )
     body = []
     for trial in summary["trials"]:
         progress = ", ".join(f"{float(value):.2f}" for value in trial.get("final_progress", []))
@@ -215,7 +227,11 @@ def _trial_from_npz(trace_path, trial_number, repeat=1):
     with np.load(trace_path, allow_pickle=False) as data:
         policies = [str(value) for value in np.asarray(data["policy_names"]).tolist()]
         final_progress = np.asarray(data["car_px"], dtype=float)[-1]
-        winner_index = int(np.nanargmax(final_progress))
+        failed = (
+            "failure_json" in data.files
+            and json.loads(str(data["failure_json"])) is not None
+        )
+        winner_index = None if failed else int(np.nanargmax(final_progress))
         ego_position = int(_scalar(data, "ego_position", 1))
         start_ranks = _scalar(data, "start_ranks", list(range(len(final_progress))))
     roles = ["ego", *[f"oppo{idx}" for idx in range(1, len(final_progress))]]
@@ -223,9 +239,9 @@ def _trial_from_npz(trace_path, trial_number, repeat=1):
         "trial": int(trial_number),
         "ego_position": ego_position,
         "repeat": int(repeat),
-        "winner": roles[winner_index],
+        "winner": "failed" if winner_index is None else roles[winner_index],
         "winner_index": winner_index,
-        "winner_policy": policies[winner_index],
+        "winner_policy": None if winner_index is None else policies[winner_index],
         "final_progress": final_progress.tolist(),
         "start_ranks": start_ranks,
     }, policies
@@ -239,16 +255,20 @@ def _combined_summary(trials, policies):
         str(position): {role: 0 for role in roles} for position in positions
     }
     trials_by_position = {position: 0 for position in positions}
+    failure_counts_by_position = {str(position): 0 for position in positions}
     for trial in trials:
         role = str(trial["winner"])
         position = int(trial["ego_position"])
+        trials_by_position[position] += 1
+        if role == "failed":  # Solver failure: no winner, counted separately.
+            failure_counts_by_position[str(position)] += 1
+            continue
         if role not in winner_counts:
             winner_counts[role] = 0
             for counts in counts_by_position.values():
                 counts[role] = 0
         winner_counts[role] += 1
         counts_by_position[str(position)][role] += 1
-        trials_by_position[position] += 1
     repeat_counts = set(trials_by_position.values())
     trials_per_position = repeat_counts.pop() if len(repeat_counts) == 1 else "varies"
     return {
@@ -257,8 +277,23 @@ def _combined_summary(trials, policies):
         "ego_positions": positions,
         "winner_counts": winner_counts,
         "winner_counts_by_position": counts_by_position,
+        "failure_count": sum(failure_counts_by_position.values()),
+        "failure_counts_by_position": failure_counts_by_position,
+        **_combined_alpha_start(trials),
         "trials": trials,
     }
+
+
+def _combined_alpha_start(trials):
+    """Alpharacer start mode shared by the source sweeps, or 'mixed'."""
+    starts = {
+        (trial.get("alpha_initial_params"), trial.get("alpha_initial_seed"))
+        for trial in trials
+    }
+    if len(starts) != 1:
+        return {"alpha_initial_params": "mixed"}
+    mode, seed = starts.pop()
+    return {"alpha_initial_params": mode, "alpha_initial_seed": seed}
 
 
 def generate_report(
@@ -304,6 +339,8 @@ def generate_report(
                     report_trial_number += 1
                     trial = {key: value for key, value in source_trial.items() if key != "npz"}
                     trial["trial"] = report_trial_number
+                    trial["alpha_initial_params"] = summary.get("alpha_initial_params")
+                    trial["alpha_initial_seed"] = summary.get("alpha_initial_seed")
                     aggregate_trials.append(trial)
                     embedded_trace = source_trial.get("npz")
                     if embedded_trace:

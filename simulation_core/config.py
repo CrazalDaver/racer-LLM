@@ -147,9 +147,10 @@ class SimulationConfig:
     # Static and trained AlphaRacer
     static_params: Sequence[float] | None = None
     static_params_by_car: Sequence[Sequence[float]] | None = None
-    alpha_params: Sequence[float] | None = None
     alpha_weight_path: str | None = None
     alpha_weight_paths: Sequence[str | None] | None = None
+    # Per car (num_cars, 3, 5): own initial theta and initial opponent estimate.
+    alpha_initial_joint_params_by_car: Sequence | None = None
 
     # IBR
     ibr_strategy_space: str | None = None

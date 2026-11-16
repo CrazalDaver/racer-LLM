@@ -446,12 +446,19 @@ def _run_position_trial(
 
     with np.load(trace_path, allow_pickle=True) as data:
         final_progress = np.asarray(data["car_px"], dtype=float)[-1].copy()
-        winner_index = int(np.nanargmax(final_progress))
+        # A solver failure stops the race early; its last progress is not a result.
+        failure = (
+            json.loads(str(data["failure_json"]))
+            if "failure_json" in data.files
+            else None
+        )
+        winner_index = None if failure else int(np.nanargmax(final_progress))
         start_ranks = [
             int(value) for value in np.asarray(data["start_ranks"]).tolist()
         ]
         result = {
             "winner_index": winner_index,
+            "failure": _jsonable(failure),
             "final_progress": _jsonable(final_progress),
             "start_ranks": start_ranks,
             "safety_summary": _trace_safety_summary(data),
@@ -464,6 +471,33 @@ def _run_position_trial(
     return result
 
 
+def _alpha_initial_joint_params(seed, ego_position, repeat):
+    """Per-race alpharacer start, sampled like the official comparison script.
+
+    Every car gets its own 3x5 joint estimate (own row = initial theta, other
+    rows = initial opponent estimate). The draw depends only on (seed, ego
+    position, repeat), so different rosters share the same race starts.
+    """
+    from policy.alpharacer.train.training import sample_upstream_params
+
+    rng = np.random.default_rng([int(seed), int(ego_position), int(repeat)])
+    return sample_upstream_params(rng, 9).reshape(3, 3, 5)
+
+
+def _run_trial_task(task):
+    """Process-pool entry: run one race and return its identity and result."""
+    result = _run_position_trial(
+        task["policy_names"],
+        task["ego_position"],
+        task["trace_path"],
+        task["simulation_overrides"],
+        suppress_output=task["suppress_output"],
+    )
+    if not task["keep_npz"]:
+        Path(task["trace_path"]).unlink(missing_ok=True)
+    return task["trial"], result
+
+
 def _run_sweep_trials(
     policy_names,
     ego_positions,
@@ -474,80 +508,115 @@ def _run_sweep_trials(
     show_progress,
     suppress_output,
     simulation_overrides,
+    alpha_initial_params="fixed",
+    alpha_initial_seed=0,
+    workers=1,
 ):
-    """Execute the trial matrix; every iteration calls one simulation."""
+    """Execute the trial matrix; every task is one independent simulation."""
     roles = ["ego", "oppo1", "oppo2"]
-    winner_counts = {role: 0 for role in roles}
-    winner_counts_by_position = {
-        str(position): {role: 0 for role in roles}
-        for position in ego_positions
-    }
-    records = []
-    total_trials = int(trials_per_position) * len(ego_positions)
+    tasks = []
+    for ego_position in ego_positions:
+        for repeat in range(1, int(trials_per_position) + 1):
+            overrides = dict(simulation_overrides)
+            initial_joint = None
+            if alpha_initial_params == "random":
+                initial_joint = _alpha_initial_joint_params(
+                    alpha_initial_seed, ego_position, repeat
+                )
+                overrides["alpha_initial_joint_params_by_car"] = initial_joint.tolist()
+            trial_id = len(tasks) + 1
+            tasks.append({
+                "trial": trial_id,
+                "ego_position": ego_position,
+                "repeat": repeat,
+                "alpha_initial_joint_params": (
+                    None if initial_joint is None else initial_joint.tolist()
+                ),
+                "policy_names": list(policy_names),
+                "trace_path": trace_dir / f"trial_{trial_id:03d}.npz",
+                "simulation_overrides": overrides,
+                "suppress_output": suppress_output,
+                "keep_npz": keep_npz,
+            })
+
     progress_bar = (
-        tqdm(
-            total=total_trials,
-            desc="Position sweep",
-            unit="sim",
-            dynamic_ncols=True,
-            leave=True,
-        )
+        tqdm(total=len(tasks), desc="Position sweep", unit="sim",
+             dynamic_ncols=True, leave=True)
         if show_progress and tqdm is not None
         else None
     )
+    results = {}
+
+    def finished(trial_id, result):
+        results[trial_id] = result
+        task = tasks[trial_id - 1]
+        if progress_bar is None:
+            print(f"[{len(results)}/{len(tasks)}] trial={trial_id} "
+                  f"ego_position={task['ego_position']} repeat={task['repeat']}")
+        else:
+            progress_bar.set_postfix(ego_position=task["ego_position"],
+                                     trial=task["repeat"], refresh=False)
+            progress_bar.update(1)
 
     try:
-        trial_id = 0
-        for ego_position in ego_positions:
-            for repeat in range(int(trials_per_position)):
-                trial_id += 1
-                if progress_bar is None:
-                    print(
-                        f"[{trial_id}/{total_trials}] "
-                        f"ego_position={ego_position}, trial={repeat + 1}"
-                    )
-                else:
-                    progress_bar.set_postfix(
-                        ego_position=ego_position,
-                        trial=repeat + 1,
-                        refresh=True,
-                    )
+        if workers <= 1:
+            for task in tasks:
+                finished(*_run_trial_task(task))
+        else:
+            import concurrent.futures
+            import multiprocessing
 
-                trace_path = trace_dir / f"trial_{trial_id:03d}.npz"
-                result = _run_position_trial(
-                    policy_names,
-                    ego_position,
-                    trace_path,
-                    simulation_overrides,
-                    suppress_output=suppress_output,
-                )
-                winner_index = result["winner_index"]
-                winner_role = roles[winner_index]
-                if not keep_npz:
-                    trace_path.unlink(missing_ok=True)
-
-                winner_counts[winner_role] += 1
-                winner_counts_by_position[str(ego_position)][winner_role] += 1
-                records.append({
-                    "trial": trial_id,
-                    "ego_position": ego_position,
-                    "repeat": repeat + 1,
-                    "winner": winner_role,
-                    "winner_index": winner_index,
-                    "winner_policy": policy_names[winner_index],
-                    "final_progress": result["final_progress"],
-                    "start_ranks": result["start_ranks"],
-                    "safety_summary": result["safety_summary"],
-                    "decision_summary_by_car": result["decision_summary_by_car"],
-                    "npz": result["npz"],
-                })
-                if progress_bar is not None:
-                    progress_bar.update(1)
+            # spawn: no CasADi/torch state is inherited from the parent.
+            context = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=min(int(workers), len(tasks)), mp_context=context
+            ) as executor:
+                futures = [executor.submit(_run_trial_task, task) for task in tasks]
+                for future in concurrent.futures.as_completed(futures):
+                    finished(*future.result())
     finally:
         if progress_bar is not None:
             progress_bar.close()
 
-    return records, winner_counts, winner_counts_by_position
+    winner_counts = {role: 0 for role in roles}
+    winner_counts_by_position = {
+        str(position): {role: 0 for role in roles} for position in ego_positions
+    }
+    failure_counts_by_position = {str(position): 0 for position in ego_positions}
+    records = []
+    for task in tasks:  # Tally in trial order, independent of completion order.
+        result = results[task["trial"]]
+        position = str(task["ego_position"])
+        winner_index = result["winner_index"]
+        if winner_index is None:
+            # Failed races get no winner and are counted separately.
+            winner_role, winner_policy = "failed", None
+            failure_counts_by_position[position] += 1
+        else:
+            winner_role = roles[winner_index]
+            winner_policy = policy_names[winner_index]
+            winner_counts[winner_role] += 1
+            winner_counts_by_position[position][winner_role] += 1
+        records.append({
+            "trial": task["trial"],
+            "ego_position": task["ego_position"],
+            "repeat": task["repeat"],
+            "alpha_initial_joint_params": task["alpha_initial_joint_params"],
+            "winner": winner_role,
+            "winner_index": winner_index,
+            "winner_policy": winner_policy,
+            "failure": result["failure"],
+            "final_progress": result["final_progress"],
+            "start_ranks": result["start_ranks"],
+            "safety_summary": result["safety_summary"],
+            "decision_summary_by_car": result["decision_summary_by_car"],
+            "npz": result["npz"],
+        })
+
+    return (
+        records, winner_counts, winner_counts_by_position,
+        failure_counts_by_position,
+    )
 
 
 def run_position_sweep(
@@ -558,13 +627,29 @@ def run_position_sweep(
     keep_npz=False,
     show_progress=True,
     suppress_simulation_output=True,
+    alpha_initial_params="fixed",
+    alpha_initial_seed=0,
+    workers=1,
     **simulation_overrides,
 ):
-    """Run a matrix of single-race simulations and save its summary."""
+    """Run a matrix of single-race simulations and save its summary.
+
+    alpha_initial_params="random" resamples every alpharacer car's initial
+    joint theta per race (official comparison script); "fixed" keeps the
+    config initializer, so repeats of deterministic rosters are identical.
+    """
     policy_names = list(policy_names)
     if len(policy_names) != 3:
         raise ValueError(f"policy_names must have length 3, got {len(policy_names)}")
+    if alpha_initial_params not in {"fixed", "random"}:
+        raise ValueError("alpha_initial_params must be 'fixed' or 'random'")
     ego_positions = [int(position) for position in ego_positions]
+    alpha_start = (
+        f"random (seed={int(alpha_initial_seed)})"
+        if alpha_initial_params == "random"
+        else "fixed (ALPHARACER_INITIAL_PARAMS)"
+    )
+    print(f"Alpharacer initial parameters: {alpha_start}; workers={int(workers)}")
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,7 +663,12 @@ def run_position_sweep(
         policy_names,
         params_snapshot(),
         runner="position_sweep",
-        run_simulation_kwargs=simulation_overrides,
+        run_simulation_kwargs={
+            **simulation_overrides,
+            "alpha_initial_params": alpha_initial_params,
+            "alpha_initial_seed": int(alpha_initial_seed),
+            "workers": int(workers),
+        },
         filename=manifest_name,
     )
     trace_dir = output_path.parent / (
@@ -586,7 +676,9 @@ def run_position_sweep(
     )
     trace_dir.mkdir(parents=True, exist_ok=True)
 
-    records, winner_counts, counts_by_position = _run_sweep_trials(
+    (
+        records, winner_counts, counts_by_position, failures_by_position,
+    ) = _run_sweep_trials(
         policy_names,
         ego_positions,
         trials_per_position,
@@ -595,19 +687,28 @@ def run_position_sweep(
         show_progress=show_progress,
         suppress_output=suppress_simulation_output,
         simulation_overrides=simulation_overrides,
+        alpha_initial_params=alpha_initial_params,
+        alpha_initial_seed=int(alpha_initial_seed),
+        workers=int(workers),
     )
     summary = {
         "policy_names": policy_names,
         "trials_per_position": int(trials_per_position),
+        "alpha_initial_params": alpha_initial_params,
+        "alpha_initial_seed": (
+            int(alpha_initial_seed) if alpha_initial_params == "random" else None
+        ),
         "ego_positions": ego_positions,
         "winner_counts": winner_counts,
         "winner_counts_by_position": counts_by_position,
+        "failure_count": sum(failures_by_position.values()),
+        "failure_counts_by_position": failures_by_position,
         "trials": records,
     }
     with output_path.open("w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2, sort_keys=True, allow_nan=False)
 
-    print(f"Winner counts: {winner_counts}")
+    print(f"Winner counts: {winner_counts}; failed races: {summary['failure_count']}")
     print(f"Saved summary to {output_path}")
     print(f"Saved config to {config_path}")
     return summary
@@ -617,6 +718,23 @@ def _add_case_args(parser):
     group = parser.add_argument_group("experiment cases")
     group.add_argument("--policies", nargs="+", default=None)
     group.add_argument("--ego-position", type=int, choices=[1, 2, 3], default=None)
+    group.add_argument("--trials-per-position", type=int, default=1, metavar="N")
+    group.add_argument(
+        "--alpha-initial-params",
+        choices=["fixed", "random"],
+        default="fixed",
+        help=(
+            "fixed: config initializer every race; random: resample each "
+            "alpharacer car's initial joint theta per race (official script)."
+        ),
+    )
+    group.add_argument("--alpha-initial-seed", type=int, default=0)
+    group.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel race processes (one CPU core each).",
+    )
     group.add_argument("--name", default=None)
     group.add_argument(
         "--suite",
@@ -702,7 +820,6 @@ def _add_sim_args(parser):
         help="Initial speed for each car, in ego/opponent policy order.",
     )
     group.add_argument("--static-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
-    group.add_argument("--alpha-params", nargs=5, type=float, metavar=("Q", "ZETA", "S1", "S2", "S3"), default=None)
     group.add_argument(
         "--alpharacer-weight",
         type=Path,
@@ -823,6 +940,8 @@ def _apply_cli_overrides(args):
         raise ValueError(
             "--mpc-min-state-speed must be within [0, MAX_STATE_SPEED]"
         )
+    if args.trials_per_position < 1 or args.workers < 1:
+        raise ValueError("--trials-per-position and --workers must be at least 1")
     if args.potential_regret_sobol_points < 1:
         raise ValueError("--potential-regret-sobol-points must be at least 1")
     if args.potential_regret_max_iterations < 1:
@@ -842,12 +961,15 @@ def _apply_cli_overrides(args):
 def _sweep_kwargs_from_args(args):
     """Translate CLI names once into sweep and SimulationConfig field names."""
     return {
-        "trials_per_position": 1,
+        "trials_per_position": args.trials_per_position,
+        "alpha_initial_params": args.alpha_initial_params,
+        "alpha_initial_seed": args.alpha_initial_seed,
+        "workers": args.workers,
         "ego_positions": (
             [args.ego_position] if args.ego_position is not None else [1, 2, 3]
         ),
         "track_name": args.track_name,
-        "vehicle_model": args.vehicle_model or "kinematic",
+        "vehicle_model": args.vehicle_model,
         "duration": args.total_time,
         "random_seed": args.random_seed,
         "raceline": args.raceline_csv,
@@ -859,7 +981,6 @@ def _sweep_kwargs_from_args(args):
         "mpc_collision_slack": args.mpc_collision_slack_weight,
         "mpc_horizon": args.mpc_horizon,
         "static_params": args.static_params,
-        "alpha_params": args.alpha_params,
         "alpha_weight_path": args.alpharacer_weight,
         "ibr_strategy_space": args.ibr_strategy_space,
         "llm_params": args.llm_params,

@@ -203,7 +203,6 @@ class Race:
                         if config.static_params_by_car is None
                         else np.asarray(config.static_params_by_car, dtype=float)[car_idx]
                     ),
-                    alpharacer_params=config.alpha_params,
                     alpharacer_weight_path=(
                         config.alpha_weight_path
                         if config.alpha_weight_paths is None
@@ -212,6 +211,13 @@ class Race:
                             car_idx,
                             config.alpha_weight_path,
                         )
+                    ),
+                    alpharacer_initial_joint_params=(
+                        None
+                        if config.alpha_initial_joint_params_by_car is None
+                        else np.asarray(
+                            config.alpha_initial_joint_params_by_car, dtype=float
+                        )[car_idx]
                     ),
                     ibr_strategy_space=config.ibr_strategy_space,
                     llm_policy_params=config.llm_params,

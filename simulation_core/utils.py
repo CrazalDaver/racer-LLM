@@ -54,8 +54,9 @@ def create_vehicle_model(model_type, dt, db_params, max_speed):
 
 
 def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
-                  static_policy_params=None, alpharacer_params=None,
-                  alpharacer_weight_path=None, ibr_strategy_space=None,
+                  static_policy_params=None,
+                  alpharacer_weight_path=None,
+                  alpharacer_initial_joint_params=None, ibr_strategy_space=None,
                   llm_policy_params=None, llm_output_mode=None,
                   llm_model_name=None, llm_temperature=None,
                   llm_update_interval_seconds=None,
@@ -71,8 +72,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
     if policy_type == "centerline":
         return CenterLinePolicy(track, mpc, step_distance=params.MPC_DT * params.MAX_RACELINE_SPEED, **common)
     if policy_type == "static_alpharacer":
-        fixed = static_policy_params if static_policy_params is not None else alpharacer_params
-        return StaticAlphaRacerPolicy(track, mpc, params=np.asarray(params.STATIC_POLICY_PARAMS if fixed is None else fixed, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, **common)
+        return StaticAlphaRacerPolicy(track, mpc, params=np.asarray(params.STATIC_POLICY_PARAMS if static_policy_params is None else static_policy_params, dtype=float).copy(), raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, **common)
     if policy_type == "fixed_push":
         return FixedModePolicy(track, mpc, mode="push", raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, **common)
     if policy_type == "llm_alpharacer":
@@ -138,7 +138,7 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
             **common,
         )
     if policy_type == "alpharacer":
-        return AlphaRacerPolicy(track, mpc, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, weight_path=params.ALPHARACER_WEIGHT_PATH if alpharacer_weight_path is None else alpharacer_weight_path, search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS, search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS, opt_style=params.POTENTIAL_FUNCTION_OPT_STYLE, gradient_rate=params.POTENTIAL_FUNCTION_GRADIENT_RATE, initial_params=params.ALPHARACER_INITIAL_PARAMS, **common)
+        return AlphaRacerPolicy(track, mpc, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, weight_path=params.ALPHARACER_WEIGHT_PATH if alpharacer_weight_path is None else alpharacer_weight_path, search_points=params.ALPHARACER_WEIGHT_SEARCH_POINTS, search_iters=params.ALPHARACER_WEIGHT_SEARCH_ITERS, opt_style=params.POTENTIAL_FUNCTION_OPT_STYLE, gradient_rate=params.POTENTIAL_FUNCTION_GRADIENT_RATE, initial_params=params.ALPHARACER_INITIAL_PARAMS, initial_joint_params=alpharacer_initial_joint_params, **common)
     if policy_type == "mode_alpharacer":
         return ModeAlphaRacerPolicy(track, mpc, raceline=raceline, max_speed=params.MAX_RACELINE_SPEED, ref_lateral_clip=params.REF_LATERAL_CLIP, weight_path=params.ALPHARACER_WEIGHT_PATH if alpharacer_weight_path is None else alpharacer_weight_path, update_interval_seconds=params.LLM_UPDATE_INTERVAL_SECONDS if llm_update_interval_seconds is None else llm_update_interval_seconds, decision_dt=params.CONTROL_DT, initial_params=params.ALPHARACER_INITIAL_PARAMS, **common)
     if policy_type == "self_play_rl":
