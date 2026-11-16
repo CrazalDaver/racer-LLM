@@ -36,9 +36,8 @@ class StepResult:
 class RaceEnvironment:
     """Own mutable physical state and advance it through a small step API."""
 
-    def __init__(self, track, states, vehicle_models, initial_progress, curvature_fn=None):
+    def __init__(self, track, states, vehicle_models, initial_progress):
         self.track = track
-        self.curvature_fn = curvature_fn
         self.states = states
         self.vehicle_models = vehicle_models
         self.progress_s = np.asarray(initial_progress, dtype=float)
@@ -80,7 +79,7 @@ class RaceEnvironment:
         self._require_active_step()
         return RaceObservation.from_runtime(
             policies, self.states, self.car_s, self.car_e, self.sim_time,
-            track=self.track, curvature_fn=self.curvature_fn
+            track=self.track,
         )
 
     def step(self, actions):

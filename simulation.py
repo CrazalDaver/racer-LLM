@@ -293,7 +293,6 @@ class Race:
             states=self.states,
             vehicle_models=self.vehicle_models,
             initial_progress=initial_progress,
-            curvature_fn=self.mpcs[0].curvature_fn,
         )
         self.oracle_evaluator = (
             OracleRolloutEvaluator(self)

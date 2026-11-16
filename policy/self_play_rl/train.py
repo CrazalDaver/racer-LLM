@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from config import make_vehicle_params, params
-from policy.utils import relative_progress, track_curvature_at
+from policy.utils import relative_progress
 from simulation_core.environment import RaceEnvironment
 from simulation_core.observation import RaceObservation
 from state import CarAction, CarState
@@ -102,7 +102,6 @@ class TrainingRace:
         self.rng = np.random.default_rng(seed)
         waypoints = load_centerline_csv(setup["track_csv"], scale=setup["track_scale"])
         self.track = Track(waypoints)
-        self.curvature_fn = lambda s: track_curvature_at(self.track, float(s))
         self.step_count = 0
         self.environment = None
         self.reset()
@@ -144,7 +143,7 @@ class TrainingRace:
             for _ in range(num_agents)
         ]
         self.environment = RaceEnvironment(
-            self.track, states, models, progress, curvature_fn=self.curvature_fn
+            self.track, states, models, progress
         )
         self.step_count = 0
         self.environment.begin_step(0)
@@ -157,7 +156,6 @@ class TrainingRace:
             self.environment.car_e,
             self.step_count * self.setup["self_play"]["dt"],
             track=self.track,
-            curvature_fn=self.curvature_fn,
         )
 
     def observation(self, car_idx):

@@ -135,6 +135,7 @@ class Track(ProjectablePath):
         if closed and np.linalg.norm(self.waypoints[0] - self.waypoints[-1]) > 1e-6:
             self.waypoints = np.vstack([self.waypoints, self.waypoints[0]])
         self._precompute_projection(self.waypoints, set_total_length=True)
+        self._curvature_function = None  # Built lazily by curvature_function().
 
     def interpolate(self, s: float) -> Tuple[float, float, float]:
         if self.total_length > 0:
@@ -254,6 +255,61 @@ class Track(ProjectablePath):
             curvature[idx] = heading_delta / (2.0 * heading_window)
         curvature[-1] = curvature[0]
         return progress, curvature
+
+    def curvature_function(self):
+        """Return the one centerline curvature function shared by the project.
+
+        Output:
+            A CasADi function kappa(s) (1/m) usable with numeric or symbolic s.
+
+        The function interpolates curvature_profile() with a cubic B-spline.
+        Three periodic copies of the table cover s in [-L, 2L], so a short
+        unwrapped MPC horizon can cross the start/finish line without a
+        symbolic modulo. MPC/IBR prediction, measured s_dot, self-play RL
+        inputs, LLM context and evaluation all query this function; only the
+        alpha-RACER features use waypoint_circumcircle_curvature instead.
+        Built once per Track and cached.
+        """
+        if self._curvature_function is None:
+            import casadi as cs  # Lazy: offline track tools do not need CasADi.
+
+            profile_s, profile_curvature = self.curvature_profile()
+            length = float(self.total_length)
+            extended_s = np.concatenate((
+                profile_s[:-1] - length, profile_s, profile_s[1:] + length,
+            ))
+            extended_curvature = np.concatenate((
+                profile_curvature[:-1], profile_curvature, profile_curvature[1:],
+            ))
+            self._curvature_function = cs.interpolant(
+                f"centerline_curvature_{id(self)}", "bspline",
+                [extended_s], extended_curvature,
+            )
+        return self._curvature_function
+
+    def curvature_at(self, s: float) -> float:
+        """Evaluate curvature_function() at centerline progress s, wrapped to one lap (1/m)."""
+        return float(self.curvature_function()(float(s) % self.total_length))
+
+    def waypoint_circumcircle_curvature(self, s: float) -> float:
+        """Signed three-waypoint circumcircle curvature used by alpha-RACER features (1/m).
+
+        Follows official waypoint.custom_fn/get_curvature: take the start point
+        of the centerline segment containing s and the next two raw waypoints,
+        and return 1/R of their circumcircle, positive for left turns. No
+        smoothing or interpolation. 4*signed_area/(a*b*c) is computed as
+        2*cross/(a*b*c), which avoids Heron cancellation on nearly straight triples.
+        """
+        points = self.waypoints[:-1]  # Track stores a duplicate closing point.
+        index = (np.searchsorted(self.cum_len, float(s) % self.total_length, side="left") - 1) % len(points)
+        p, q, r = points[[index, (index + 1) % len(points), (index + 2) % len(points)]]
+        a, b, c = np.linalg.norm(q-p), np.linalg.norm(r-q), np.linalg.norm(r-p)
+        assert a*b*c > 0
+        cross = (q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0])
+        curvature = 2*cross/(a*b*c)
+        if not np.isfinite(curvature):
+            raise ValueError("Nonfinite alpha-RACER waypoint curvature")
+        return float(curvature)
 
 
 # def create_test_track(num_points=300, radius=14.0):

@@ -39,8 +39,6 @@ class ReferenceTrajectoryMPC:
         - _build_problem: construct the CasADi NLP problem with objective and constraints.
     """
 
-    _instance_counter = 0
-
     def __init__(self, settings: MPCSettings, track):
         self.settings = settings
         self.dt = settings.dt
@@ -112,32 +110,13 @@ class ReferenceTrajectoryMPC:
         self.last_opponent_active = None
         self.n_states = 4
         self.n_controls = 2
-        curvature_s, curvature = self.track.curvature_profile()
+        _, curvature = self.track.curvature_profile()
         self.max_abs_curvature = float(np.max(np.abs(curvature)))
         self.minimum_nominal_frenet_denominator = float(
             1.0 - self.max_abs_curvature * self.track_constraint_half_width
         )
-        length = float(self.track.total_length)
-        # Three periodic copies let a short unwrapped MPC horizon cross the
-        # start/finish seam without a symbolic modulo operation.
-        extended_s = np.concatenate((
-            curvature_s[:-1] - length,
-            curvature_s,
-            curvature_s[1:] + length,
-        ))
-        extended_curvature = np.concatenate((
-            curvature[:-1], curvature, curvature[1:],
-        ))
-        instance_id = ReferenceTrajectoryMPC._instance_counter
-        ReferenceTrajectoryMPC._instance_counter += 1
-        self._curvature_grid = extended_s
-        self._curvature_values = extended_curvature
-        self.curvature_fn = cs.interpolant(
-            f"centerline_curvature_{instance_id}",
-            "bspline",
-            [extended_s],
-            extended_curvature,
-        )
+        # Shared periodic B-spline kappa(s); the same function feeds Observation.
+        self.curvature_fn = self.track.curvature_function()
 
         # Define optimization variables and parameters
         self.X = cs.SX.sym(

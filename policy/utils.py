@@ -51,10 +51,3 @@ def track_heading_error(track: Track, psi: float, s: float, reference_minus_head
         return angle_delta(ref_psi, psi)
     return angle_delta(psi, ref_psi)
 
-
-def track_curvature_at(track: Track, s: float, ds: float = 0.25) -> float:
-    """Estimate centerline curvature with a centered heading difference."""
-    _, _, psi_prev = track.interpolate(s - ds)
-    _, _, psi_next = track.interpolate(s + ds)
-    return angle_delta(psi_next, psi_prev) / (2.0 * ds)
-

@@ -12,7 +12,7 @@ import urllib.request
 import numpy as np
 
 from config import duration_to_steps, params as sim_params
-from ..utils import angle_delta, progress_delta, track_curvature_at
+from ..utils import angle_delta, progress_delta
 
 
 class LLMPolicyBase:
@@ -227,7 +227,7 @@ class LLMPolicyBase:
             road_samples.append(
                 {
                     "distance": float(distance),
-                    "curvature": float(track_curvature_at(self.track, sample_s)),
+                    "curvature": self.track.curvature_at(sample_s),
                     "turn_from_current_degrees": math.degrees(
                         angle_delta(center_heading, current_heading)
                     ),

@@ -94,11 +94,10 @@ class RaceObservation:
     sim_time: float
     cars: tuple[CarObservation, ...]
     _track: object = None
-    _curvature: object = None
 
     @classmethod
     def from_states(
-        cls, states, car_s, car_e, sim_time, *, track, curvature_fn, policies=None
+        cls, states, car_s, car_e, sim_time, *, track, policies=None
     ):
         """Capture measured states, optionally including policy-owned metadata."""
         if not (len(states) == len(car_s) == len(car_e)):
@@ -116,7 +115,7 @@ class RaceObservation:
                 if policy is not None else None
             )
             frame = track.state_kinematics(state, car_s[idx], car_e[idx],
-                float(curvature_fn(car_s[idx] % track.total_length)))
+                track.curvature_at(car_s[idx]))
             cars.append(
                 CarObservation(
                     car_idx=idx,
@@ -141,19 +140,16 @@ class RaceObservation:
                     **frame,
                 )
             )
-        return cls(sim_time=float(sim_time), cars=tuple(cars),
-                   _track=track, _curvature=curvature_fn)
+        return cls(sim_time=float(sim_time), cars=tuple(cars), _track=track)
 
     @classmethod
-    def from_runtime(cls, policies, states, car_s, car_e, sim_time, *, track=None, curvature_fn=None):
+    def from_runtime(cls, policies, states, car_s, car_e, sim_time, *, track=None):
         """Capture state and previous policy outputs before any new action is chosen."""
         if not policies:
             raise ValueError("from_runtime requires at least one policy")
         track = policies[0].track if track is None else track
-        curvature_fn = policies[0].mpc.curvature_fn if curvature_fn is None else curvature_fn
         return cls.from_states(
-            states, car_s, car_e, sim_time, track=track,
-            curvature_fn=curvature_fn, policies=policies,
+            states, car_s, car_e, sim_time, track=track, policies=policies,
         )
 
     def car(self, car_idx):
@@ -179,8 +175,8 @@ class RaceObservation:
         evaluation code.  Velocity components use the paper's Frenet-frame
         state definition for both cars.
         """
-        if self._track is None or self._curvature is None:
-            raise ValueError("Self-play RL input requires track and curvature data")
+        if self._track is None:
+            raise ValueError("Self-play RL input requires track data")
         if lookahead_seconds < 0.0:
             raise ValueError("lookahead_seconds must be non-negative")
         ego = self.car(ego_idx)
@@ -214,10 +210,8 @@ class RaceObservation:
                 opponent.omega,
                 ego.curvature,
                 opponent.curvature,
-                float(self._curvature(ego_lookahead_s % self._track.total_length)),
-                float(self._curvature(
-                    opponent_lookahead_s % self._track.total_length
-                )),
+                self._track.curvature_at(ego_lookahead_s),
+                self._track.curvature_at(opponent_lookahead_s),
             ],
             dtype=np.float32,
         )
@@ -230,7 +224,7 @@ class RaceObservation:
             return car.s_dot
         # Compatibility for manually constructed observations in offline callers.
         return Track.state_kinematics(self._track, car.state, car.s, car.e,
-            float(self._curvature(car.s % self._track.total_length)))["s_dot"]
+            self._track.curvature_at(car.s))["s_dot"]
 
     def mpc_opponents(self, ego_idx):
         """Return the legacy opponent records consumed by shared MPC/reference code."""

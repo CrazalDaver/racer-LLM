@@ -20,7 +20,6 @@ from .utils import (
     progress_delta,
     relative_progress,
     relative_progress_gain,
-    track_curvature_at,
     track_heading_error,
 )
 
@@ -45,7 +44,6 @@ __all__ = [
     "progress_delta",
     "relative_progress",
     "relative_progress_gain",
-    "track_curvature_at",
     "track_heading_error",
     "resolve_llm_output",
 ]

@@ -12,7 +12,7 @@ from .optimizer import (
     PotentialOracleOptimizer,
     observation_cars,
 )
-from policy.utils import progress_delta, track_curvature_at
+from policy.utils import progress_delta
 from simulation_core.runtime_snapshot import RuntimeSnapshotter
 
 
@@ -214,7 +214,7 @@ class PotentialRegretEvaluator:
         probe = 2.0
         threshold = 0.05
         curvatures = [
-            abs(track_curvature_at(self.race.track, ego.s + offset))
+            abs(self.race.track.curvature_at(ego.s + offset))
             for offset in (-probe, 0.0, probe)
         ]
         if max(curvatures) < threshold:

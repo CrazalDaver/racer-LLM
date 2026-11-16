@@ -28,21 +28,6 @@ ALPHA_PARAMETER_BOUNDS = params.ALPHARACER_PARAMETER_BOUNDS
 ALPHA_CURVATURE_LOOKAHEAD_M = 8 * 0.1  # official collection H * dt * default body_speed=1
 
 
-def alpha_track_curvature(track, s):
-    """Signed three-waypoint circumcircle curvature, as in official custom_fn."""
-    points = track.waypoints[:-1]  # Track stores a duplicate closing point.
-    index = (np.searchsorted(track.cum_len, float(s) % track.total_length, side="left") - 1) % len(points)
-    p, q, r = points[[index, (index + 1) % len(points), (index + 2) % len(points)]]
-    a, b, c = np.linalg.norm(q-p), np.linalg.norm(r-q), np.linalg.norm(r-p)
-    assert a*b*c > 0
-    # 4*signed_area/(a*b*c); avoids Heron cancellation on nearly straight triples.
-    cross = (q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0])
-    curvature = 2*cross/(a*b*c)
-    if not np.isfinite(curvature):
-        raise ValueError("Nonfinite alpha-RACER waypoint curvature")
-    return float(curvature)
-
-
 class SimpleNeuralNetwork(nn.Module if nn is not None else object):
     """Batch-normalized MLP shared by value and potential approximators."""
 
@@ -169,9 +154,10 @@ def build_alpha_input(track, mpc_dt, mpc_horizon, cars, joint_params):
     for block in blocks:
         features.extend(block[1:])
 
-    features.extend(alpha_track_curvature(track, float(car["px"])) for car in cars)
+    # Official waypoint circumcircle curvature, not the shared Frenet curvature_at.
+    features.extend(track.waypoint_circumcircle_curvature(float(car["px"])) for car in cars)
     for car in cars:
-        features.append(alpha_track_curvature(track, float(car["px"]) + ALPHA_CURVATURE_LOOKAHEAD_M))
+        features.append(track.waypoint_circumcircle_curvature(float(car["px"]) + ALPHA_CURVATURE_LOOKAHEAD_M))
 
     features.extend(np.asarray(joint_params, dtype=float).reshape(3, 5).ravel().tolist())
     result = np.asarray(features, dtype=np.float32)
