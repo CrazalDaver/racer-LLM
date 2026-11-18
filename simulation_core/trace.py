@@ -137,6 +137,9 @@ def create_simulation_trace(
             bool(getattr(policy, "include_decision_feedback", False))
             for policy in policies
         ],
+        "car_llm_memory_lengths": [
+            int(getattr(policy, "memory_length", 0)) for policy in policies
+        ],
         "car_llm_system_prompt_paths": [
             str(getattr(policy, "system_prompt_path", "")) for policy in policies
         ],
@@ -722,6 +725,9 @@ def save_simulation_trace(trace, track, params, output_path=None):
         ),
         car_llm_include_decision_feedback=np.asarray(
             trace.get("car_llm_include_decision_feedback", []), dtype=bool
+        ),
+        car_llm_memory_lengths=np.asarray(
+            trace.get("car_llm_memory_lengths", []), dtype=int
         ),
         car_llm_system_prompt_paths=np.asarray(
             trace.get("car_llm_system_prompt_paths", []), dtype=str

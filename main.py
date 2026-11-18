@@ -884,7 +884,11 @@ def _add_sim_args(parser):
         "--llm-prompt-module",
         choices=LLM_PROMPT_MODULES,
         default="base",
-        help="System-prompt ablation module; base is the unchanged default.",
+        help=(
+            "Direct-parameter system-prompt layers: base (task, parameter "
+            "effects, input), reference (+ reference-point equations), "
+            "reference_mpc (+ MPC and vehicle)."
+        ),
     )
     group.add_argument(
         "--llm-include-raceline-speed",
@@ -903,9 +907,15 @@ def _add_sim_args(parser):
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Toggle one-step direct-parameter memory: previous observation, "
-            "executed parameters, and interval collision/off-track flags."
+            "Toggle direct-parameter memory: the last --llm-memory-length "
+            "decisions with their parameters and interval outcomes."
         ),
+    )
+    group.add_argument(
+        "--llm-memory-length",
+        type=int,
+        default=None,
+        help="Entries kept in recent_decisions (default: config LLM_MEMORY_LENGTH).",
     )
     group.add_argument(
         "--potential-regret",
@@ -1029,6 +1039,7 @@ def _sweep_kwargs_from_args(args):
         "llm_include_raceline_speed": args.llm_include_raceline_speed,
         "llm_include_current_parameters": args.llm_include_current_parameters,
         "llm_include_decision_feedback": args.llm_include_decision_feedback,
+        "llm_memory_length": args.llm_memory_length,
         "potential_regret_enabled": args.potential_regret,
         "potential_regret_weight_path": args.potential_regret_weight,
         "potential_regret_sobol_points": args.potential_regret_sobol_points,

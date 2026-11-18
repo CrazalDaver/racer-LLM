@@ -7,11 +7,19 @@ import numpy as np
 
 from config import params as sim_params
 from ..mpc import MPCPolicy
+from ..utils import progress_delta
 
 from .base import LLMPolicyBase
 
 
 PARAMETER_NAMES = ("q", "zeta", "s1", "s2", "s3")
+# System-prompt layers appended after params_system.txt (task, parameter
+# effects, input description). Each later module adds one more level of detail.
+PROMPT_MODULE_FILES = {
+    "base": (),
+    "reference": ("params_reference_module.txt",),
+    "reference_mpc": ("params_reference_module.txt", "params_mpc_module.txt"),
+}
 
 
 class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
@@ -31,9 +39,11 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
         prompt_module="base",
         prompt_variant="raw",
         observation_variant="baseline",
-        include_raceline_speed=False,
+        include_raceline_speed=None,
         include_current_parameters=False,
         include_decision_feedback=False,
+        memory_length=None,
+        race_duration_seconds=None,
         history_length=None,
         param_bounds=None,
         system_prompt_path=None,
@@ -45,29 +55,41 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
                 "Direct-parameter policies use input-module booleans; "
                 "observation variants are reserved for mode policies"
             )
-        if prompt_module not in {"base", "base_plus_mechanics"}:
+        if prompt_module not in PROMPT_MODULE_FILES:
             raise ValueError(f"Unknown parameter prompt module: {prompt_module}")
 
         self.prompt_module = str(prompt_module)
         self.prompt_module_version = (
-            "mechanics_v1" if prompt_module == "base_plus_mechanics" else "none"
+            "none" if prompt_module == "base" else f"{prompt_module}_v1"
         )
         self.prompt_variant = (
-            "direct_params_modular_v1" if prompt_variant == "raw" else str(prompt_variant)
+            "direct_params_v3" if prompt_variant == "raw" else str(prompt_variant)
         )
-        self.include_raceline_speed = bool(include_raceline_speed)
+        self.include_raceline_speed = bool(
+            sim_params.LLM_INPUT_INCLUDE_RACELINE_SPEED
+            if include_raceline_speed is None
+            else include_raceline_speed
+        )
         self.include_current_parameters = bool(include_current_parameters)
         self.include_decision_feedback = bool(include_decision_feedback)
-        if (
-            self.include_decision_feedback
-            and self.prompt_variant == "direct_params_modular_v1"
-        ):
-            self.prompt_variant = "direct_params_memory_feedback_v1"
+        self.memory_length = max(
+            1,
+            int(
+                sim_params.LLM_MEMORY_LENGTH
+                if memory_length is None
+                else memory_length
+            ),
+        )
+        self.race_duration_seconds = float(
+            sim_params.TOTAL_TIME
+            if race_duration_seconds is None
+            else race_duration_seconds
+        )
         self.observation_variant = "baseline"
         self.input_schema_version = (
-            "direct_params_memory_feedback_v1"
+            "direct_params_v3_recent_decisions_v1"
             if self.include_decision_feedback
-            else "direct_params_modular_v1"
+            else "direct_params_v3"
         )
         self.input_modules = {
             "base": True,
@@ -75,8 +97,11 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
             "current_parameters": self.include_current_parameters,
             "decision_feedback": self.include_decision_feedback,
         }
-        self._previous_prompt_observation = None
-        self._previous_selected_parameters = None
+        # Recent-decision memory: completed (parameters, outcome) entries and
+        # the open entry for the interval that started at the last decision.
+        self._recent_decisions = []
+        self._open_decision = None
+        self._decision_observation = None
         self._interval_collision = False
         self._interval_off_track = False
         self.history_length = max(
@@ -91,10 +116,8 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
         prompt_dir = Path(__file__).with_name("prompts")
         if system_prompt_path is None:
             system_prompt_path = prompt_dir / "params_system.txt"
-        extra_prompts = (
-            (prompt_dir / "params_mechanics_module.txt",)
-            if prompt_module == "base_plus_mechanics"
-            else ()
+        extra_prompts = tuple(
+            prompt_dir / name for name in PROMPT_MODULE_FILES[prompt_module]
         )
         super().__init__(
             *args,
@@ -113,6 +136,8 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
     def format_observation(self, measured, observation):
         """Render shared scene facts with direct-parameter field names."""
         ego = measured["ego"]
+        # Speeds along/across the track are Frenet rates (s_dot, e_dot) for
+        # every car; ego body speed is the MPC's own scalar speed state.
         traffic = [
             {
                 "id": opponent["id"],
@@ -122,14 +147,14 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
                 "relative_lateral_position_m": self._rounded(
                     opponent["delta_e"], 3
                 ),
-                "relative_speed_mps": self._rounded(
-                    opponent["relative_speed"], 2
-                ),
+                "progress_rate_mps": self._rounded(opponent["s_dot"], 2),
+                "lateral_rate_mps": self._rounded(opponent["e_dot"], 2),
             }
             for opponent in measured["opponents"]
         ]
-        road_samples = [
-            {
+        road_samples = []
+        for sample in measured["road"]["samples"]:
+            road_sample = {
                 "distance_ahead_m": self._rounded(sample["distance"], 1),
                 "centerline_curvature_per_m": self._rounded(
                     sample["curvature"], 3
@@ -138,24 +163,26 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
                     sample["raceline_offset"], 3
                 ),
             }
-            for sample in measured["road"]["samples"]
-        ]
+            if self.include_raceline_speed:
+                road_sample["raceline_speed_mps"] = self._rounded(
+                    sample["raceline_speed"], 2
+                )
+            road_samples.append(road_sample)
         scene = {
+            "race_time": {
+                "elapsed_s": self._rounded(observation.sim_time, 1),
+                "total_s": self._rounded(self.race_duration_seconds, 1),
+            },
             "ego_state": {
                 "speed_mps": self._rounded(ego["body_speed"], 2),
+                "progress_rate_mps": self._rounded(ego["s_dot"], 2),
+                "lateral_rate_mps": self._rounded(ego["e_dot"], 2),
                 "lateral_position_m": self._rounded(ego["e"], 3),
                 "heading_error_rad": self._rounded(ego["heading_error"], 3),
             },
             "traffic_state": {"all_opponents": traffic},
             "road_preview": {"samples_near_to_far": road_samples},
         }
-        if self.include_raceline_speed:
-            scene["raceline_speed"] = {
-                "target_speed_mps_at_preview_points": [
-                    self._rounded(sample["raceline_speed"], 2)
-                    for sample in measured["road"]["samples"]
-                ]
-            }
         if self.include_current_parameters:
             scene["current_parameters"] = {
                 name: self._rounded(value)
@@ -163,31 +190,59 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
             }
         return scene
 
+    def observe(self, observation):
+        """Close the open memory entry with this snapshot, then render it."""
+        self._decision_observation = observation
+        if self.include_decision_feedback:
+            self._close_open_decision(observation)
+        return super().observe(observation)
+
+    def _close_open_decision(self, observation):
+        """Add the outcome of the interval since the previous decision."""
+        entry = self._open_decision
+        if entry is None:
+            return
+        length = self.track.total_length
+        travelled = {}
+        for car in observation.cars:
+            key = "ego" if car.car_idx == self.car_idx else f"car_{car.car_idx}"
+            travelled[key] = self._rounded(
+                progress_delta(car.s, entry["start_s"][car.car_idx], length), 2
+            )
+        self._recent_decisions.append(
+            {
+                "parameters": entry["parameters"],
+                "interval_seconds": self._rounded(
+                    observation.sim_time - entry["start_time"], 2
+                ),
+                "distance_travelled_m": travelled,
+                "ego_touched_another_car": bool(self._interval_collision),
+                "ego_center_outside_track_edges": bool(self._interval_off_track),
+            }
+        )
+        self._recent_decisions = self._recent_decisions[-self.memory_length:]
+        self._open_decision = None
+
     def build_prompt_payload(self, observed):
-        """Optionally prepend the previous observation, parameters and events."""
+        """Optionally prepend the recent (parameters, outcome) entries."""
         if not self.include_decision_feedback:
             return observed
-        previous_step = None
-        if self._previous_prompt_observation is not None:
-            previous_step = {
-                "observation": json.loads(json.dumps(self._previous_prompt_observation)),
-                "selected_parameters": dict(self._previous_selected_parameters),
-                "events_during_interval": {
-                    "collision": bool(self._interval_collision),
-                    "off_track": bool(self._interval_off_track),
-                },
-            }
-        return {"previous_step": previous_step, "current_observation": observed}
+        return {
+            "recent_decisions": json.loads(json.dumps(self._recent_decisions)),
+            "current_observation": observed,
+        }
 
     def response_schema(self):
         """Require exactly five bounded numerical fields from the model."""
         properties = {}
         for name in PARAMETER_NAMES:
             lower, upper = self.param_bounds[name]
+            # Four significant digits, as written in the prompt (3.333, 0.7225);
+            # apply_response still clips to the exact bounds.
             properties[name] = {
                 "type": "number",
-                "minimum": float(lower),
-                "maximum": float(upper),
+                "minimum": float(f"{lower:.4g}"),
+                "maximum": float(f"{upper:.4g}"),
             }
         return {
             "type": "object",
@@ -226,13 +281,17 @@ class LLMParameterPolicy(LLMPolicyBase, MPCPolicy):
             self.llm_decision_history = self.llm_decision_history[-self.history_length:]
 
     def finish_decision_attempt(self, observed):
-        """Save this observation and executed parameters for the next prompt."""
+        """Open a memory entry for the parameters now in effect."""
         if not self.include_decision_feedback:
             return
-        self._previous_prompt_observation = json.loads(json.dumps(observed))
-        self._previous_selected_parameters = {
-            name: self._rounded(value)
-            for name, value in zip(PARAMETER_NAMES, self.params)
+        observation = self._decision_observation
+        self._open_decision = {
+            "parameters": {
+                name: self._rounded(value)
+                for name, value in zip(PARAMETER_NAMES, self.params)
+            },
+            "start_time": float(observation.sim_time),
+            "start_s": {car.car_idx: float(car.s) for car in observation.cars},
         }
         self._interval_collision = False
         self._interval_off_track = False

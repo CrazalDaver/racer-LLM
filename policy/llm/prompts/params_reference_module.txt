@@ -1,0 +1,45 @@
+Reference-point equations
+These are the exact computations behind the reference points described above.
+They state how the five numbers enter; they do not say which values to choose.
+
+Notation: theta = (q, zeta, s1, s2, s3); dt = 0.1 s; N = 10 steps (1.0 s).
+s is distance along the centerline, e is lateral position from the centerline
+(left positive). The reference points are computed for k = 0, ..., N.
+
+Raceline sampling. Let r_0 be the raceline arc position nearest to your car.
+At step k the raceline point at r_k has centerline coordinates
+(s_race,k, e_race,k) and raceline speed v_race,k. Then
+
+  v_ref,k   = zeta * v_race,k
+  r_(k+1)   = r_k + zeta * v_race,k * dt
+
+Other cars. Only the nearest car ahead and the nearest car behind enter. Each
+such car j is predicted with constant progress rate and constant lateral
+position:
+
+  s_j,k = s_j + k * dt * sdot_j,        e_j,k = e_j
+
+where sdot_j is its measured progress rate along the track.
+
+For each of these cars, with
+  d_j,k  = s_race,k - s_j,k   (along the closed track, positive when the
+                               reference point is ahead of car j)
+  de_j   = e_ego - e_j        (current lateral gap, your position minus car j)
+
+the sideways offset is
+
+  p_side_j,k = sign(de_j) * max((s1 - |de_j|) * exp(-s2 * d_j,k^2), 0)
+
+and the shift toward car j is
+
+  p_toward_j,k = (e_j - e_race,k) * (1 - exp(-s3 * (sdot_j - v_ref,k)))
+                 * exp(-s2 * d_j,k^2)
+     only if sdot_j > v_ref,k and d_j,k >= 0; otherwise 0.
+
+The lateral position of reference point k is
+
+  e_ref,k = clip(e_race,k + sum_j p_side_j,k + sum_j p_toward_j,k, -0.44, 0.44)
+
+and its longitudinal position is s_race,k. zeta, s1, s2 and s3 enter only
+these reference points. q does not change them; it weights how closely the MPC
+follows them.

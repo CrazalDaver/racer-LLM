@@ -245,14 +245,17 @@ class SimParams:
     LLM_TIMEOUT = 20.0
     LLM_TEMPERATURE = 0.0
     LLM_UPDATE_INTERVAL_SECONDS = 1.0
-    # Direct-parameter input modules. The base always contains ego_state,
-    # every opponent in traffic_state, and road_preview. Non-base modules are
+    # Direct-parameter input modules. The base always contains race_time,
+    # ego_state, every opponent in traffic_state, and road_preview. Raceline
+    # speed is on by default: s3 acts only when s_dot exceeds zeta * it. Non-base modules are
     # independent switches so later ablations change one factor at a time.
-    LLM_INPUT_INCLUDE_RACELINE_SPEED = False
+    LLM_INPUT_INCLUDE_RACELINE_SPEED = True
     LLM_INPUT_INCLUDE_CURRENT_PARAMETERS = False
-    # One-step memory containing the previous complete observation, executed
-    # parameters, and ego collision/off-track events over the decision interval.
+    # Recent-decision memory: the last LLM_MEMORY_LENGTH entries, each with the
+    # parameters in effect over one interval, the distance every car travelled,
+    # and whether ego touched a car or had its center outside the track edges.
     LLM_INPUT_INCLUDE_DECISION_FEEDBACK = False
+    LLM_MEMORY_LENGTH = 5
     # Maximum number of executed modes exposed in
     # memory.recent_modes_oldest_to_newest.
     LLM_RECENT_MODES_MAX_LENGTH = 1
@@ -271,8 +274,8 @@ class SimParams:
     # Ego-centered centerline/raceline preview exposed to the LLM. Sampling
     # resolution is observational only; it does not classify the road or pick
     # a behavior mode.
-    LLM_ROAD_PREVIEW_LENGTH_METERS = 8.0 
-    LLM_ROAD_PREVIEW_SAMPLE_COUNT = 5
+    LLM_ROAD_PREVIEW_LENGTH_METERS = 12.0  # 2026-11-17: covers 1 s held + 1 s plan at 5 m/s
+    LLM_ROAD_PREVIEW_SAMPLE_COUNT = 7  # 2 m spacing
 
     # ==================== ALPHARACER POLICIES ==================
 

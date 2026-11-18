@@ -103,7 +103,8 @@ LLM_OBSERVATION_VARIANTS = (
     "raceline_speed",
     "decision_feedback",
 )
-LLM_PROMPT_MODULES = ("base", "base_plus_mechanics", "mode_v2")
+# Direct-parameter system-prompt layers; mode_v2 belongs to the mode policy.
+LLM_PROMPT_MODULES = ("base", "reference", "reference_mpc", "mode_v2")
 
 
 def validate_policy_name(name: str) -> str:
@@ -171,6 +172,7 @@ class SimulationConfig:
     llm_include_raceline_speed: bool | None = None
     llm_include_current_parameters: bool | None = None
     llm_include_decision_feedback: bool | None = None
+    llm_memory_length: int | None = None
 
     # Optional learned-potential paired-rollout diagnostic. Disabled by
     # default so existing simulations do not load a network or branch state.

@@ -100,8 +100,12 @@ class LLMPolicyBase:
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in component_paths
         }
+        # The decision interval is a run option, so the prompt names it through
+        # a placeholder instead of a fixed number.
         self.system_prompt = "\n\n".join(
             path.read_text(encoding="utf-8").strip() for path in component_paths
+        ).replace(
+            "{decision_interval_seconds}", f"{self.update_interval_seconds:g}"
         )
         self.system_prompt_sha256 = hashlib.sha256(
             self.system_prompt.encode("utf-8")
@@ -203,6 +207,8 @@ class LLMPolicyBase:
                     "position": position,
                     "delta_s": delta_s,
                     "delta_e": float(opponent.e - ego.e),
+                    "s_dot": float(opponent.s_dot),  # Frenet progress rate, m/s
+                    "e_dot": float(opponent.e_dot),  # Frenet lateral rate, m/s
                     "progress_speed": opponent_progress_speed,
                     "relative_speed": opponent_progress_speed - ego_body_speed,
                     "closing_speed": closing_speed,
@@ -248,6 +254,8 @@ class LLMPolicyBase:
                 "s": float(ego.s),
                 "e": float(ego.e),
                 "body_speed": ego_body_speed,
+                "s_dot": float(ego.s_dot),  # Frenet progress rate, m/s
+                "e_dot": float(ego.e_dot),  # Frenet lateral rate, m/s
                 "heading_error": float(ego.heading_error),
                 "lap_progress_percent": (
                     100.0
@@ -275,7 +283,7 @@ class LLMPolicyBase:
         """Round one finite value for stable JSON and return null otherwise."""
         if value is None or not np.isfinite(value):
             return None
-        return round(float(value), digits)
+        return round(float(value), digits) + 0.0  # + 0.0 turns -0.0 into 0.0
 
     def build_prompt_payload(self, observed):
         """Return the final JSON object sent as the user prompt."""

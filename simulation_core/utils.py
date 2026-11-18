@@ -66,6 +66,8 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                   llm_include_raceline_speed=None,
                   llm_include_current_parameters=None,
                   llm_include_decision_feedback=None,
+                  llm_memory_length=None,
+                  llm_race_duration_seconds=None,
                   self_play_rl_model_path=None):
     """Construct one policy from canonical identity plus relevant overrides."""
     policy_type = validate_policy_name(policy_type)
@@ -124,6 +126,8 @@ def create_policy(policy_type, track, mpc, raceline=None, car_idx=0,
                     if llm_include_decision_feedback is None
                     else llm_include_decision_feedback
                 ),
+                memory_length=llm_memory_length,
+                race_duration_seconds=llm_race_duration_seconds,
             )
         return policy_class(
             track,

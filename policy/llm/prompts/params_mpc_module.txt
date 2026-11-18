@@ -1,0 +1,34 @@
+MPC and vehicle
+These describe how the MPC turns the reference points into commands and how
+the simulated car responds. They do not say which values to choose.
+
+MPC prediction model. The MPC predicts your car with a kinematic model in
+track coordinates, state x = (s, e, heading error, v), commands
+u = (throttle, steering), throttle in [0, 1] and steering in [-1, 1].
+Predicted speed is kept within [0, 5] m/s.
+
+Objective, minimised over the next N = 10 steps (1.0 s):
+
+  J = sum_(k=0..N) q * ((s_k - s_ref,k)^2 + (e_k - e_ref,k)^2)
+    + sum_(k=0..N-1) ||u_k - u_(k-1)||^2
+    + 1000 * (track slack)^2 + 10000 * (separation slack)^2
+
+where u_(-1) is the command applied in the previous 0.1 s.
+
+Constraints:
+- steering command change of at most 0.4 per 0.1 s step;
+- a speed-dependent limit on steering, |v^2 * tan(steering)| <= 1.6 * 9.81 * 0.34;
+- soft limit |e_k| <= 0.44 m (violations cost the track slack term);
+- soft separation from the predicted positions of the nearest car ahead and
+  the nearest car behind, (ds/0.428)^4 + (de/0.285)^4 >= 1 (violations cost
+  the separation slack term).
+
+Only the first command of the solution is applied; the problem is solved
+again 0.1 s later from the new measured state.
+
+Simulated car. The race itself uses a dynamic bicycle model with tyre forces
+(states: position, heading, forward and sideways velocity, yaw rate), so the
+real car can slide sideways and respond differently from the MPC's kinematic
+prediction. Cars are 0.36 m long and 0.24 m wide. Recovery outside 0.55 m:
+for an overshoot of o metres, each 0.1 s the speed is multiplied by
+exp(-3 o) and the heading and steering are turned back toward the track.

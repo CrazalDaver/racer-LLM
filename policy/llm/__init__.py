@@ -18,7 +18,7 @@ class LLMAlphaRacerPolicy:
         output_mode="auto",
         model_name="qwen2.5:7b",
         param_bounds=None,
-        include_raceline_speed=False,
+        include_raceline_speed=None,
         include_current_parameters=False,
         include_decision_feedback=False,
         **kwargs,

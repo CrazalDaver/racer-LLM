@@ -234,6 +234,12 @@ class Race:
                     llm_include_current_parameters=(
                         config.llm_include_current_parameters
                     ),
+                    llm_memory_length=config.llm_memory_length,
+                    llm_race_duration_seconds=(
+                        params.TOTAL_TIME
+                        if config.duration is None
+                        else config.duration
+                    ),
                     llm_include_decision_feedback=(
                         config.llm_include_decision_feedback
                     ),
@@ -477,7 +483,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--llm-prompt-module",
-        choices=["base", "base_plus_mechanics"],
+        choices=["base", "reference", "reference_mpc"],
         default="base",
     )
     parser.add_argument(
