@@ -451,6 +451,10 @@ def record_simulation_step(
         getattr(policy, "last_ibr_diagnostics", {}).get("max_br_residual", 0.0)
         for policy in policies
     ])
+    trace["car_ibr_stall_push"].append([
+        bool(getattr(policy, "last_ibr_diagnostics", {}).get("stall_push", False))
+        for policy in policies
+    ])
     trace["car_policy_mode"].append([getattr(policy, "current_mode", "fixed") for policy in policies])
     trace["car_policy_decision_count"].append(
         [int(getattr(policy, "policy_decision_count", 0)) for policy in policies]
@@ -799,6 +803,9 @@ def save_simulation_trace(trace, track, params, output_path=None):
         car_ibr_max_br_residual=np.asarray(
             trace.get("car_ibr_max_br_residual", []), dtype=float
         ),
+        car_ibr_stall_push=np.asarray(
+            trace.get("car_ibr_stall_push", []), dtype=bool
+        ),
         car_policy_mode=np.asarray(trace.get("car_policy_mode", []), dtype=str),
         car_policy_reason=np.asarray(trace.get("car_policy_reason", []), dtype=str),
         car_policy_basis=np.asarray(trace.get("car_policy_basis", []), dtype=str),
@@ -963,6 +970,10 @@ def save_simulation_trace(trace, track, params, output_path=None):
         ),
         ibr_control_weight=np.asarray(params.IBR_CONTROL_WEIGHT),
         ibr_control_rate_weight=np.asarray(params.IBR_CONTROL_RATE_WEIGHT),
+        ibr_stall_push_speed=np.asarray(params.IBR_STALL_PUSH_SPEED),
+        ibr_stall_push_release_speed=np.asarray(params.IBR_STALL_PUSH_RELEASE_SPEED),
+        ibr_stall_push_throttle=np.asarray(params.IBR_STALL_PUSH_THROTTLE),
+        ibr_stall_push_start_delay=np.asarray(params.IBR_STALL_PUSH_START_DELAY),
         ibr_parameter_optimizer=np.asarray(
             trace.get("ibr_parameter_optimizer", "finite_difference")
         ),

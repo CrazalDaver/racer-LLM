@@ -167,6 +167,8 @@ def _trace_safety_summary(data):
             "car_ibr_max_collision_slack"
         ),
         "max_ibr_track_slack_by_car": max_by_car("car_ibr_max_track_slack"),
+        "ibr_stall_push_seconds_by_car": time_by_car("car_ibr_stall_push"),
+        "ibr_stall_push_triggers_by_car": trigger_count_by_car("car_ibr_stall_push"),
         "ibr_collision_slack_active_fraction_by_car": activation_fraction(
             "car_ibr_max_collision_slack", threshold=1.0e-6
         ),

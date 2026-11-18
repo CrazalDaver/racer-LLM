@@ -342,6 +342,16 @@ class SimParams:
     IBR_SPEED_WEIGHT = 0.0
     IBR_CONTROL_WEIGHT = 1.0
     IBR_CONTROL_RATE_WEIGHT = 0.0
+    # Local stall push for control IBR (not in the release; human-approved
+    # 2026-11-17). At Berlin hairpins tighter than the 0.96 m turn radius the
+    # 2 s BR can settle on standing still inside the road, where offroad
+    # recovery never acts. An on-road car slower than the trigger speed after
+    # the start delay executes (throttle, -sign(heading error)) instead of its
+    # BR action, held until it reaches the release speed or leaves the road.
+    IBR_STALL_PUSH_SPEED = 0.05  # m/s, measured scalar speed max(body vx, 0)
+    IBR_STALL_PUSH_RELEASE_SPEED = 0.5  # m/s
+    IBR_STALL_PUSH_THROTTLE = 0.5  # release heading-takeover throttle
+    IBR_STALL_PUSH_START_DELAY = 1.0  # s, keeps standing starts to the BR
     # Five-parameter BR estimates all normalized partial derivatives around the
     # same center, then evaluates one projected joint-ascent step.
     IBR_PARAMETER_DIFFERENCE_STEP = 0.10

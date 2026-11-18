@@ -413,6 +413,7 @@ class IteratedBestResponsePolicy(MPCPolicy):
             if self.strategy_space == "control" else None
         )
         self.current_mode = f"ibr_{self.strategy_space}"
+        self.stall_push_active = False
         self.last_ibr_rounds = []
         self.last_ibr_diagnostics = {}
         self.last_joint_state_plans = None
@@ -895,6 +896,42 @@ class IteratedBestResponsePolicy(MPCPolicy):
 
         # Accept the final ego BR result and return its first action
         # only the first action is really executed
-        return self._accept_ibr_result(
+        action = self._accept_ibr_result(
             plans, controls, own, history, opponent_idx
         )
+        if self.strategy_space == "control":
+            action = self._apply_stall_push(observation, action)
+        return action
+
+    def _apply_stall_push(self, observation, action):
+        """Replace the BR action of a car stopped on the road by a fixed push.
+
+        The BR is still solved every tick (its failures still stop the race);
+        only the executed command changes. The push starts below
+        IBR_STALL_PUSH_SPEED after the start delay and holds until
+        IBR_STALL_PUSH_RELEASE_SPEED or until offroad recovery takes over.
+        """
+        car = observation.car(self.car_idx)
+        heading_error = float(car.kinematic_state[2])  # body minus road, rad
+        speed = float(car.kinematic_state[3])  # max(body vx, 0), m/s
+        on_road = abs(float(car.e)) <= sim_params.OFFROAD_RECOVERY_THRESHOLD
+        starts = (
+            speed < sim_params.IBR_STALL_PUSH_SPEED
+            and observation.sim_time > sim_params.IBR_STALL_PUSH_START_DELAY
+        )
+        self.stall_push_active = bool(
+            on_road
+            and speed < sim_params.IBR_STALL_PUSH_RELEASE_SPEED
+            and (self.stall_push_active or starts)
+        )
+        self.last_ibr_diagnostics["stall_push"] = self.stall_push_active
+        if not self.stall_push_active:
+            return action
+        # Steering turns the body back toward the road direction.
+        push = np.array([
+            float(sim_params.IBR_STALL_PUSH_THROTTLE), -float(np.sign(heading_error)),
+        ])
+        self.last_requested_action = push.copy()
+        self.last_u = push.copy()
+        self.mpc.last_diagnostics["stall_push"] = True
+        return CarAction(throttle=float(push[0]), steer=float(push[1]))
