@@ -74,7 +74,7 @@ def main(argv=None):
         if ticks is not None:
             np.savez_compressed(os.path.join(out, "ticks", f"race_{summary['ep_no']:03d}.npz"), **ticks)
         print(f"race {summary['ep_no']} G{summary['group']} progress {np.round(summary['progress'], 1).tolist()} "
-              f"winner(progress) {summary['winner_progress']} wins(official) {summary['n_wins_official']} "
+              f"winner {summary['winner']} wins {summary['n_wins']} (official rule {summary['n_wins_official_rule']}) "
               f"{summary['wall_s']:.0f}s", flush=True)
 
     Session(cfg).run(on_race)

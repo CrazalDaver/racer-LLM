@@ -35,7 +35,8 @@ class Session:
         self.ep_no = 0
         self.i = 0
         self.last_i = [-1, -1, -1]  # official per-car raceline search start for CarNode.mpc
-        self.n_wins = [0, 0, 0]
+        self.n_wins = [0, 0, 0]  # by cumulative progress (port rule)
+        self.n_wins_official_rule = [0, 0, 0]
         if config.start_ep > 0:
             self.ep_no = config.start_ep - 1
             self._next_race()
@@ -98,17 +99,23 @@ class Session:
         return summary, ({k: np.asarray(v) for k, v in rec.items()} if rec is not None else None)
 
     def _finish_race(self, start_params):
-        s = list(self._last_s)  # official win rule uses s measured at the last tick (before its step)
+        """Winner = largest lap-unwrapped progress since the start (the port's rule). The official rule
+        (final generator s, +150.1 if s < 50) is kept as a record: it misranks a car that is more than
+        about 100 m ahead of the start line, e.g. after more than one lap."""
+        s = list(self._last_s)  # measured at the last tick, before its step
         s_official = [v + 150.1 if v < 50. else v for v in s]
         winner_official = None
         for k in range(3):
             if all(s_official[k] > s_official[j] for j in range(3) if j != k):
                 winner_official = k
         if winner_official is not None:
-            self.n_wins[winner_official] += 1
+            self.n_wins_official_rule[winner_official] += 1
+        winner = int(np.argmax(self._cum))  # exact ties go to the lower car index
+        self.n_wins[winner] += 1
         return {"ep_no": self.ep_no, "group": start_group(self.ep_no), "s": s, "progress": list(self._cum),
-                "winner_official_rule": winner_official, "winner_progress": int(np.argmax(self._cum)),
-                "n_wins_official": list(self.n_wins), "start_params": start_params,
+                "winner": winner, "n_wins": list(self.n_wins),
+                "winner_official_rule": winner_official, "n_wins_official_rule": list(self.n_wins_official_rule),
+                "start_params": start_params,
                 "end": [p.record() for p in self.policies], "policies": [p.name for p in self.policies]}
 
     def run(self, on_race=None):
