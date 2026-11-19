@@ -642,14 +642,27 @@ class SelfPlayTrainer:
 
 
 def _git_metadata():
-    return {
-        "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "dirty": subprocess.check_output(
-            ["git", "status", "--porcelain"], text=True
-        ),
-    }
+    try:
+        return {
+            "commit": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "dirty": subprocess.check_output(
+                ["git", "status", "--porcelain"], text=True
+            ),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        # Unpacked server snapshots (test/agent/server-cpu/pack.sh) are not Git
+        # checkouts; their manifest records the packing commit and status.
+        import json
+        with open("SNAPSHOT_MANIFEST.json") as manifest:
+            snapshot = json.load(manifest)
+        return {
+            "commit": snapshot["git_head"],
+            "dirty": snapshot["git_status"],
+            "source": "SNAPSHOT_MANIFEST.json",
+            "snapshot_diff_sha256": snapshot["git_diff_sha256"],
+        }
 
 
 def train(args):
