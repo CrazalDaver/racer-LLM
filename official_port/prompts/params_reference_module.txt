@@ -1,0 +1,30 @@
+Reference-point equations
+These are the exact computations behind the reference points described above.
+They state how the five numbers enter; they do not say which values to choose.
+
+Notation: dt = 0.1 s; the plan has ten reference points at t = 0.1, ..., 1.0 s.
+Lateral positions here are measured from the raceline (left positive): y is
+your car's, y_j that of car j. s and s_j are distances along the centerline,
+v and v_j forward speeds; all are current measurements.
+
+Along the raceline. Starting just ahead of the raceline point nearest to your
+car, point k (time t = 0.1 k) lies zeta * v_race * dt further along the
+raceline than point k-1, where v_race is the raceline speed where point k-1
+lies.
+
+Sideways move from car j at time t (zero when v_j = v exactly):
+  g_j(t) = (s_j - s) + (v_j - v) * t      (not wrapped around the lap)
+  a_j(t) = s1 * exp(-s2 * g_j(t)^2)
+  m_j(t) = +a_j(t) if y > y_j, otherwise -a_j(t)
+Let J be the car with the larger |m_j(t)| and m = m_1(t) + m_2(t). Then twice
+in a row:
+  if (m + y_J) * m < 0:  m = 0
+  else if a_J(t) > 0.03: m = m + y_J
+
+Blocking. Let R be the nearest car behind your car. If R exists:
+  m = m + (y_R - m) * (1 - exp(-s3 * max(v_R - v, 0))) * exp(-s2 * g_R(t)^2)
+(no move when v_R = v exactly).
+
+Reference point k is the raceline point moved by m to the left (m < 0 moves
+it to the right). Its lateral position is not limited. q does not change the
+reference points; it weights how closely the MPC follows them.

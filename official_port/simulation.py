@@ -30,8 +30,8 @@ class Session:
         self.world = World()
         self.ctrl = OfficialController(self.world.raceline, self.world.raceline_dev)
         specs = (config.ego, config.opp1, config.opp2)
-        self.policies = [make_policy(k, s, config.fixed_params if k == 0 else None, config.rl_weights)
-                         for k, s in enumerate(specs)]
+        self.policies = [make_policy(k, s, config.fixed_params if k == 0 else None, config.rl_weights,
+                                     config.llm, self.world) for k, s in enumerate(specs)]
         self.ep_no = 0
         self.i = 0
         self.last_i = [-1, -1, -1]  # official per-car raceline search start for CarNode.mpc
@@ -60,6 +60,8 @@ class Session:
                 d = d - TRACK_LENGTH_WRAP if d > 75. else (d + TRACK_LENGTH_WRAP if d < -75. else d)
                 self._cum[k] += d
         self._last_s = s_now
+        for p in self.policies:
+            p.before_tick(self, ms)
         used, actions = [], []
         for k in range(3):
             o1, o2 = [c for c in range(3) if c != k]
@@ -74,6 +76,8 @@ class Session:
             actions.append(self.world.recover_and_step(k, m, steer, throttle, override))
             used.append(p)
         contact = self.world.apply_contacts(ms, self.ctrl)
+        for p in self.policies:
+            p.after_tick(self, ms, contact)
         feats = features(ms, self.world.obs)
         for p in self.policies:
             p.update(self.i, feats)

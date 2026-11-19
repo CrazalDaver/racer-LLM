@@ -85,6 +85,12 @@ class Policy:
     def update(self, i, feats):
         pass
 
+    def before_tick(self, session, ms):
+        """Called after the tick-start measurement, before any car's MPC call (LLM decisions)."""
+
+    def after_tick(self, session, ms, contact):
+        """Called after the contact rule with the three pair costs (0,1), (0,2), (1,2)."""
+
     def record(self):
         return {"params": list(map(float, self.params()))}
 
@@ -152,7 +158,7 @@ class IBR(Policy):
         return u
 
 
-def make_policy(car, spec, fixed_params=None, weight_path=None):
+def make_policy(car, spec, fixed_params=None, weight_path=None, llm=None, world=None):
     if spec == "mpc":
         return Policy(car, INIT_EGO if car == 0 else INIT_OPP)
     if spec == "fixed":
@@ -166,6 +172,9 @@ def make_policy(car, spec, fixed_params=None, weight_path=None):
         return AlphaRacer(car, spec)
     if spec == "ibr":
         return IBR(car, INIT_OPP)
+    if spec == "llm":
+        from .llm import LLMPolicy
+        return LLMPolicy(car, llm, world)
     if spec == "rl":
         from .rl import RLPolicy
         assert weight_path, "rl needs a trained actor checkpoint"

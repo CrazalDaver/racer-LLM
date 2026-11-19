@@ -1,0 +1,33 @@
+MPC and vehicle
+These describe how the MPC turns the reference points into commands and how
+the simulated car responds. They do not say which values to choose.
+
+MPC prediction model. The MPC predicts your car with a kinematic bicycle model
+in world coordinates, state (x, y, heading, v), commands u = (throttle a,
+steering d):
+  x' = v cos(heading), y' = v sin(heading),
+  heading' = (v / 0.3) * tan(0.34 d),  v' = (20 / 4.65) a - 1.
+
+Objective, minimised over the next N = 10 steps (1.0 s):
+
+  J = sum_(k=0..9) q * ||(x_k, y_k) - p_(k+1)||^2 + sum_(k=0..9) (a_k^2 + d_k^2)
+
+where p_1, ..., p_10 are the reference points and (x_0, y_0) is the current
+position.
+
+Constraints: |v_k^2 * tan(d_k)| <= 1.6 * 9.81 * 0.34, and predicted speed
+within [0, 5] m/s. Throttle and steering have no bounds inside the MPC; the
+car clips throttle to [0, 1] and steering to [-1, 1]. Only the first command
+is applied; the problem is solved again 0.1 s later. After the MPC, if your
+heading differs from the raceline direction a few points ahead by more than
+30 degrees, steering is set fully toward the raceline.
+
+Simulated car. The race itself uses a dynamic bicycle model with tyre forces
+and one step of command delay, so the real car can slide sideways and respond
+differently from the MPC's prediction. Cars are 0.36 m long and 0.24 m wide.
+Contact: when two cars overlap, both speeds are multiplied by exp(-20 c) for
+the car behind and exp(-5 c) for the car ahead, where c is the overlap area
+measure. Recovery outside 0.55 m: for an overshoot of o metres, each 0.1 s the
+speed is multiplied by exp(-3 o) and the heading and steering are turned
+toward the track direction. Whenever the heading error exceeds 1 rad, the
+throttle command gets +0.2.

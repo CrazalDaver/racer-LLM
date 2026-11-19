@@ -1,0 +1,95 @@
+You choose five numbers that configure the controller of one car in a
+three-car race simulation. Every {decision_interval_seconds} s of simulated
+time you receive the current state of the race as JSON and return the five
+numbers. They stay in effect until your next answer.
+
+Goal
+The race lasts a fixed time (race_time.total_s). When it ends, the cars are
+ranked by the distance they have travelled along the track. Your goal is to
+finish with your car ranked as high as possible.
+
+Race
+- The track is a closed loop about 150 m long and about 1 m wide. Lateral
+  position is measured from the centerline, left positive.
+- If two cars overlap, both lose speed at once; the car behind loses far more
+  than the car ahead.
+- If a car's center is more than 0.55 m from the centerline, a recovery rule
+  reduces its speed and turns it back toward the track.
+
+Controller
+Every 0.1 s a model-predictive controller (MPC) chooses throttle and steering
+for your car. It plans 1.0 s ahead and steers the car toward a sequence of
+ten reference points, one for each 0.1 s step of that plan. There is no
+separate speed target: the car goes faster when the reference points lie
+farther ahead and slower when they lie closer. The MPC has no rule of its own
+that keeps the car apart from other cars or inside the track: the only way
+your car avoids or approaches another car is through where the reference
+points are placed.
+
+The reference points start from the raceline, a precomputed path through the
+track with its own speed profile (raceline_speed_mps, at most 5 m/s). zeta
+moves the points along the track; s1 and s3 move them sideways near other
+cars; s2 sets how far from another car these sideways moves reach; q sets how
+firmly the MPC pulls the car toward the points.
+
+The five numbers
+- zeta in [0.7225, 1.21]: pace. The reference points advance along the
+  raceline at zeta * raceline_speed_mps, so zeta scales how fast the car is
+  asked to go. With zeta = 1 they move at the raceline's own pace.
+
+- q in [1.0, 3.333]: tracking firmness. The MPC weighs the squared distance
+  between the car and the reference points (weight q) against the squared
+  size of the throttle and steering commands (weight 1). With larger q the
+  car follows the points more closely, using stronger commands; with smaller
+  q the commands stay smaller and the car may lag behind or cut inside the
+  points.
+
+- s1 in [0.1, 0.5] m: sideways move near another car. For each other car,
+  the reference point at time t of the plan is moved sideways by
+  s1 * exp(-s2 * g^2), away from that car's side, where g is the predicted gap
+  along the track between the two cars at that time (both keep their current
+  speed). When this move is larger than 0.03 m for the car that produces the
+  larger move, the points are offset further by that car's lateral position
+  measured from the raceline (the computation applies this step twice), so
+  they end up beside that car rather than beside the raceline.
+
+- s2 in [0.1, 0.5] per m^2: reach. It sets how quickly the s1 and s3 moves
+  fade with the predicted gap g.
+    g =        1 m   2 m   3 m   5 m
+    s2 = 0.1:  0.90  0.67  0.41  0.08
+    s2 = 0.3:  0.74  0.30  0.07  0.00
+    s2 = 0.5:  0.61  0.14  0.01  0.00
+
+- s3 in [0, 1]: blocking. When the nearest car behind you is faster than
+  your car, the reference points move toward that car's lateral position by
+  the fraction (1 - exp(-s3 * speed difference)) * exp(-s2 * g^2). With
+  s3 = 0 there is no move. The first factor is:
+    speed difference =  0.5   1     2 m/s
+    s3 = 0.3:           0.14  0.26  0.45
+    s3 = 1.0:           0.39  0.63  0.86
+
+Input
+All distances are in m, speeds in m/s, curvature in 1/m. Progress rate is
+the speed along the track, lateral rate the speed toward the left edge, both
+measured over the last 0.1 s.
+- race_time: elapsed_s since the start and total_s, the race length.
+- ego_state: speed_mps (your car's forward speed in its own heading),
+  progress_rate_mps, lateral_rate_mps, lateral_position_m, heading_error_rad
+  (your heading minus the track direction, positive when the car points
+  toward the left edge).
+- traffic_state.all_opponents: for each other car, relative_longitudinal_position_m
+  (its distance along the track minus yours, positive ahead),
+  relative_lateral_position_m (its lateral position minus yours),
+  progress_rate_mps and lateral_rate_mps.
+- road_preview.samples_near_to_far: at each distance_ahead_m, the centerline
+  curvature (positive turns left), the raceline's lateral position
+  (raceline_offset_m) and, when present, raceline_speed_mps.
+- current_parameters, when present: the five numbers currently in effect.
+- recent_decisions, when present: your most recent answers, oldest first. Each
+  entry gives the five numbers that were in effect over one interval and what
+  happened during it: the distance each car travelled, and whether your car
+  touched another car or had its center more than 0.55 m from the centerline.
+
+Output
+Return only a JSON object with the keys q, zeta, s1, s2 and s3, each within
+its interval.
