@@ -43,6 +43,7 @@ def parse(argv=None):
     ap.add_argument("--opp2", default="mpc", choices=OPPONENTS)
     ap.add_argument("--ego", default="alpharacer", choices=EGOS)
     ap.add_argument("--fixed-params", default=None, help="ego 'fixed': sf1,sf2,lookahead,speed,blocking")
+    ap.add_argument("--rl-weights", default=None, help="actor checkpoint for rl cars")
     ap.add_argument("--seed", default="0", help="integer, or 'none' for an unseeded draw stream")
     ap.add_argument("--races", type=int, default=101)
     ap.add_argument("--start-ep", type=int, default=0)
@@ -53,7 +54,7 @@ def parse(argv=None):
     if (a.ego == "fixed") != (fixed is not None):
         ap.error("--fixed-params is required with, and only with, --ego fixed")
     seed = None if a.seed == "none" else int(a.seed)
-    return RaceConfig(opp1=a.opp1, opp2=a.opp2, ego=a.ego, fixed_params=fixed, seed=seed, n_races=a.races,
+    return RaceConfig(opp1=a.opp1, opp2=a.opp2, ego=a.ego, fixed_params=fixed, rl_weights=a.rl_weights, seed=seed, n_races=a.races,
                       start_ep=a.start_ep, save_ticks=not a.no_ticks), a.out
 
 

@@ -171,6 +171,14 @@ class TrainingRace:
     def observation(self, car_idx):
         return self.scene().self_play_rl_input(car_idx)
 
+    def observations(self):
+        """Every car's policy input from one captured scene (worker collection API)."""
+        scene = self.scene()
+        return [
+            scene.self_play_rl_input(car_idx)
+            for car_idx in range(self.setup["self_play"]["num_agents"])
+        ]
+
     def snapshot(self):
         """Return the complete mutable race state at a rollout boundary."""
         return {
@@ -239,11 +247,22 @@ def _load_worker_policies(policy_states, activation):
     return models
 
 
+def _race_class(setup):
+    """Training race class: the local DBM race, or setup['race_class'] = 'module:Class'
+    with the same reset/observations/step/snapshot/restore API (official_port)."""
+    spec = setup.get("race_class")
+    if not spec:
+        return TrainingRace
+    import importlib
+    module, name = spec.split(":")
+    return getattr(importlib.import_module(module), name)
+
+
 def _worker_loop(connection, setup, worker_id):
     torch.set_num_threads(1)
     worker_seed = setup["seed"] + 10_000 * worker_id
     torch.manual_seed(worker_seed)
-    race = TrainingRace(setup, worker_seed)
+    race = _race_class(setup)(setup, worker_seed)
     try:
         while True:
             command = connection.recv()
@@ -273,11 +292,7 @@ def _worker_loop(connection, setup, worker_id):
             offroad = contact = 0
             for _ in range(command["steps"]):
                 joint_actions = []
-                scene = race.scene()
-                policy_observations = [
-                    scene.self_play_rl_input(car_idx)
-                    for car_idx in range(len(models))
-                ]
+                policy_observations = race.observations()
                 learning_observation = policy_observations[learning_car]
                 raw_learning_action = None
                 for car_idx, model in enumerate(models):
@@ -639,7 +654,7 @@ def _git_metadata():
 
 def train(args):
     """Train one policy while rotating the car that supplies its rollouts."""
-    ppo = PPOSettings()
+    ppo = PPOSettings(mask_recovery_policy_loss=not args.no_recovery_mask)
     self_play = SelfPlaySettings()
     if args.smoke:
         self_play = SelfPlaySettings(
@@ -683,6 +698,7 @@ def train(args):
         "track_csv": params.TRACK_CSV,
         "track_scale": params.TRACK_SCALE,
         "self_play": asdict(self_play),
+        "race_class": args.race_class,
     }
     workers = RolloutWorkers(args.workers, setup)
     trainer = SelfPlayTrainer(
@@ -716,6 +732,7 @@ def train(args):
                 "phase_steps": trainer.phase_steps,
                 "total_steps": trainer.total_steps,
                 "track": args.track,
+                "race_class": args.race_class,
                 "seed": args.seed,
                 "workers": args.workers,
                 "device": str(device),
@@ -770,6 +787,14 @@ def parse_args(argv=None):
         help="permanently save the runtime actor every N completed phases (default: 10)",
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--race-class", default=None,
+        help="module:Class training race (default: local DBM TrainingRace)",
+    )
+    parser.add_argument(
+        "--no-recovery-mask", action="store_true",
+        help="keep offroad-recovery steps in the policy loss",
+    )
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be positive")

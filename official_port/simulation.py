@@ -30,7 +30,8 @@ class Session:
         self.world = World()
         self.ctrl = OfficialController(self.world.raceline, self.world.raceline_dev)
         specs = (config.ego, config.opp1, config.opp2)
-        self.policies = [make_policy(k, s, config.fixed_params if k == 0 else None) for k, s in enumerate(specs)]
+        self.policies = [make_policy(k, s, config.fixed_params if k == 0 else None, config.rl_weights)
+                         for k, s in enumerate(specs)]
         self.ep_no = 0
         self.i = 0
         self.last_i = [-1, -1, -1]  # official per-car raceline search start for CarNode.mpc
@@ -63,9 +64,11 @@ class Session:
             o1, o2 = [c for c in range(3) if c != k]
             m, a, b = ms[k], ms[o1], ms[o2]
             p = list(self.policies[k].params())
-            steer, throttle, _, _, self.last_i[k] = self.ctrl.mpc(
-                (m.px, m.py, m.psi), (m.s, m.e, m.vx), (a.s, a.e, a.vx), (b.s, b.e, b.vx),
-                p[0], p[1], p[2]*2, p[3]**2, p[4], last_i=self.last_i[k])
+            steer, throttle = 0., 0.  # direct-command policies (rl): the official MPC output would be discarded
+            if getattr(self.policies[k], "uses_mpc", True):
+                steer, throttle, _, _, self.last_i[k] = self.ctrl.mpc(
+                    (m.px, m.py, m.psi), (m.s, m.e, m.vx), (a.s, a.e, a.vx), (b.s, b.e, b.vx),
+                    p[0], p[1], p[2]*2, p[3]**2, p[4], last_i=self.last_i[k])
             override = self.policies[k].action_override(ms, self.world.raceline)
             actions.append(self.world.recover_and_step(k, m, steer, throttle, override))
             used.append(p)

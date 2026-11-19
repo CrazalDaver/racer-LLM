@@ -152,7 +152,7 @@ class IBR(Policy):
         return u
 
 
-def make_policy(car, spec, fixed_params=None):
+def make_policy(car, spec, fixed_params=None, weight_path=None):
     if spec == "mpc":
         return Policy(car, INIT_EGO if car == 0 else INIT_OPP)
     if spec == "fixed":
@@ -166,4 +166,8 @@ def make_policy(car, spec, fixed_params=None):
         return AlphaRacer(car, spec)
     if spec == "ibr":
         return IBR(car, INIT_OPP)
+    if spec == "rl":
+        from .rl import RLPolicy
+        assert weight_path, "rl needs a trained actor checkpoint"
+        return RLPolicy(car, INIT_EGO if car == 0 else INIT_OPP, weight_path)
     raise ValueError(f"unknown policy {spec!r}")
